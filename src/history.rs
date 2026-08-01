@@ -17,6 +17,10 @@ pub(crate) struct ResourceSample {
     pub(crate) own_memory: u64,
     pub(crate) subtree_cpu: f32,
     pub(crate) subtree_memory: u64,
+    pub(crate) own_read_rate: u64,
+    pub(crate) own_write_rate: u64,
+    pub(crate) subtree_read_rate: u64,
+    pub(crate) subtree_write_rate: u64,
     pub(crate) subtree_processes: usize,
 }
 
@@ -98,6 +102,10 @@ impl ResourceHistory {
                 own_memory: process.memory,
                 subtree_cpu: aggregate.cpu,
                 subtree_memory: aggregate.memory,
+                own_read_rate: process.read_rate,
+                own_write_rate: process.write_rate,
+                subtree_read_rate: aggregate.read_rate,
+                subtree_write_rate: aggregate.write_rate,
                 subtree_processes: aggregate.process_count,
             });
             while series.samples.len() > self.sample_limit {

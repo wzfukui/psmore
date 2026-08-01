@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::Path,
     process::{Command, Stdio},
+    time::{Duration, Instant},
 };
 
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind, Users};
@@ -89,6 +90,8 @@ pub(crate) fn is_sampler_process(process: &ProcessInfo, psmore_pids: &HashSet<Pi
 pub(crate) struct NativeProcessProvider {
     system: System,
     users: Users,
+    io_instances: HashMap<Pid, u64>,
+    last_sample: Option<Instant>,
 }
 
 impl NativeProcessProvider {
@@ -96,12 +99,28 @@ impl NativeProcessProvider {
         Self {
             system: System::new(),
             users: Users::new_with_refreshed_list(),
+            io_instances: HashMap::new(),
+            last_sample: None,
         }
     }
 }
 
+pub(crate) fn bytes_per_second(bytes: u64, elapsed: Duration) -> u64 {
+    if bytes == 0 || elapsed.is_zero() {
+        return 0;
+    }
+    (bytes as f64 / elapsed.as_secs_f64())
+        .round()
+        .clamp(0.0, u64::MAX as f64) as u64
+}
+
 impl ProcessProvider for NativeProcessProvider {
     fn refresh(&mut self) -> Vec<ProcessInfo> {
+        let sampled_at = Instant::now();
+        let elapsed = self
+            .last_sample
+            .replace(sampled_at)
+            .map(|previous| sampled_at.saturating_duration_since(previous));
         // A process relationship tool should not silently mix Linux tasks
         // (threads) into the process tree. Besides being noisy, task IDs are
         // short-lived and can look like stale child processes between samples.
@@ -111,16 +130,37 @@ impl ProcessProvider for NativeProcessProvider {
             ProcessRefreshKind::nothing()
                 .with_memory()
                 .with_cpu()
+                .with_disk_usage()
                 .with_user(UpdateKind::OnlyIfNotSet)
                 .with_cwd(UpdateKind::Always)
                 .with_exe(UpdateKind::OnlyIfNotSet)
                 .without_tasks(),
         );
-        let mut processes: Vec<ProcessInfo> = self
-            .system
-            .processes()
-            .values()
-            .map(|process| ProcessInfo {
+        let mut active_instances = HashSet::new();
+        let mut processes = Vec::with_capacity(self.system.processes().len());
+        for process in self.system.processes().values() {
+            let instance_is_known = self
+                .io_instances
+                .get(&process.pid())
+                .map(|start_time| *start_time == process.start_time())
+                .unwrap_or(false);
+            let disk = process.disk_usage();
+            let (read_rate, write_rate) = if instance_is_known {
+                elapsed
+                    .map(|elapsed| {
+                        (
+                            bytes_per_second(disk.read_bytes, elapsed),
+                            bytes_per_second(disk.written_bytes, elapsed),
+                        )
+                    })
+                    .unwrap_or_default()
+            } else {
+                (0, 0)
+            };
+            self.io_instances
+                .insert(process.pid(), process.start_time());
+            active_instances.insert(process.pid());
+            processes.push(ProcessInfo {
                 pid: process.pid(),
                 parent: process.parent(),
                 name: process.name().to_string_lossy().into_owned(),
@@ -149,11 +189,15 @@ impl ProcessProvider for NativeProcessProvider {
                     .unwrap_or_default(),
                 cpu: process.cpu_usage(),
                 memory: process.memory(),
+                read_rate,
+                write_rate,
                 start_time: process.start_time(),
                 runtime: process.run_time(),
                 status: format!("{:?}", process.status()),
-            })
-            .collect();
+            });
+        }
+        self.io_instances
+            .retain(|pid, _| active_instances.contains(pid));
 
         // One native snapshot complements sysinfo on both macOS and Linux:
         // it preserves the original command line and fills short-lived or
@@ -198,6 +242,8 @@ impl ProcessProvider for NativeProcessProvider {
                 cwd: String::new(),
                 cpu: 0.0,
                 memory: 0,
+                read_rate: 0,
+                write_rate: 0,
                 start_time: 0,
                 runtime: 0,
                 status: state,
@@ -238,6 +284,8 @@ impl ProcessProvider for NativeProcessProvider {
             cwd: String::new(),
             cpu: 0.0,
             memory: 0,
+            read_rate: 0,
+            write_rate: 0,
             start_time: 0,
             runtime: 0,
             status: "VirtualRoot".into(),

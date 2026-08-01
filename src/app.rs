@@ -11,11 +11,13 @@ use crate::{
     history::ResourceHistory,
     inspection::inspect_process,
     model::{
-        ChangeSummary, MarqueePhase, ProcessChange, ProcessEvent, ProcessInfo, ProcessInspection,
-        ResourceAggregate, SortMode, TreeRow, diff_processes, process_path,
+        ChangeSummary, HotspotMetric, HotspotScope, MarqueePhase, ProcessChange, ProcessEvent,
+        ProcessInfo, ProcessInspection, ResourceAggregate, SortMode, StatusNotice, TreeRow,
+        TrendView, diff_processes, process_path,
     },
     network::{NetworkScan, scan_network},
-    provider::{NativeProcessProvider, ProcessProvider},
+    provider::{NativeProcessProvider, ProcessProvider, platform_name},
+    report::{ReportInput, export_report},
     snapshot::BaselineSnapshot,
 };
 
@@ -41,6 +43,8 @@ pub(crate) fn aggregate_resources(
             .map(|process| ResourceAggregate {
                 cpu: process.cpu,
                 memory: process.memory,
+                read_rate: process.read_rate,
+                write_rate: process.write_rate,
                 process_count: usize::from(pid.as_u32() != 0),
             })
             .unwrap_or_default();
@@ -79,6 +83,8 @@ pub(crate) fn sort_processes(
             SortMode::Stable => std::cmp::Ordering::Equal,
             SortMode::SubtreeCpu => right_resource.cpu.total_cmp(&left_resource.cpu),
             SortMode::SubtreeMemory => right_resource.memory.cmp(&left_resource.memory),
+            SortMode::SubtreeRead => right_resource.read_rate.cmp(&left_resource.read_rate),
+            SortMode::SubtreeWrite => right_resource.write_rate.cmp(&left_resource.write_rate),
         };
         hot_order.then_with(|| {
             let left_name = processes
@@ -94,6 +100,76 @@ pub(crate) fn sort_processes(
     });
 }
 
+pub(crate) fn rank_hotspots(
+    processes: &HashMap<Pid, ProcessInfo>,
+    resources: &HashMap<Pid, ResourceAggregate>,
+    metric: HotspotMetric,
+    scope: HotspotScope,
+) -> Vec<Pid> {
+    let root = Pid::from_u32(0);
+    let mut pids: Vec<Pid> = processes
+        .keys()
+        .filter(|pid| **pid != root)
+        .copied()
+        .collect();
+    pids.sort_by(|left, right| {
+        let left_process = processes.get(left);
+        let right_process = processes.get(right);
+        let left_tree = resources.get(left).copied().unwrap_or_default();
+        let right_tree = resources.get(right).copied().unwrap_or_default();
+        let metric_order = match (metric, scope) {
+            (HotspotMetric::Cpu, HotspotScope::Process) => right_process
+                .map(|process| process.cpu)
+                .unwrap_or_default()
+                .total_cmp(&left_process.map(|process| process.cpu).unwrap_or_default()),
+            (HotspotMetric::Cpu, HotspotScope::Subtree) => right_tree.cpu.total_cmp(&left_tree.cpu),
+            (HotspotMetric::Memory, HotspotScope::Process) => right_process
+                .map(|process| process.memory)
+                .unwrap_or_default()
+                .cmp(
+                    &left_process
+                        .map(|process| process.memory)
+                        .unwrap_or_default(),
+                ),
+            (HotspotMetric::Memory, HotspotScope::Subtree) => {
+                right_tree.memory.cmp(&left_tree.memory)
+            }
+            (HotspotMetric::Read, HotspotScope::Process) => right_process
+                .map(|process| process.read_rate)
+                .unwrap_or_default()
+                .cmp(
+                    &left_process
+                        .map(|process| process.read_rate)
+                        .unwrap_or_default(),
+                ),
+            (HotspotMetric::Read, HotspotScope::Subtree) => {
+                right_tree.read_rate.cmp(&left_tree.read_rate)
+            }
+            (HotspotMetric::Write, HotspotScope::Process) => right_process
+                .map(|process| process.write_rate)
+                .unwrap_or_default()
+                .cmp(
+                    &left_process
+                        .map(|process| process.write_rate)
+                        .unwrap_or_default(),
+                ),
+            (HotspotMetric::Write, HotspotScope::Subtree) => {
+                right_tree.write_rate.cmp(&left_tree.write_rate)
+            }
+        };
+        metric_order.then_with(|| {
+            let left_name = left_process
+                .map(|process| process.name.to_lowercase())
+                .unwrap_or_default();
+            let right_name = right_process
+                .map(|process| process.name.to_lowercase())
+                .unwrap_or_default();
+            (left_name, left.as_u32()).cmp(&(right_name, right.as_u32()))
+        })
+    });
+    pids
+}
+
 pub(crate) struct App {
     pub(crate) provider: NativeProcessProvider,
     pub(crate) processes: HashMap<Pid, ProcessInfo>,
@@ -101,6 +177,11 @@ pub(crate) struct App {
     pub(crate) resources: HashMap<Pid, ResourceAggregate>,
     pub(crate) history: ResourceHistory,
     pub(crate) trend_pid: Option<Pid>,
+    pub(crate) trend_view: TrendView,
+    pub(crate) show_hotspots: bool,
+    pub(crate) hotspot_metric: HotspotMetric,
+    pub(crate) hotspot_scope: HotspotScope,
+    pub(crate) hotspot_selected: Option<Pid>,
     pub(crate) baseline: Option<BaselineSnapshot>,
     pub(crate) show_snapshot_diff: bool,
     pub(crate) snapshot_diff_scroll: u16,
@@ -123,6 +204,7 @@ pub(crate) struct App {
     pub(crate) marquee_phase: MarqueePhase,
     pub(crate) page_size: usize,
     pub(crate) error: Option<String>,
+    pub(crate) notice: Option<StatusNotice>,
     pub(crate) paused: bool,
     pub(crate) show_events: bool,
     pub(crate) events: Vec<ProcessEvent>,
@@ -140,6 +222,11 @@ impl App {
             resources: HashMap::new(),
             history: ResourceHistory::default(),
             trend_pid: None,
+            trend_view: TrendView::default(),
+            show_hotspots: false,
+            hotspot_metric: HotspotMetric::default(),
+            hotspot_scope: HotspotScope::default(),
+            hotspot_selected: None,
             baseline: None,
             show_snapshot_diff: false,
             snapshot_diff_scroll: 0,
@@ -162,6 +249,7 @@ impl App {
             marquee_phase: MarqueePhase::Scrolling,
             page_size: 10,
             error: None,
+            notice: None,
             paused: false,
             show_events: false,
             events: Vec::new(),
@@ -215,6 +303,9 @@ impl App {
             );
         }
         self.rebuild_visible();
+        if self.show_hotspots {
+            self.ensure_hotspot_selection();
+        }
         self.last_refresh = observed_at;
         self.error = None;
     }
@@ -533,12 +624,14 @@ impl App {
     }
 
     fn toggle_selected_expanded(&mut self) {
-        if let Some(pid) = self.selected_pid()
-            && self
-                .children
-                .get(&Some(pid))
-                .map(|c| !c.is_empty())
-                .unwrap_or(false)
+        let Some(pid) = self.selected_pid() else {
+            return;
+        };
+        if self
+            .children
+            .get(&Some(pid))
+            .map(|c| !c.is_empty())
+            .unwrap_or(false)
         {
             if !self.expanded.insert(pid) {
                 self.expanded.remove(&pid);
@@ -609,6 +702,38 @@ impl App {
         self.snapshot_diff_scroll = 0;
     }
 
+    fn export_diagnostic_report(&mut self) {
+        let result = std::env::current_dir().and_then(|directory| {
+            export_report(
+                ReportInput {
+                    platform: platform_name(),
+                    selected_pid: self.selected_pid(),
+                    paused: self.paused,
+                    sort_mode: self.sort_mode,
+                    processes: &self.processes,
+                    resources: &self.resources,
+                    events: &self.events,
+                    network: self.network_scan.as_ref(),
+                    inspection: self.inspection.as_ref(),
+                    baseline: self.baseline.as_ref(),
+                },
+                &directory,
+            )
+        });
+        self.notice = Some(match result {
+            Ok(path) => StatusNotice {
+                message: format!("report saved: {}", path.display()),
+                is_error: false,
+                observed_at: Instant::now(),
+            },
+            Err(error) => StatusNotice {
+                message: format!("report export failed: {error}"),
+                is_error: true,
+                observed_at: Instant::now(),
+            },
+        });
+    }
+
     fn open_network(&mut self) {
         self.network_scan = Some(scan_network(&self.processes));
         self.network_selected = 0;
@@ -618,6 +743,59 @@ impl App {
         self.inspection = None;
         self.trend_pid = None;
         self.show_snapshot_diff = false;
+        self.show_hotspots = false;
+        self.hotspot_selected = None;
+    }
+
+    fn open_hotspots(&mut self) {
+        self.show_hotspots = true;
+        self.hotspot_metric = HotspotMetric::default();
+        self.hotspot_scope = HotspotScope::default();
+        self.network_scan = None;
+        self.network_filter.clear();
+        self.network_searching = false;
+        self.show_events = false;
+        self.inspection = None;
+        self.trend_pid = None;
+        self.show_snapshot_diff = false;
+        self.reset_hotspot_selection();
+    }
+
+    pub(crate) fn hotspot_ranked(&self, metric: HotspotMetric) -> Vec<Pid> {
+        rank_hotspots(&self.processes, &self.resources, metric, self.hotspot_scope)
+    }
+
+    fn reset_hotspot_selection(&mut self) {
+        self.hotspot_selected = self.hotspot_ranked(self.hotspot_metric).first().copied();
+    }
+
+    fn ensure_hotspot_selection(&mut self) {
+        let selected_is_alive = self
+            .hotspot_selected
+            .map(|pid| self.processes.contains_key(&pid))
+            .unwrap_or(false);
+        if !selected_is_alive {
+            self.reset_hotspot_selection();
+        }
+    }
+
+    fn select_hotspot_metric(&mut self, metric: HotspotMetric) {
+        self.hotspot_metric = metric;
+        self.reset_hotspot_selection();
+    }
+
+    fn move_hotspot_selection(&mut self, delta: isize) {
+        let ranked = self.hotspot_ranked(self.hotspot_metric);
+        if ranked.is_empty() {
+            self.hotspot_selected = None;
+            return;
+        }
+        let current = self
+            .hotspot_selected
+            .and_then(|pid| ranked.iter().position(|candidate| *candidate == pid))
+            .unwrap_or(0);
+        let next = (current as isize + delta).clamp(0, ranked.len().saturating_sub(1) as isize);
+        self.hotspot_selected = ranked.get(next as usize).copied();
     }
 
     fn refresh_network(&mut self) {
@@ -658,6 +836,8 @@ impl App {
         self.network_scan = None;
         self.network_filter.clear();
         self.network_searching = false;
+        self.show_hotspots = false;
+        self.hotspot_selected = None;
         self.search.clear();
         self.searching = false;
         self.focus = None;
@@ -678,6 +858,47 @@ impl App {
 
     pub(crate) fn on_key(&mut self, key: KeyEvent) -> bool {
         if key.kind != KeyEventKind::Press {
+            return false;
+        }
+        if !self.searching
+            && !self.network_searching
+            && key.modifiers.is_empty()
+            && key.code == KeyCode::Char('o')
+        {
+            self.export_diagnostic_report();
+            return false;
+        }
+        if self.show_hotspots {
+            match key.code {
+                KeyCode::Char('q') => return true,
+                KeyCode::Esc | KeyCode::Char('h') => {
+                    self.show_hotspots = false;
+                    self.hotspot_selected = None;
+                }
+                KeyCode::Left => {
+                    self.select_hotspot_metric(self.hotspot_metric.previous());
+                }
+                KeyCode::Right | KeyCode::Tab => {
+                    self.select_hotspot_metric(self.hotspot_metric.next());
+                }
+                KeyCode::Down | KeyCode::Char('j') => self.move_hotspot_selection(1),
+                KeyCode::Up | KeyCode::Char('k') => self.move_hotspot_selection(-1),
+                KeyCode::PageDown => self.move_hotspot_selection(10),
+                KeyCode::PageUp => self.move_hotspot_selection(-10),
+                KeyCode::Char('v') => {
+                    self.hotspot_scope.toggle();
+                    self.reset_hotspot_selection();
+                }
+                KeyCode::Char('r') => self.refresh(),
+                KeyCode::Enter => {
+                    if let Some(pid) = self.hotspot_selected {
+                        self.jump_to_process(pid);
+                    }
+                }
+                KeyCode::Char(' ') => self.toggle_paused(),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
+                _ => {}
+            }
             return false;
         }
         if self.show_snapshot_diff {
@@ -787,6 +1008,7 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('t') => self.trend_pid = None,
                 KeyCode::Char(' ') => self.toggle_paused(),
                 KeyCode::Char('r') => self.refresh(),
+                KeyCode::Char('i') => self.trend_view.toggle(),
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
                 _ => {}
             }
@@ -896,6 +1118,7 @@ impl App {
             }
             KeyCode::Char('t') => {
                 self.trend_pid = self.selected_pid();
+                self.trend_view = TrendView::default();
                 self.show_events = false;
                 self.inspection = None;
             }
@@ -913,6 +1136,7 @@ impl App {
                 self.snapshot_diff_scroll = 0;
             }
             KeyCode::Char('n') => self.open_network(),
+            KeyCode::Char('h') => self.open_hotspots(),
             KeyCode::Enter => self.open_inspection(),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
             _ => {}

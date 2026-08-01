@@ -13,6 +13,8 @@ pub(crate) struct ProcessSnapshotEntry {
     pub(crate) start_time: u64,
     pub(crate) own_cpu: f32,
     pub(crate) own_memory: u64,
+    pub(crate) own_read_rate: u64,
+    pub(crate) own_write_rate: u64,
     pub(crate) subtree: ResourceAggregate,
 }
 
@@ -26,6 +28,8 @@ impl ProcessSnapshotEntry {
             start_time: process.start_time,
             own_cpu: process.cpu,
             own_memory: process.memory,
+            own_read_rate: process.read_rate,
+            own_write_rate: process.write_rate,
             subtree,
         }
     }
@@ -61,6 +65,10 @@ pub(crate) struct SnapshotResourceDelta {
     pub(crate) subtree_cpu: f32,
     pub(crate) own_memory: i128,
     pub(crate) subtree_memory: i128,
+    pub(crate) own_read_rate: i128,
+    pub(crate) own_write_rate: i128,
+    pub(crate) subtree_read_rate: i128,
+    pub(crate) subtree_write_rate: i128,
     pub(crate) subtree_processes: i128,
     pub(crate) current_subtree: ResourceAggregate,
 }
@@ -164,6 +172,16 @@ impl BaselineSnapshot {
                         subtree_memory: unsigned_delta(
                             current_subtree.memory,
                             entry.subtree.memory,
+                        ),
+                        own_read_rate: unsigned_delta(process.read_rate, entry.own_read_rate),
+                        own_write_rate: unsigned_delta(process.write_rate, entry.own_write_rate),
+                        subtree_read_rate: unsigned_delta(
+                            current_subtree.read_rate,
+                            entry.subtree.read_rate,
+                        ),
+                        subtree_write_rate: unsigned_delta(
+                            current_subtree.write_rate,
+                            entry.subtree.write_rate,
                         ),
                         subtree_processes: count_delta(
                             current_subtree.process_count,

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -12,8 +14,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     app::App,
     model::{
-        InspectionField, ProcessChange, ProcessEvent, ProcessInspection, TreeRow,
-        process_command_line, process_path,
+        HotspotMetric, HotspotScope, InspectionField, ProcessChange, ProcessEvent,
+        ProcessInspection, TreeRow, TrendView, process_command_line, process_path,
     },
     network::NetworkListener,
     provider::platform_name,
@@ -116,7 +118,7 @@ fn detail_height(app: &App, area: ratatui::layout::Rect) -> u16 {
         .unwrap_or(0);
     let subtree = app.resources.get(&pid).copied().unwrap_or_default();
     let summary = format!(
-        "PID {}  PPID {}  children {}  status {}  CPU {:.1}%  MEM {} MB  runtime {}s",
+        "PID {}  PPID {}  children {}  status {}  CPU {:.1}%  MEM {} MB  R {}  W {}  runtime {}s",
         pid,
         process
             .parent
@@ -126,13 +128,17 @@ fn detail_height(app: &App, area: ratatui::layout::Rect) -> u16 {
         process.status,
         process.cpu,
         process.memory / 1024 / 1024,
+        format_bytes_rate(process.read_rate),
+        format_bytes_rate(process.write_rate),
         process.runtime
     );
     let tree = format!(
-        "TREE {} proc (self + descendants)  CPU {:.1}%  MEM {} MB",
+        "TREE {} proc (self + descendants)  CPU {:.1}%  MEM {} MB  R {}  W {}",
         subtree.process_count,
         subtree.cpu,
-        subtree.memory / 1024 / 1024
+        subtree.memory / 1024 / 1024,
+        format_bytes_rate(subtree.read_rate),
+        format_bytes_rate(subtree.write_rate)
     );
     let content_lines = wrapped_lines(&summary, width)
         + wrapped_lines(&tree, width)
@@ -395,7 +401,10 @@ fn draw_trend_overlay(frame: &mut Frame, app: &App, area: Rect) {
         .map(|process| process.name.as_str())
         .or_else(|| app.history.name(pid))
         .unwrap_or("exited process");
-    let title = format!(" trends {name} [{pid}]  t/Esc close  r sample ");
+    let title = format!(
+        " trends {name} [{pid}]  {}  i switch  t/Esc close  r sample ",
+        app.trend_view.label()
+    );
     let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(popup);
     frame.render_widget(Clear, popup);
@@ -416,32 +425,6 @@ fn draw_trend_overlay(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let own_cpu: Vec<f32> = samples.iter().map(|sample| sample.own_cpu).collect();
-    let subtree_cpu: Vec<f32> = samples.iter().map(|sample| sample.subtree_cpu).collect();
-    let own_memory: Vec<u64> = samples.iter().map(|sample| sample.own_memory).collect();
-    let subtree_memory: Vec<u64> = samples.iter().map(|sample| sample.subtree_memory).collect();
-    let own_cpu_data = cpu_sparkline_data(&own_cpu);
-    let subtree_cpu_data = cpu_sparkline_data(&subtree_cpu);
-    let own_memory_data = memory_sparkline_data(&own_memory);
-    let subtree_memory_data = memory_sparkline_data(&subtree_memory);
-    let cpu_scale = own_cpu_data
-        .iter()
-        .chain(&subtree_cpu_data)
-        .copied()
-        .max()
-        .unwrap_or(1)
-        .max(1);
-    let memory_scale = own_memory_data
-        .iter()
-        .chain(&subtree_memory_data)
-        .copied()
-        .max()
-        .unwrap_or(1)
-        .max(1);
-    let (own_cpu_now, own_cpu_avg, own_cpu_max) = f32_stats(&own_cpu);
-    let (tree_cpu_now, tree_cpu_avg, tree_cpu_max) = f32_stats(&subtree_cpu);
-    let (own_mem_now, own_mem_avg, own_mem_max) = memory_stats(&own_memory);
-    let (tree_mem_now, tree_mem_avg, tree_mem_max) = memory_stats(&subtree_memory);
     let window = samples
         .front()
         .zip(samples.back())
@@ -473,10 +456,87 @@ fn draw_trend_overlay(frame: &mut Frame, app: &App, area: Rect) {
                 window,
                 subtree_processes
             )),
-            Line::from(" shared scale per metric: self and tree charts are directly comparable"),
+            Line::from(if app.trend_view == TrendView::Io {
+                " shared I/O scale: read/write and self/tree charts are directly comparable"
+            } else {
+                " shared scale per metric: self and tree charts are directly comparable"
+            }),
         ]),
         chunks[0],
     );
+
+    if app.trend_view == TrendView::Io {
+        let own_read: Vec<u64> = samples.iter().map(|sample| sample.own_read_rate).collect();
+        let tree_read: Vec<u64> = samples
+            .iter()
+            .map(|sample| sample.subtree_read_rate)
+            .collect();
+        let own_write: Vec<u64> = samples.iter().map(|sample| sample.own_write_rate).collect();
+        let tree_write: Vec<u64> = samples
+            .iter()
+            .map(|sample| sample.subtree_write_rate)
+            .collect();
+        let io_scale = own_read
+            .iter()
+            .chain(&tree_read)
+            .chain(&own_write)
+            .chain(&tree_write)
+            .copied()
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let series = [
+            ("READ self", own_read, Color::Cyan),
+            ("READ tree", tree_read, Color::LightCyan),
+            ("WRITE self", own_write, Color::Yellow),
+            ("WRITE tree", tree_write, Color::LightRed),
+        ];
+        for (index, (label, values, color)) in series.into_iter().enumerate() {
+            let (now, average, maximum) = memory_stats(&values);
+            frame.render_widget(
+                Sparkline::default()
+                    .block(Block::default().borders(Borders::TOP).title(format!(
+                        " {label:<10} now {}  avg {}  max {} ",
+                        format_bytes_rate(now),
+                        format_bytes_rate(average),
+                        format_bytes_rate(maximum)
+                    )))
+                    .data(&values)
+                    .max(io_scale)
+                    .bar_set(symbols::bar::NINE_LEVELS)
+                    .style(Style::default().fg(color)),
+                chunks[index + 1],
+            );
+        }
+        return;
+    }
+
+    let own_cpu: Vec<f32> = samples.iter().map(|sample| sample.own_cpu).collect();
+    let subtree_cpu: Vec<f32> = samples.iter().map(|sample| sample.subtree_cpu).collect();
+    let own_memory: Vec<u64> = samples.iter().map(|sample| sample.own_memory).collect();
+    let subtree_memory: Vec<u64> = samples.iter().map(|sample| sample.subtree_memory).collect();
+    let own_cpu_data = cpu_sparkline_data(&own_cpu);
+    let subtree_cpu_data = cpu_sparkline_data(&subtree_cpu);
+    let own_memory_data = memory_sparkline_data(&own_memory);
+    let subtree_memory_data = memory_sparkline_data(&subtree_memory);
+    let cpu_scale = own_cpu_data
+        .iter()
+        .chain(&subtree_cpu_data)
+        .copied()
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let memory_scale = own_memory_data
+        .iter()
+        .chain(&subtree_memory_data)
+        .copied()
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let (own_cpu_now, own_cpu_avg, own_cpu_max) = f32_stats(&own_cpu);
+    let (tree_cpu_now, tree_cpu_avg, tree_cpu_max) = f32_stats(&subtree_cpu);
+    let (own_mem_now, own_mem_avg, own_mem_max) = memory_stats(&own_memory);
+    let (tree_mem_now, tree_mem_avg, tree_mem_max) = memory_stats(&subtree_memory);
     frame.render_widget(
         Sparkline::default()
             .block(Block::default().borders(Borders::TOP).title(format!(
@@ -539,6 +599,36 @@ fn format_signed_bytes(delta: i128) -> String {
     } else {
         format!("{sign}{bytes} B")
     }
+}
+
+fn format_bytes_rate(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.1} GB/s", bytes as f64 / 1024.0 / 1024.0 / 1024.0)
+    } else if bytes >= 1024 * 1024 {
+        format!("{:.1} MB/s", bytes as f64 / 1024.0 / 1024.0)
+    } else if bytes >= 1024 {
+        format!("{:.1} KB/s", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B/s")
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.1} GB", bytes as f64 / 1024.0 / 1024.0 / 1024.0)
+    } else if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / 1024.0 / 1024.0)
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn format_signed_rate(delta: i128) -> String {
+    let sign = if delta >= 0 { "+" } else { "-" };
+    let value = delta.unsigned_abs().min(u128::from(u64::MAX)) as u64;
+    format!("{sign}{}", format_bytes_rate(value))
 }
 
 fn snapshot_entry_line(prefix: &str, entry: &ProcessSnapshotEntry, color: Color) -> Line<'static> {
@@ -679,6 +769,91 @@ fn snapshot_diff_lines(diff: &SnapshotDiff) -> Vec<Line<'static>> {
             )));
         }
     }
+
+    for (title, empty, is_read) in [
+        (
+            "TOP TREE READ RATE INCREASE",
+            " no surviving process subtree increased disk reads",
+            true,
+        ),
+        (
+            "TOP TREE WRITE RATE INCREASE",
+            " no surviving process subtree increased disk writes",
+            false,
+        ),
+    ] {
+        let mut growth: Vec<_> = diff
+            .resource_deltas
+            .iter()
+            .filter(|delta| {
+                if is_read {
+                    delta.subtree_read_rate > 0
+                } else {
+                    delta.subtree_write_rate > 0
+                }
+            })
+            .collect();
+        growth.sort_by_key(|delta| {
+            std::cmp::Reverse(if is_read {
+                delta.subtree_read_rate
+            } else {
+                delta.subtree_write_rate
+            })
+        });
+        let count = growth.len();
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            if count > 50 {
+                format!("{title} ({count}, showing 50)")
+            } else {
+                format!("{title} ({count})")
+            },
+            Style::default()
+                .fg(if is_read {
+                    Color::LightCyan
+                } else {
+                    Color::Yellow
+                })
+                .add_modifier(Modifier::BOLD),
+        )));
+        if growth.is_empty() {
+            lines.push(Line::from(Span::styled(
+                empty,
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            for delta in growth.into_iter().take(50) {
+                let (tree_delta, own_delta, current) = if is_read {
+                    (
+                        delta.subtree_read_rate,
+                        delta.own_read_rate,
+                        delta.current_subtree.read_rate,
+                    )
+                } else {
+                    (
+                        delta.subtree_write_rate,
+                        delta.own_write_rate,
+                        delta.current_subtree.write_rate,
+                    )
+                };
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        " {}  {} [{}] | now {} | own {}",
+                        format_signed_rate(tree_delta),
+                        delta.name,
+                        delta.pid,
+                        format_bytes_rate(current),
+                        format_signed_rate(own_delta)
+                    ),
+                    Style::default().fg(if is_read {
+                        Color::LightCyan
+                    } else {
+                        Color::Yellow
+                    }),
+                )));
+            }
+        }
+    }
     lines
 }
 
@@ -709,9 +884,11 @@ fn draw_snapshot_diff_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         .as_ref()
         .map(|delta| {
             format!(
-                "system ΔCPU {:+.1}% ΔMEM {} proc {:+}",
+                "system ΔCPU {:+.1}% ΔMEM {} ΔR {} ΔW {} proc {:+}",
                 delta.subtree_cpu,
                 format_signed_bytes(delta.subtree_memory),
+                format_signed_rate(delta.subtree_read_rate),
+                format_signed_rate(delta.subtree_write_rate),
                 delta.subtree_processes
             )
         })
@@ -819,6 +996,222 @@ fn draw_network_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
             )),
         ]),
         chunks[1],
+    );
+}
+
+fn hotspot_color(metric: HotspotMetric) -> Color {
+    match metric {
+        HotspotMetric::Cpu => Color::LightRed,
+        HotspotMetric::Memory => Color::LightMagenta,
+        HotspotMetric::Read => Color::LightCyan,
+        HotspotMetric::Write => Color::Yellow,
+    }
+}
+
+fn hotspot_value(app: &App, pid: Pid, metric: HotspotMetric) -> (String, usize) {
+    let process = app.processes.get(&pid);
+    let subtree = app.resources.get(&pid).copied().unwrap_or_default();
+    let process_count = if app.hotspot_scope == HotspotScope::Subtree {
+        subtree.process_count
+    } else {
+        1
+    };
+    let value = match (metric, app.hotspot_scope) {
+        (HotspotMetric::Cpu, HotspotScope::Process) => {
+            format!("{:.1}%", process.map(|item| item.cpu).unwrap_or_default())
+        }
+        (HotspotMetric::Cpu, HotspotScope::Subtree) => format!("{:.1}%", subtree.cpu),
+        (HotspotMetric::Memory, HotspotScope::Process) => {
+            format_bytes(process.map(|item| item.memory).unwrap_or_default())
+        }
+        (HotspotMetric::Memory, HotspotScope::Subtree) => format_bytes(subtree.memory),
+        (HotspotMetric::Read, HotspotScope::Process) => {
+            format_bytes_rate(process.map(|item| item.read_rate).unwrap_or_default())
+        }
+        (HotspotMetric::Read, HotspotScope::Subtree) => format_bytes_rate(subtree.read_rate),
+        (HotspotMetric::Write, HotspotScope::Process) => {
+            format_bytes_rate(process.map(|item| item.write_rate).unwrap_or_default())
+        }
+        (HotspotMetric::Write, HotspotScope::Subtree) => format_bytes_rate(subtree.write_rate),
+    };
+    (value, process_count)
+}
+
+fn hotspot_is_active(app: &App, pid: Pid, metric: HotspotMetric) -> bool {
+    let process = app.processes.get(&pid);
+    let subtree = app.resources.get(&pid).copied().unwrap_or_default();
+    match (metric, app.hotspot_scope) {
+        (HotspotMetric::Cpu, HotspotScope::Process) => {
+            process.map(|item| item.cpu > 0.0).unwrap_or(false)
+        }
+        (HotspotMetric::Cpu, HotspotScope::Subtree) => subtree.cpu > 0.0,
+        (HotspotMetric::Memory, HotspotScope::Process) => {
+            process.map(|item| item.memory > 0).unwrap_or(false)
+        }
+        (HotspotMetric::Memory, HotspotScope::Subtree) => subtree.memory > 0,
+        (HotspotMetric::Read, HotspotScope::Process) => {
+            process.map(|item| item.read_rate > 0).unwrap_or(false)
+        }
+        (HotspotMetric::Read, HotspotScope::Subtree) => subtree.read_rate > 0,
+        (HotspotMetric::Write, HotspotScope::Process) => {
+            process.map(|item| item.write_rate > 0).unwrap_or(false)
+        }
+        (HotspotMetric::Write, HotspotScope::Subtree) => subtree.write_rate > 0,
+    }
+}
+
+fn draw_hotspot_panel(frame: &mut Frame, app: &App, area: Rect, metric: HotspotMetric) {
+    let ranked = app.hotspot_ranked(metric);
+    let active = app.hotspot_metric == metric;
+    let selected_rank = if active {
+        app.hotspot_selected
+            .and_then(|pid| ranked.iter().position(|candidate| *candidate == pid))
+    } else {
+        None
+    };
+    let capacity = area.height.saturating_sub(2).max(1) as usize;
+    let offset = selected_rank
+        .map(|rank| rank.saturating_sub(capacity.saturating_sub(1)))
+        .unwrap_or(0);
+    let mut items: Vec<ListItem> = ranked
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .filter(|(_, pid)| hotspot_is_active(app, **pid, metric))
+        .take(capacity)
+        .filter_map(|(rank, pid)| {
+            let process = app.processes.get(pid)?;
+            let (value, process_count) = hotspot_value(app, *pid, metric);
+            let scope = if app.hotspot_scope == HotspotScope::Subtree {
+                format!(" {:>3}p", process_count)
+            } else {
+                String::new()
+            };
+            Some(ListItem::new(format!(
+                " #{:<3} {:>10}{}  {} [{}]  {}",
+                rank + 1,
+                value,
+                scope,
+                process.name,
+                pid,
+                process_path(process)
+            )))
+        })
+        .collect();
+    let color = hotspot_color(metric);
+    if items.is_empty() {
+        items.push(
+            ListItem::new(" no activity in the current sample")
+                .style(Style::default().fg(Color::DarkGray)),
+        );
+    }
+    let title = if active {
+        format!(" {}  ACTIVE ", metric.label())
+    } else {
+        format!(" {} ", metric.label())
+    };
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(Style::default().fg(if active { color } else { Color::DarkGray })),
+        )
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(color)
+                .add_modifier(Modifier::BOLD),
+        );
+    let mut state = ListState::default();
+    match selected_rank {
+        Some(rank) if rank >= offset && rank < offset + capacity => {
+            state.select(Some(rank - offset));
+        }
+        _ => {}
+    }
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn draw_hotspot_overlay(frame: &mut Frame, app: &App, area: Rect) {
+    let width = area.width.saturating_sub(2).clamp(1, 150);
+    let height = area.height.saturating_sub(2).max(1);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" hotspot cockpit ");
+    let inner = block.inner(popup);
+    let rows = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Percentage(50),
+        Constraint::Percentage(50),
+    ])
+    .split(inner);
+    let top =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(rows[1]);
+    let bottom =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(rows[2]);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::raw(" scope: "),
+                Span::styled(
+                    app.hotspot_scope.label(),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  | selected panel: "),
+                Span::styled(
+                    app.hotspot_metric.label(),
+                    Style::default()
+                        .fg(hotspot_color(app.hotspot_metric))
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(" ↑↓ rank | ←→ metric | v self/tree | Enter jump | r sample | Esc close"),
+        ]),
+        rows[0],
+    );
+    for (metric, panel) in HotspotMetric::ALL
+        .into_iter()
+        .zip([top[0], top[1], bottom[0], bottom[1]])
+    {
+        draw_hotspot_panel(frame, app, panel, metric);
+    }
+}
+
+fn draw_notice(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(notice) = app
+        .notice
+        .as_ref()
+        .filter(|notice| notice.observed_at.elapsed() <= Duration::from_secs(10))
+    else {
+        return;
+    };
+    let notice_area = Rect::new(
+        area.x,
+        area.y.saturating_add(area.height.saturating_sub(1)),
+        area.width,
+        1,
+    );
+    let style = if notice.is_error {
+        Style::default().fg(Color::White).bg(Color::Red)
+    } else {
+        Style::default().fg(Color::Black).bg(Color::Green)
+    }
+    .add_modifier(Modifier::BOLD);
+    frame.render_widget(Clear, notice_area);
+    frame.render_widget(
+        Paragraph::new(format!(" {} ", notice.message)).style(style),
+        notice_area,
     );
 }
 
@@ -948,7 +1341,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!(
-                "  PPID {}  children {}  status {}  CPU {:.1}%  MEM {} MB  runtime {}s",
+                "  PPID {}  children {}  status {}  CPU {:.1}%  MEM {} MB  R {}  W {}  runtime {}s",
                 p.parent
                     .map(|p| p.to_string())
                     .unwrap_or_else(|| "-".into()),
@@ -956,6 +1349,8 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
                 p.status,
                 p.cpu,
                 p.memory / 1024 / 1024,
+                format_bytes_rate(p.read_rate),
+                format_bytes_rate(p.write_rate),
                 p.runtime
             )),
         ])];
@@ -967,10 +1362,12 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!(
-                " {} proc (self + descendants)  CPU {:.1}%  MEM {} MB",
+                " {} proc (self + descendants)  CPU {:.1}%  MEM {} MB  R {}  W {}",
                 subtree.process_count,
                 subtree.cpu,
-                subtree.memory / 1024 / 1024
+                subtree.memory / 1024 / 1024,
+                format_bytes_rate(subtree.read_rate),
+                format_bytes_rate(subtree.write_rate)
             )),
         ]));
         detail_lines.push(Line::from(command));
@@ -1012,7 +1409,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
             app.last_changes.reparented,
         )),
         Line::from(
-            " ↑↓/jk move | ←/→ tree | / find | s sort | t trend | n ports | b base | d diff | Enter ",
+            " ↑↓/jk move | ←/→ tree | / find | h hot | s sort | t trend | n ports | b base | d diff | o report ",
         ),
     ])
     .style(Style::default().fg(if app.paused {
@@ -1022,7 +1419,9 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     }));
     frame.render_widget(footer, chunks[2]);
 
-    if app.network_scan.is_some() {
+    if app.show_hotspots {
+        draw_hotspot_overlay(frame, app, area);
+    } else if app.network_scan.is_some() {
         draw_network_overlay(frame, app, area);
     } else if app.show_snapshot_diff {
         draw_snapshot_diff_overlay(frame, app, area);
@@ -1033,4 +1432,5 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     } else if app.show_events {
         draw_event_overlay(frame, app, area);
     }
+    draw_notice(frame, app, area);
 }

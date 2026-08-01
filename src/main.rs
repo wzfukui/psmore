@@ -4,6 +4,7 @@ mod inspection;
 mod model;
 mod network;
 mod provider;
+mod report;
 mod snapshot;
 mod ui;
 
@@ -18,6 +19,16 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::{app::App, ui::draw};
 
+fn handle_pending_input(app: &mut App) -> io::Result<bool> {
+    if !event::poll(Duration::from_millis(250))? {
+        return Ok(false);
+    }
+    match event::read()? {
+        Event::Key(key) => Ok(app.on_key(key)),
+        _ => Ok(false),
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -27,10 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::new();
     let result = loop {
         terminal.draw(|frame| draw(frame, &mut app))?;
-        if event::poll(Duration::from_millis(250))?
-            && let Event::Key(key) = event::read()?
-            && app.on_key(key)
-        {
+        if handle_pending_input(&mut app)? {
             break Ok(());
         }
         if !app.paused && app.last_refresh.elapsed() >= Duration::from_secs(2) {
@@ -47,8 +55,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use std::{
         collections::{HashMap, HashSet},
-        time::{Duration, Instant},
+        fs,
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     use sysinfo::Pid;
 
@@ -66,13 +78,15 @@ mod tests {
     #[cfg(target_os = "linux")]
     use crate::network::{parse_linux_inet_listeners, parse_linux_unix_listeners};
     use crate::{
-        app::{aggregate_resources, sort_processes},
+        app::{aggregate_resources, rank_hotspots, sort_processes},
         history::ResourceHistory,
         model::{
-            ProcessChange, ProcessInfo, ResourceAggregate, SortMode, diff_processes, process_path,
+            HotspotMetric, HotspotScope, ProcessChange, ProcessInfo, ResourceAggregate, SortMode,
+            diff_processes, process_path,
         },
         network::NetworkListener,
-        provider::{is_sampler_process, parse_ps_snapshot},
+        provider::{bytes_per_second, is_sampler_process, parse_ps_snapshot, platform_name},
+        report::{ReportInput, export_report},
         snapshot::BaselineSnapshot,
     };
 
@@ -87,6 +101,8 @@ mod tests {
             cwd: "/tmp".into(),
             cpu: 0.0,
             memory: 0,
+            read_rate: 0,
+            write_rate: 0,
             start_time: pid as u64,
             runtime: 0,
             status: "Sleep".into(),
@@ -123,6 +139,14 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_process_io_deltas_to_bytes_per_second() {
+        assert_eq!(bytes_per_second(4_096, Duration::from_secs(2)), 2_048);
+        assert_eq!(bytes_per_second(4_096, Duration::from_millis(500)), 8_192);
+        assert_eq!(bytes_per_second(4_096, Duration::ZERO), 0);
+        assert_eq!(bytes_per_second(0, Duration::from_secs(2)), 0);
+    }
+
+    #[test]
     fn does_not_label_an_unreadable_process_as_system_root() {
         let process = ProcessInfo {
             pid: Pid::from_u32(42),
@@ -134,6 +158,8 @@ mod tests {
             cwd: String::new(),
             cpu: 0.0,
             memory: 0,
+            read_rate: 0,
+            write_rate: 0,
             start_time: 1,
             runtime: 0,
             status: "Sleep".into(),
@@ -396,12 +422,18 @@ Max address space         unlimited            unlimited            bytes\n";
         let mut service = test_process(10, 0, "service");
         service.cpu = 2.5;
         service.memory = 10 * 1024 * 1024;
+        service.read_rate = 100;
+        service.write_rate = 200;
         let mut worker = test_process(11, 10, "worker");
         worker.cpu = 7.5;
         worker.memory = 30 * 1024 * 1024;
+        worker.read_rate = 300;
+        worker.write_rate = 400;
         let mut sidecar = test_process(12, 10, "sidecar");
         sidecar.cpu = 1.0;
         sidecar.memory = 5 * 1024 * 1024;
+        sidecar.read_rate = 500;
+        sidecar.write_rate = 600;
         let processes = [root, service, worker, sidecar]
             .into_iter()
             .map(|process| (process.pid, process))
@@ -421,6 +453,8 @@ Max address space         unlimited            unlimited            bytes\n";
             ResourceAggregate {
                 cpu: 11.0,
                 memory: 45 * 1024 * 1024,
+                read_rate: 900,
+                write_rate: 1_200,
                 process_count: 3,
             }
         );
@@ -428,7 +462,7 @@ Max address space         unlimited            unlimited            bytes\n";
     }
 
     #[test]
-    fn cycles_between_stable_cpu_and_memory_hotspot_ordering() {
+    fn orders_siblings_by_stable_cpu_memory_and_io_hotspots() {
         let mut low_cpu = test_process(10, 0, "alpha");
         low_cpu.cpu = 1.0;
         low_cpu.memory = 50 * 1024 * 1024;
@@ -445,6 +479,8 @@ Max address space         unlimited            unlimited            bytes\n";
                 ResourceAggregate {
                     cpu: 1.0,
                     memory: 50 * 1024 * 1024,
+                    read_rate: 1_000,
+                    write_rate: 8_000,
                     process_count: 1,
                 },
             ),
@@ -453,6 +489,8 @@ Max address space         unlimited            unlimited            bytes\n";
                 ResourceAggregate {
                     cpu: 80.0,
                     memory: 5 * 1024 * 1024,
+                    read_rate: 9_000,
+                    write_rate: 2_000,
                     process_count: 1,
                 },
             ),
@@ -467,6 +505,104 @@ Max address space         unlimited            unlimited            bytes\n";
 
         sort_processes(&mut pids, SortMode::SubtreeMemory, &processes, &resources);
         assert_eq!(pids, vec![Pid::from_u32(10), Pid::from_u32(20)]);
+
+        sort_processes(&mut pids, SortMode::SubtreeRead, &processes, &resources);
+        assert_eq!(pids, vec![Pid::from_u32(20), Pid::from_u32(10)]);
+
+        sort_processes(&mut pids, SortMode::SubtreeWrite, &processes, &resources);
+        assert_eq!(pids, vec![Pid::from_u32(10), Pid::from_u32(20)]);
+    }
+
+    #[test]
+    fn ranks_hotspots_by_process_self_or_complete_service_subtree() {
+        let mut service = test_process(10, 0, "service");
+        service.cpu = 1.0;
+        service.memory = 10;
+        service.read_rate = 100;
+        service.write_rate = 200;
+        let mut worker = test_process(11, 10, "worker");
+        worker.cpu = 50.0;
+        worker.memory = 70;
+        worker.read_rate = 900;
+        worker.write_rate = 800;
+        let mut database = test_process(20, 0, "database");
+        database.cpu = 20.0;
+        database.memory = 100;
+        database.read_rate = 500;
+        database.write_rate = 2_000;
+        let processes = [service, worker, database]
+            .into_iter()
+            .map(|process| (process.pid, process))
+            .collect();
+        let resources = HashMap::from([
+            (
+                Pid::from_u32(10),
+                ResourceAggregate {
+                    cpu: 51.0,
+                    memory: 80,
+                    read_rate: 1_000,
+                    write_rate: 1_000,
+                    process_count: 2,
+                },
+            ),
+            (
+                Pid::from_u32(11),
+                ResourceAggregate {
+                    cpu: 50.0,
+                    memory: 70,
+                    read_rate: 900,
+                    write_rate: 800,
+                    process_count: 1,
+                },
+            ),
+            (
+                Pid::from_u32(20),
+                ResourceAggregate {
+                    cpu: 20.0,
+                    memory: 100,
+                    read_rate: 500,
+                    write_rate: 2_000,
+                    process_count: 1,
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            rank_hotspots(
+                &processes,
+                &resources,
+                HotspotMetric::Cpu,
+                HotspotScope::Process,
+            ),
+            vec![Pid::from_u32(11), Pid::from_u32(20), Pid::from_u32(10)]
+        );
+        assert_eq!(
+            rank_hotspots(
+                &processes,
+                &resources,
+                HotspotMetric::Cpu,
+                HotspotScope::Subtree,
+            ),
+            vec![Pid::from_u32(10), Pid::from_u32(11), Pid::from_u32(20)]
+        );
+        assert_eq!(
+            rank_hotspots(
+                &processes,
+                &resources,
+                HotspotMetric::Write,
+                HotspotScope::Process,
+            ),
+            vec![Pid::from_u32(20), Pid::from_u32(11), Pid::from_u32(10)]
+        );
+        assert_eq!(
+            rank_hotspots(
+                &processes,
+                &resources,
+                HotspotMetric::Read,
+                HotspotScope::Subtree,
+            ),
+            vec![Pid::from_u32(10), Pid::from_u32(11), Pid::from_u32(20)]
+        );
     }
 
     #[test]
@@ -476,6 +612,8 @@ Max address space         unlimited            unlimited            bytes\n";
         let aggregate = ResourceAggregate {
             cpu: 0.0,
             memory: 20 * 1024 * 1024,
+            read_rate: 10,
+            write_rate: 20,
             process_count: 2,
         };
         let resources = HashMap::from([(pid, aggregate)]);
@@ -494,6 +632,14 @@ Max address space         unlimited            unlimited            bytes\n";
         let samples = history.samples(pid).expect("active process history");
         assert_eq!(samples.len(), 3);
         assert_eq!(samples.front().map(|sample| sample.own_cpu), Some(2.0));
+        assert_eq!(
+            samples.back().map(|sample| sample.subtree_read_rate),
+            Some(10)
+        );
+        assert_eq!(
+            samples.back().map(|sample| sample.subtree_write_rate),
+            Some(20)
+        );
 
         process.start_time += 1;
         process.cpu = 99.0;
@@ -516,6 +662,8 @@ Max address space         unlimited            unlimited            bytes\n";
             ResourceAggregate {
                 cpu: 5.0,
                 memory: 1024,
+                read_rate: 0,
+                write_rate: 0,
                 process_count: 1,
             },
         )]);
@@ -606,6 +754,8 @@ Max address space         unlimited            unlimited            bytes\n";
         let mut service = test_process(10, 0, "service");
         service.cpu = 2.0;
         service.memory = 10 * 1024 * 1024;
+        service.read_rate = 1_000;
+        service.write_rate = 2_000;
         let baseline_processes =
             HashMap::from([(root.pid, root.clone()), (service.pid, service.clone())]);
         let baseline_resources = HashMap::from([
@@ -614,6 +764,8 @@ Max address space         unlimited            unlimited            bytes\n";
                 ResourceAggregate {
                     cpu: 5.0,
                     memory: 100 * 1024 * 1024,
+                    read_rate: 10_000,
+                    write_rate: 20_000,
                     process_count: 1,
                 },
             ),
@@ -622,6 +774,8 @@ Max address space         unlimited            unlimited            bytes\n";
                 ResourceAggregate {
                     cpu: 5.0,
                     memory: 30 * 1024 * 1024,
+                    read_rate: 3_000,
+                    write_rate: 4_000,
                     process_count: 2,
                 },
             ),
@@ -631,6 +785,8 @@ Max address space         unlimited            unlimited            bytes\n";
 
         service.cpu = 4.5;
         service.memory = 15 * 1024 * 1024;
+        service.read_rate = 5_000;
+        service.write_rate = 7_000;
         let current_processes = HashMap::from([(root.pid, root), (service.pid, service)]);
         let current_resources = HashMap::from([
             (
@@ -638,6 +794,8 @@ Max address space         unlimited            unlimited            bytes\n";
                 ResourceAggregate {
                     cpu: 20.0,
                     memory: 125 * 1024 * 1024,
+                    read_rate: 30_000,
+                    write_rate: 50_000,
                     process_count: 2,
                 },
             ),
@@ -646,6 +804,8 @@ Max address space         unlimited            unlimited            bytes\n";
                 ResourceAggregate {
                     cpu: 15.0,
                     memory: 50 * 1024 * 1024,
+                    read_rate: 13_000,
+                    write_rate: 24_000,
                     process_count: 3,
                 },
             ),
@@ -661,11 +821,119 @@ Max address space         unlimited            unlimited            bytes\n";
         assert_eq!(service_delta.subtree_cpu, 10.0);
         assert_eq!(service_delta.own_memory, 5 * 1024 * 1024);
         assert_eq!(service_delta.subtree_memory, 20 * 1024 * 1024);
+        assert_eq!(service_delta.own_read_rate, 4_000);
+        assert_eq!(service_delta.own_write_rate, 5_000);
+        assert_eq!(service_delta.subtree_read_rate, 10_000);
+        assert_eq!(service_delta.subtree_write_rate, 20_000);
         assert_eq!(service_delta.subtree_processes, 1);
 
         let system_delta = diff.system_delta.expect("system delta");
         assert_eq!(system_delta.subtree_cpu, 15.0);
         assert_eq!(system_delta.subtree_memory, 25 * 1024 * 1024);
+        assert_eq!(system_delta.subtree_read_rate, 20_000);
+        assert_eq!(system_delta.subtree_write_rate, 30_000);
         assert_eq!(system_delta.subtree_processes, 1);
+    }
+
+    #[test]
+    fn exports_a_versioned_deterministic_private_json_report() {
+        let mut root = test_process(0, 0, "kernel / system");
+        root.parent = None;
+        let mut later = test_process(42, 0, "worker");
+        later.read_rate = 4_096;
+        later.write_rate = 8_192;
+        let earlier = test_process(9, 0, "service");
+        let processes: HashMap<Pid, ProcessInfo> = [root, later, earlier]
+            .into_iter()
+            .map(|process| (process.pid, process))
+            .collect();
+        let resources = HashMap::from([
+            (
+                Pid::from_u32(0),
+                ResourceAggregate {
+                    cpu: 3.5,
+                    memory: 12_345,
+                    read_rate: 4_096,
+                    write_rate: 8_192,
+                    process_count: 2,
+                },
+            ),
+            (Pid::from_u32(9), ResourceAggregate::default()),
+            (
+                Pid::from_u32(42),
+                ResourceAggregate {
+                    cpu: 1.5,
+                    memory: 4_096,
+                    read_rate: 4_096,
+                    write_rate: 8_192,
+                    process_count: 1,
+                },
+            ),
+        ]);
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "psmore-report-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).expect("create report test directory");
+
+        let path = export_report(
+            ReportInput {
+                platform: platform_name(),
+                selected_pid: Some(Pid::from_u32(42)),
+                paused: true,
+                sort_mode: SortMode::Stable,
+                processes: &processes,
+                resources: &resources,
+                events: &[],
+                network: None,
+                inspection: None,
+                baseline: None,
+            },
+            &directory,
+        )
+        .expect("export report");
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read exported report"))
+                .expect("parse exported report");
+
+        assert_eq!(report["schema"], "psmore.diagnostic-report");
+        assert_eq!(report["schema_version"], 1);
+        assert_eq!(report["tool"]["name"], "psmore");
+        assert_eq!(report["platform"], platform_name());
+        assert_eq!(report["selected_pid"], 42);
+        assert_eq!(report["paused"], true);
+        assert_eq!(report["process_count"], 2);
+        assert_eq!(report["system"]["write_bytes_per_second"], 8_192);
+        assert_eq!(report["processes"][0]["pid"], 0);
+        assert_eq!(report["processes"][1]["pid"], 9);
+        assert_eq!(report["processes"][2]["pid"], 42);
+        assert_eq!(report["processes"][2]["read_bytes_per_second"], 4_096);
+        assert!(report["privacy_notice"].as_str().is_some());
+        assert!(report["network_scan"].is_null());
+        assert!(report["selected_inspection"].is_null());
+        assert!(report["baseline"].is_null());
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("report metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::read_dir(&directory)
+                .expect("list report directory")
+                .filter_map(Result::ok)
+                .count(),
+            1
+        );
+
+        fs::remove_file(path).expect("remove test report");
+        fs::remove_dir(directory).expect("remove report test directory");
     }
 }

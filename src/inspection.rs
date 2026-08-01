@@ -508,11 +508,13 @@ fn container_hint(paths: &[String]) -> Option<String> {
                     return Some(format!("{runtime} {}", short_container_id(id)));
                 }
             }
-            if matches!(*component, "docker" | "containers")
-                && let Some(id) = components.get(index + 1)
-                && id.len() >= 12
-            {
-                return Some(format!("container {}", short_container_id(id)));
+            if matches!(*component, "docker" | "containers") {
+                let Some(id) = components.get(index + 1) else {
+                    continue;
+                };
+                if id.len() >= 12 {
+                    return Some(format!("container {}", short_container_id(id)));
+                }
             }
         }
         if path.contains("kubepods") {
