@@ -94,6 +94,30 @@ impl ProcessProvider for MacOsProcessProvider {
             })
             .collect();
 
+        let command_by_pid: HashMap<u32, String> = Command::new("ps")
+            .args(["-ww", "-axo", "pid=,command="])
+            .output()
+            .ok()
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .filter_map(|line| {
+                        let mut fields = line.trim_start().splitn(2, char::is_whitespace);
+                        let pid = fields.next()?.parse().ok()?;
+                        let command = fields.next().unwrap_or("").trim().to_string();
+                        Some((pid, command))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for process in &mut processes {
+            if let Some(command) = command_by_pid.get(&process.pid.as_u32()) {
+                if !command.is_empty() {
+                    process.command = command.clone();
+                }
+            }
+        }
+
         // sysinfo can omit PPID for ordinary macOS readers.  The native ps
         // view is more reliable here, so use it as the macOS provider's
         // authoritative parent relationship.
@@ -364,13 +388,7 @@ impl App {
     fn selected_context(&self) -> Option<String> {
         let pid = self.selected_pid()?;
         let process = self.processes.get(&pid)?;
-        Some(if !process.command.is_empty() {
-            process.command.clone()
-        } else if !process.executable.is_empty() {
-            process.executable.clone()
-        } else {
-            "system root".into()
-        })
+        Some(process_path(process))
     }
 
     fn advance_marquee(&mut self, width: usize) {
@@ -393,7 +411,7 @@ impl App {
         let now = Instant::now();
         match self.marquee_phase {
             MarqueePhase::Scrolling => {
-                if now.duration_since(self.last_marquee) >= Duration::from_millis(250) {
+                if now.duration_since(self.last_marquee) >= Duration::from_millis(125) {
                     self.marquee_offset = self.marquee_offset.saturating_add(1);
                     self.last_marquee = now;
                     if self.marquee_offset >= max_offset {
@@ -615,13 +633,7 @@ fn row_label_and_context(app: &App, row: &TreeRow) -> (String, String) {
     if row.depth > 0 {
         prefix.push_str(if row.is_last { "└─" } else { "├─" });
     }
-    let context = if !p.command.is_empty() {
-        p.command.clone()
-    } else if !p.executable.is_empty() {
-        p.executable.clone()
-    } else {
-        "system root".into()
-    };
+    let context = process_path(p);
     let name = if child_count > 0 && !app.expanded.contains(&row.pid) {
         format!("{} ({})", p.name, child_count)
     } else {
@@ -631,6 +643,24 @@ fn row_label_and_context(app: &App, row: &TreeRow) -> (String, String) {
         format!("{}{} {}  [{}]", prefix, marker, name, row.pid),
         context,
     )
+}
+
+fn process_path(process: &ProcessInfo) -> String {
+    if !process.executable.is_empty() {
+        process.executable.clone()
+    } else if let Some(first) = process.command.split_whitespace().next() {
+        first.to_string()
+    } else {
+        "system root".into()
+    }
+}
+
+fn process_command_line(process: &ProcessInfo) -> String {
+    if !process.command.is_empty() {
+        process.command.clone()
+    } else {
+        process_path(process)
+    }
 }
 
 fn marquee(text: &str, offset: usize, width: usize) -> String {
@@ -661,13 +691,35 @@ fn marquee(text: &str, offset: usize, width: usize) -> String {
     result
 }
 
+fn wrapped_lines(text: &str, width: usize) -> usize {
+    if width == 0 {
+        return 1;
+    }
+    (text.width().max(1) + width - 1) / width
+}
+
+fn detail_height(app: &App, area: ratatui::layout::Rect) -> u16 {
+    let Some(pid) = app.selected_pid() else {
+        return 4;
+    };
+    let Some(process) = app.processes.get(&pid) else {
+        return 4;
+    };
+    let width = area.width.saturating_sub(2).max(1) as usize;
+    let command = process_command_line(process);
+    let content_lines = 1 + wrapped_lines(&command, width);
+    let desired = (content_lines + 2).max(4) as u16;
+    desired.min(area.height.saturating_sub(4).max(4))
+}
+
 fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
+    let detail_height = detail_height(app, area);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(3),
-            Constraint::Length(4),
+            Constraint::Length(detail_height),
             Constraint::Length(1),
         ])
         .split(area);
@@ -762,45 +814,29 @@ fn draw(frame: &mut Frame, app: &mut App) {
 
     let detail = if let Some(pid) = app.selected_pid() {
         let p = &app.processes[&pid];
-        let command = if !p.command.is_empty() {
-            p.command.clone()
-        } else if !p.executable.is_empty() {
-            p.executable.clone()
-        } else {
-            p.name.clone()
-        };
+        let command = process_command_line(p);
         let children = app.children.get(&Some(pid)).map(|c| c.len()).unwrap_or(0);
-        Text::from(vec![
-            Line::from(vec![
-                Span::styled(
-                    format!("PID {}", pid),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(format!(
-                    "  PPID {}  children {}  status {}  CPU {:.1}%  MEM {} MB  runtime {}s",
-                    p.parent
-                        .map(|p| p.to_string())
-                        .unwrap_or_else(|| "-".into()),
-                    children,
-                    p.status,
-                    p.cpu,
-                    p.memory / 1024 / 1024,
-                    p.runtime
-                )),
-            ]),
-            Line::from(format!(
-                "name: {}  path: {}",
-                p.name,
-                if p.executable.is_empty() {
-                    "-"
-                } else {
-                    &p.executable
-                }
+        let mut detail_lines = vec![Line::from(vec![
+            Span::styled(
+                format!("PID {}", pid),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(
+                "  PPID {}  children {}  status {}  CPU {:.1}%  MEM {} MB  runtime {}s",
+                p.parent
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "-".into()),
+                children,
+                p.status,
+                p.cpu,
+                p.memory / 1024 / 1024,
+                p.runtime
             )),
-            Line::from(format!("cmd: {}", command)),
-        ])
+        ])];
+        detail_lines.push(Line::from(command));
+        Text::from(detail_lines)
     } else {
         Text::from("No processes found")
     };
