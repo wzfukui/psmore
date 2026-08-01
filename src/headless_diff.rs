@@ -7,6 +7,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::model::sanitize_terminal_text;
+
 const SNAPSHOT_SCHEMA: &str = "psmore.process-snapshot";
 const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const DIFF_SCHEMA: &str = "psmore.snapshot-diff";
@@ -471,17 +473,6 @@ pub(crate) fn render_diff_json(comparison: &SnapshotComparison) -> Result<String
     .map_err(|error| error.to_string())
 }
 
-fn sanitize(value: &str) -> String {
-    value
-        .chars()
-        .map(|character| match character {
-            '\n' | '\r' | '\t' => ' ',
-            character if character.is_control() => '\u{fffd}',
-            character => character,
-        })
-        .collect()
-}
-
 fn parent_label(parent: Option<u32>) -> String {
     parent
         .map(|pid| pid.to_string())
@@ -533,8 +524,8 @@ fn append_identity_rows(
             "{marker} {:>7} ppid {:>7} {:<20} {}\n",
             entry.pid,
             parent_label(entry.parent_pid),
-            sanitize(&entry.name),
-            sanitize(&entry.command)
+            sanitize_terminal_text(&entry.name),
+            sanitize_terminal_text(&entry.command)
         ));
     }
     if entries.len() > TABLE_CHANGE_LIMIT {
@@ -566,7 +557,7 @@ fn append_cpu_growth(output: &mut String, deltas: &[ResourceDelta]) {
         output.push_str(&format!(
             "{:>7} {:<22} {:+8.1}% {:+8.1}% {:>8.1}%\n",
             delta.pid,
-            sanitize(&delta.name),
+            sanitize_terminal_text(&delta.name),
             delta.own_delta.cpu_percent,
             delta.subtree_delta.cpu_percent,
             delta.current_subtree.cpu_percent
@@ -595,7 +586,7 @@ fn append_memory_growth(output: &mut String, deltas: &[ResourceDelta]) {
         output.push_str(&format!(
             "{:>7} {:<22} {:>11} {:>11} {:>11} {:+7}\n",
             delta.pid,
-            sanitize(&delta.name),
+            sanitize_terminal_text(&delta.name),
             signed_bytes(delta.own_delta.memory_bytes),
             signed_bytes(delta.subtree_delta.memory_bytes),
             human_bytes(delta.current_subtree.memory_bytes),
@@ -628,7 +619,7 @@ fn append_io_growth(output: &mut String, deltas: &[ResourceDelta]) {
         output.push_str(&format!(
             "{:>7} {:<22} {:>13}/s {:>14}/s\n",
             delta.pid,
-            sanitize(&delta.name),
+            sanitize_terminal_text(&delta.name),
             signed_bytes(delta.subtree_delta.read_bytes_per_second),
             signed_bytes(delta.subtree_delta.write_bytes_per_second)
         ));
@@ -647,7 +638,7 @@ pub(crate) fn render_diff_table(comparison: &SnapshotComparison) -> String {
     if let Some(query) = &comparison.selection.query {
         output.push_str(&format!(
             "scope query: {}  (appearance means entering/leaving the result)\n",
-            sanitize(query)
+            sanitize_terminal_text(query)
         ));
     } else {
         output.push_str("scope all processes  (appearance means process start/exit)\n");
@@ -688,9 +679,9 @@ pub(crate) fn render_diff_table(comparison: &SnapshotComparison) -> String {
             output.push_str(&format!(
                 "! {:>7} {} [{}] -> {} [{}]\n",
                 reuse.pid,
-                sanitize(&reuse.before.name),
+                sanitize_terminal_text(&reuse.before.name),
                 reuse.before.start_time_unix_seconds,
-                sanitize(&reuse.after.name),
+                sanitize_terminal_text(&reuse.after.name),
                 reuse.after.start_time_unix_seconds
             ));
         }
@@ -707,7 +698,7 @@ pub(crate) fn render_diff_table(comparison: &SnapshotComparison) -> String {
             output.push_str(&format!(
                 "↪ {:>7} {:<20} {} -> {}\n",
                 process.pid,
-                sanitize(&process.name),
+                sanitize_terminal_text(&process.name),
                 parent_label(process.old_parent_pid),
                 parent_label(process.new_parent_pid)
             ));

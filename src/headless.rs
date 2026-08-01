@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -9,7 +9,9 @@ use sysinfo::{Pid, System};
 
 use crate::{
     app::aggregate_resources,
-    model::{ProcessInfo, ResourceAggregate, process_command_line, process_path},
+    model::{
+        ProcessInfo, ResourceAggregate, process_command_line, process_path, sanitize_terminal_text,
+    },
     provider::{NativeProcessProvider, ProcessProvider, platform_name},
     query::ProcessQuery,
 };
@@ -27,11 +29,15 @@ pub(crate) struct ProcessSnapshot {
 
 impl ProcessSnapshot {
     #[cfg(test)]
-    fn from_processes(processes: Vec<ProcessInfo>, sample_ms: u64) -> Self {
+    pub(crate) fn from_processes(processes: Vec<ProcessInfo>, sample_ms: u64) -> Self {
         Self::build(processes, sample_ms, 1_700_000_000_000)
     }
 
-    fn build(processes: Vec<ProcessInfo>, sample_ms: u64, generated_at_unix_ms: u64) -> Self {
+    pub(crate) fn build(
+        processes: Vec<ProcessInfo>,
+        sample_ms: u64,
+        generated_at_unix_ms: u64,
+    ) -> Self {
         let processes: HashMap<Pid, ProcessInfo> = processes
             .into_iter()
             .map(|process| (process.pid, process))
@@ -51,6 +57,51 @@ impl ProcessSnapshot {
             sample_ms,
             generated_at_unix_ms,
         }
+    }
+
+    pub(crate) fn process(&self, pid: Pid) -> Option<&ProcessInfo> {
+        self.processes.get(&pid)
+    }
+
+    pub(crate) fn processes(&self) -> &HashMap<Pid, ProcessInfo> {
+        &self.processes
+    }
+
+    pub(crate) fn children_of(&self, pid: Pid) -> &[Pid] {
+        self.children
+            .get(&Some(pid))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn resource(&self, pid: Pid) -> ResourceAggregate {
+        self.resources.get(&pid).copied().unwrap_or_default()
+    }
+
+    pub(crate) fn sample_ms(&self) -> u64 {
+        self.sample_ms
+    }
+
+    pub(crate) fn generated_at_unix_ms(&self) -> u64 {
+        self.generated_at_unix_ms
+    }
+
+    pub(crate) fn real_process_count(&self) -> usize {
+        self.processes.len().saturating_sub(1)
+    }
+
+    pub(crate) fn matching_pid_set(&self, query: &ProcessQuery) -> HashSet<Pid> {
+        let root = Pid::from_u32(0);
+        self.processes
+            .values()
+            .filter(|process| process.pid != root)
+            .filter(|process| {
+                let subtree = self.resource(process.pid);
+                let direct_children = self.children_of(process.pid).len();
+                query.matches(process, subtree, direct_children)
+            })
+            .map(|process| process.pid)
+            .collect()
     }
 }
 
@@ -73,26 +124,7 @@ pub(crate) fn capture_snapshot(sample_ms: u64) -> ProcessSnapshot {
 
 fn matching_pids(snapshot: &ProcessSnapshot, query: &str) -> Result<Vec<Pid>, String> {
     let query = ProcessQuery::parse(query)?;
-    let root = Pid::from_u32(0);
-    let mut pids: Vec<Pid> = snapshot
-        .processes
-        .values()
-        .filter(|process| process.pid != root)
-        .filter(|process| {
-            let subtree = snapshot
-                .resources
-                .get(&process.pid)
-                .copied()
-                .unwrap_or_default();
-            let direct_children = snapshot
-                .children
-                .get(&Some(process.pid))
-                .map(Vec::len)
-                .unwrap_or(0);
-            query.matches(process, subtree, direct_children)
-        })
-        .map(|process| process.pid)
-        .collect();
+    let mut pids: Vec<Pid> = snapshot.matching_pid_set(&query).into_iter().collect();
     pids.sort_by_key(|pid| pid.as_u32());
     Ok(pids)
 }
@@ -248,9 +280,9 @@ pub(crate) fn render_table(snapshot: &ProcessSnapshot, query: &str) -> Result<St
             subtree.process_count,
             human_rate(process.read_rate),
             human_rate(process.write_rate),
-            sanitize(&process.user),
-            sanitize(&process.status),
-            sanitize(&process_command_line(process)),
+            sanitize_terminal_text(&process.user),
+            sanitize_terminal_text(&process.status),
+            sanitize_terminal_text(&process_command_line(process)),
         ));
     }
     Ok(output)
@@ -331,17 +363,6 @@ fn human_bytes(value: u64) -> String {
     } else {
         format!("{amount:.2}{}", UNITS[unit])
     }
-}
-
-fn sanitize(value: &str) -> String {
-    value
-        .chars()
-        .map(|character| match character {
-            '\n' | '\r' | '\t' => ' ',
-            character if character.is_control() => '\u{fffd}',
-            character => character,
-        })
-        .collect()
 }
 
 #[cfg(test)]

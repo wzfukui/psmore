@@ -547,7 +547,7 @@ fn attach_linux_threads(proc_root: &str, inspection: &mut ProcessInspection) {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_fd_access(pid: Pid, fd: &str) -> String {
+pub(crate) fn linux_fd_access(pid: Pid, fd: &str) -> String {
     let path = format!("/proc/{pid}/fdinfo/{fd}");
     fs::read_to_string(path)
         .ok()

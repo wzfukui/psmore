@@ -2,7 +2,12 @@ mod actions;
 mod app;
 mod cli;
 mod headless;
+mod headless_deleted;
 mod headless_diff;
+mod headless_inspect;
+mod headless_port;
+mod headless_tree;
+mod headless_watch;
 mod history;
 mod inspection;
 mod model;
@@ -35,7 +40,14 @@ use crate::{
         capture_snapshot, matching_process_count, render_check_json, render_check_table,
         render_json, render_table, validate_query,
     },
+    headless_deleted::{
+        DeletedPolicyStatus, capture_deleted_files, render_deleted_json, render_deleted_table,
+    },
     headless_diff::{load_comparison, render_diff_json, render_diff_table},
+    headless_inspect::{capture_inspection, render_inspection_json, render_inspection_table},
+    headless_port::{capture_port, render_port_json, render_port_table},
+    headless_tree::{build_tree, render_tree_json, render_tree_table},
+    headless_watch::{WatchOutput, run_watch},
     ui::draw,
 };
 
@@ -184,13 +196,149 @@ fn main() -> ExitCode {
                         _ => unreachable!(),
                     }
                     .map_err(io::Error::other)?;
-                    if let Err(error) = write_stdout(&output)
-                        && error.kind() != io::ErrorKind::BrokenPipe
-                    {
-                        return Err(error.into());
+                    if let Err(error) = write_stdout(&output) {
+                        if error.kind() != io::ErrorKind::BrokenPipe {
+                            return Err(error.into());
+                        }
                     }
                 }
                 Ok(passed)
+            })();
+            match result {
+                Ok(true) => ExitCode::SUCCESS,
+                Ok(false) => ExitCode::from(3),
+                Err(error) => runtime_result(Err(error)),
+            }
+        }
+        LaunchMode::InspectTable | LaunchMode::InspectJson => {
+            let Some(pid) = cli.inspect_pid else {
+                return usage_error("inspect requires exactly one PID");
+            };
+            let result = (|| -> Result<(), Box<dyn Error>> {
+                let inspection =
+                    capture_inspection(pid, cli.sample_ms).map_err(io::Error::other)?;
+                let output = match cli.mode {
+                    LaunchMode::InspectTable => render_inspection_table(&inspection),
+                    LaunchMode::InspectJson => {
+                        render_inspection_json(&inspection).map_err(io::Error::other)?
+                    }
+                    _ => unreachable!(),
+                };
+                write_stdout(&output)?;
+                Ok(())
+            })();
+            runtime_result(result)
+        }
+        LaunchMode::PortTable | LaunchMode::PortJson => {
+            let Some(port) = cli.port else {
+                return usage_error("port requires exactly one local port number");
+            };
+            let result = (|| -> Result<bool, Box<dyn Error>> {
+                let captured = capture_port(port, cli.port_protocol, cli.port_all);
+                let matched = captured.matched_endpoint_count();
+                let passed = cli
+                    .port_expectation
+                    .map(|expectation| expectation.passes(matched))
+                    .unwrap_or(true);
+                if !cli.quiet {
+                    let expectation = cli.port_expectation.map(|value| value.label());
+                    let policy_result = cli.port_expectation.map(|_| passed);
+                    let output = match cli.mode {
+                        LaunchMode::PortTable => {
+                            render_port_table(&captured, expectation, policy_result)
+                        }
+                        LaunchMode::PortJson => {
+                            render_port_json(&captured, expectation, policy_result)
+                                .map_err(io::Error::other)?
+                        }
+                        _ => unreachable!(),
+                    };
+                    if let Err(error) = write_stdout(&output) {
+                        if error.kind() != io::ErrorKind::BrokenPipe {
+                            return Err(error.into());
+                        }
+                    }
+                }
+                Ok(passed)
+            })();
+            match result {
+                Ok(true) => ExitCode::SUCCESS,
+                Ok(false) => ExitCode::from(3),
+                Err(error) => runtime_result(Err(error)),
+            }
+        }
+        LaunchMode::TreeTable | LaunchMode::TreeJson => {
+            let Some(pid) = cli.tree_pid else {
+                return usage_error("tree requires exactly one PID");
+            };
+            let result = (|| -> Result<(), Box<dyn Error>> {
+                let snapshot = capture_snapshot(cli.sample_ms);
+                let tree = build_tree(&snapshot, pid, cli.tree_depth).map_err(io::Error::other)?;
+                let output = match cli.mode {
+                    LaunchMode::TreeTable => render_tree_table(&tree),
+                    LaunchMode::TreeJson => render_tree_json(&tree).map_err(io::Error::other)?,
+                    _ => unreachable!(),
+                };
+                write_stdout(&output)?;
+                Ok(())
+            })();
+            runtime_result(result)
+        }
+        LaunchMode::WatchTable | LaunchMode::WatchJsonl => {
+            if let Err(error) = validate_query(&cli.query) {
+                return usage_error(&format!("invalid query: {error}"));
+            }
+            let result = (|| -> Result<(), Box<dyn Error>> {
+                let stdout = io::stdout();
+                let mut stdout = stdout.lock();
+                let output = if cli.mode == LaunchMode::WatchJsonl {
+                    WatchOutput::Jsonl
+                } else {
+                    WatchOutput::Table
+                };
+                run_watch(
+                    &mut stdout,
+                    &cli.query,
+                    cli.watch_interval_ms,
+                    cli.watch_count,
+                    output,
+                )?;
+                Ok(())
+            })();
+            runtime_result(result)
+        }
+        LaunchMode::DeletedTable | LaunchMode::DeletedJson => {
+            let result = (|| -> Result<bool, Box<dyn Error>> {
+                let captured = capture_deleted_files(cli.deleted_min_size);
+                let policy_status = cli
+                    .deleted_expectation
+                    .map(|expectation| captured.evaluate_policy(expectation));
+                if !cli.quiet {
+                    let expectation = cli.deleted_expectation.map(|value| value.label());
+                    let output = match cli.mode {
+                        LaunchMode::DeletedTable => {
+                            render_deleted_table(&captured, expectation, policy_status)
+                        }
+                        LaunchMode::DeletedJson => {
+                            render_deleted_json(&captured, expectation, policy_status)
+                                .map_err(io::Error::other)?
+                        }
+                        _ => unreachable!(),
+                    };
+                    if let Err(error) = write_stdout(&output) {
+                        if error.kind() != io::ErrorKind::BrokenPipe {
+                            return Err(error.into());
+                        }
+                    }
+                }
+                match policy_status {
+                    None | Some(DeletedPolicyStatus::Passed) => Ok(true),
+                    Some(DeletedPolicyStatus::Violated) => Ok(false),
+                    Some(DeletedPolicyStatus::Inconclusive) => Err(io::Error::other(
+                        "deleted-file policy is inconclusive because collection was incomplete",
+                    )
+                    .into()),
+                }
             })();
             match result {
                 Ok(true) => ExitCode::SUCCESS,

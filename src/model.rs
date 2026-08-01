@@ -2,6 +2,59 @@ use std::{collections::HashMap, time::Instant};
 
 use sysinfo::Pid;
 
+pub(crate) fn sanitize_terminal_text(value: &str) -> String {
+    let characters: Vec<char> = value.chars().collect();
+    let mut output = String::with_capacity(value.len());
+    let mut index = 0;
+    while index < characters.len() {
+        if characters[index] == '\\' {
+            let slash_start = index;
+            while index < characters.len() && characters[index] == '\\' {
+                index += 1;
+            }
+            let slash_count = index - slash_start;
+            let escaped_whitespace = characters
+                .get(index..index.saturating_add(3))
+                .map(|digits| matches!(digits, ['0', '1', '1' | '2' | '5']))
+                .unwrap_or(false);
+            if slash_count % 2 == 1 && escaped_whitespace {
+                output.extend(std::iter::repeat_n('\\', slash_count - 1));
+                output.push(' ');
+                index += 3;
+                continue;
+            }
+            output.extend(std::iter::repeat_n('\\', slash_count));
+            continue;
+        }
+        let character = characters[index];
+        output.push(match character {
+            '\n' | '\r' | '\t' => ' ',
+            character if character.is_control() => '\u{fffd}',
+            character => character,
+        });
+        index += 1;
+    }
+    output
+}
+
+#[cfg(test)]
+mod terminal_text_tests {
+    use super::sanitize_terminal_text;
+
+    #[test]
+    fn normalizes_controls_and_ps_octal_whitespace_escapes() {
+        assert_eq!(
+            sanitize_terminal_text("one\\012two\nthree\\011four\tfive\\015six"),
+            "one two three four five six"
+        );
+        assert_eq!(sanitize_terminal_text("bad\u{7}text"), "bad\u{fffd}text");
+        assert_eq!(
+            sanitize_terminal_text(r"literal\\012value"),
+            r"literal\\012value"
+        );
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ProcessInfo {
     pub(crate) pid: Pid,

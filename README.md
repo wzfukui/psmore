@@ -48,6 +48,11 @@
 - 无交互模式执行两次采样，默认间隔 500 ms，使 CPU 与磁盘 I/O 速率具有实际意义；可用 `--sample-ms` 在 100–60000 ms 之间调整
 - `psmore diff BEFORE.json AFTER.json` 将两份持久快照对比为启动/退出、PID 复用、父进程变化，以及 CPU、内存、I/O 和子树进程数增量；默认输出透明的分类榜单，增加 `--json` 可获得完整机器可读差异
 - `psmore check QUERY` 将任意结构化查询变成 CI/运维健康门禁：默认期望零命中，`--expect any` 可反向要求服务存在；支持表格、`psmore.check-result` JSON 和完全静默的 `--quiet`
+- `psmore inspect PID` 将 TUI 深度检查直接带到 SSH、脚本和事故工单：一次输出进程身份、完整命令、热点线程、socket、打开文件及平台运行上下文，也可导出 `psmore.process-inspection` JSON
+- `psmore port PORT` 直接回答“谁占用了这个端口”：将 TCP/UDP 本地端点关联到 PID、用户、完整命令、FD 和 Linux 网络 namespace，并可作为端口存在/释放健康门禁
+- `psmore tree PID` 在非交互环境输出目标的完整父链和后代树，保留目录连接线、稳定同级排序、进程自身/完整子树资源及显式深度截断，也可导出嵌套 JSON
+- `psmore watch [QUERY]` 建立进程基线后持续输出启动、退出、PID 复用、父进程变化及动态查询进入/离开事件；支持实时刷新的表格和每行一个文档的版本化 JSONL
+- `psmore deleted` 定位“文件已删除但进程仍占用”的磁盘空间泄漏：展示 PID、FD、用户、完整命令、文件身份与大小，并按 device+inode 去重估算真正可释放空间
 - 深度检查仅在打开或手动刷新面板时启动后台采样：macOS 调用一次 `lsof`，Linux 直接读取目标进程的 `/proc`，不会加入两秒一次的全局刷新
 - 每 2 秒从系统进程数据刷新一次
 
@@ -112,6 +117,116 @@ psmore check 'cpu>90 age>5m' --quiet
 ```
 
 默认 expectation 是 `none`，即零命中才通过；`--expect any` 表示至少一个命中才通过。命令仍执行两次采样，默认间隔 500 ms，可用 `--sample-ms` 调整。表格首行明确显示 `CHECK PASS` 或 `CHECK FAIL`，随后仅在有命中时列出相关进程；JSON 包含策略、查询、命中数、通过状态以及完整的过滤快照。
+
+### 无交互进程深检
+
+知道异常 PID 后，无需进入 TUI 再定位，可以直接取得适合现场阅读或归档的完整上下文：
+
+```bash
+# SSH 现场阅读：完整命令、资源、线程、socket、文件和平台上下文
+psmore inspect 1234
+
+# 机器可读输出，可附到事故工单或交给 jq/其他诊断程序
+psmore inspect 1234 --json > process-1234.json
+
+# 调整进程 CPU 与 I/O 的采样间隔；Linux 热点线程仍使用自身约 250ms 差分
+psmore inspect 1234 --sample-ms 1000
+```
+
+表格不截断命令、socket 或文件路径；终端自行换行。JSON 使用 `psmore.process-inspection` schema v1，包含采集主机、进程资源、运行上下文、安全信息、namespace、资源限制、热点线程、socket 和打开文件。macOS 的线程 CPU 明确标记为 `scheduler_estimate`，Linux 标记为 `sample_delta` 并记录实际采样毫秒数。
+
+命令在深检前后重新采集目标 PID：若确认发生 PID 复用，会拒绝合并两个进程实例并以退出码 `1` 失败；若目标在采集中正常退出，则保留已经取得的诊断结果，同时将身份标记为 `exited_during_collection`。无法取得启动时间时会标记为 `unverified`，不会伪装成已经确认。输出可能包含敏感参数、路径、用户名、线程名和网络端点，分享前应检查。
+
+### 端口占用诊断
+
+端口命令按本地端口精确匹配，不会把 `8080` 错配到 `18080`，默认同时检查 TCP 监听和 UDP 绑定：
+
+```bash
+# 查明谁监听/绑定了 8080，并展示 PID、用户、FD 和完整命令
+psmore port 8080
+
+# 只查 UDP；--all 还会包含该本地端口上的非监听连接
+psmore port 53 --protocol udp
+psmore port 443 --protocol tcp --all
+
+# 供自动化消费的版本化 JSON
+psmore port 8080 --json | jq '.endpoints[]'
+
+# 要求服务端口存在，或要求发布前端口已经释放
+psmore port 8080 --expect any --quiet
+psmore port 8080 --expect none
+```
+
+不指定 `--expect` 时，端口不存在也属于成功诊断，表格会明确显示零命中。指定 `--expect any|none` 后，策略不满足时退出 `3`；`--quiet` 必须与 expectation 一起使用。JSON 使用 `psmore.port-inspection` schema v1，包含匹配端点数、已知所有者数、无法关联所有者的端点数和采集警告。Linux 会扫描各网络 namespace 并通过 socket inode 反查 PID/FD；macOS 使用一次性 `lsof`。权限不足时不会把未知所有者误标成“端口空闲”。
+
+### 无交互进程关系树
+
+需要把“它是谁启动的、又启动了什么”粘贴到事故工单或在 SSH 管道中处理时，可以直接围绕 PID 截取上下文：
+
+```bash
+# 展示从系统根到 PID 1234 的父链，以及 1234 的完整后代树
+psmore tree 1234
+
+# 只展开两级后代；被隐藏的后代数量会明确显示
+psmore tree 1234 --depth 2
+
+# PID 0 可用于导出完整系统树；大型主机建议同时限制深度
+psmore tree 0 --depth 3
+
+# 嵌套 JSON 适合拓扑分析、归档或后续可视化
+psmore tree 1234 --json > process-tree-1234.json
+```
+
+祖先链始终完整，不计入 `--depth`；深度从目标进程算起，`0` 表示只展示目标，默认 `all`。表格中 `CPU%/TREE`、`MEM/TREE` 和 `PROCS` 同时给出进程自身与完整后代聚合值，即使视觉上因深度限制隐藏了后代，聚合值仍保持完整。命令执行两次采样，默认 500ms，可用 `--sample-ms` 调整。
+
+JSON 使用 `psmore.process-tree` schema v1，将父链放在 `ancestors`，目标及后代放在嵌套 `tree.children`，并分别记录包含虚拟 PID 0 的可见节点数、真实进程数、隐藏后代数和深度限制。文本输出会把真实控制字符及 macOS `ps` 的 `\\011`、`\\012`、`\\015` 空白转义统一为单个空格，避免恶意或异常命令行破坏终端布局。
+
+### 持续事件追踪
+
+活动审计面板适合 TUI 现场查看；需要抓取间歇出现的进程、保留日志或观察资源条件越界时，使用 watch：
+
+```bash
+# 追踪全系统进程启动、退出和父进程变化，Ctrl-C 结束
+psmore watch
+
+# 只关心命令行中包含 worker 的相关生命周期事件
+psmore watch cmd:worker --interval-ms 250
+
+# 动态条件：进程 CPU 越过 80% 时 MATCH，回落时 UNMATCH
+psmore watch 'cpu>80 age>5s'
+
+# JSONL 可直接交给 jq、日志采集器或事件处理程序
+psmore watch 'user:deploy tree.mem>1g' --jsonl
+
+# 自动化测试中采样 20 次后正常结束，并输出 complete 记录
+psmore watch name:api --jsonl --interval-ms 100 --count 20
+```
+
+watch 启动后立即输出 `baseline`，随后按间隔采样。事件类型包括 `started`、`exited`、`reparented`、`matched` 和 `unmatched`；PID 复用会明确产生旧实例退出和新实例启动两条事件，不会合并。watch 自身会从查询匹配中排除，避免观察器成为自己的告警噪声。结构化查询与 TUI、snapshot、check 完全一致，因此支持子树 CPU/内存、运行时间、用户和否定条件；建议优先使用 `name:`、`cmd:` 等字段，避免普通文本同时匹配无关字段。
+
+`--count N` 表示基线之后执行 N 次刷新，默认无限；有限 watch 最后输出 `complete` 及实际进程事件数。JSONL 每行均为独立的 `psmore.process-watch-event` schema v1 文档，包含序号、采样序号、相对/绝对时间、主机、查询、当前匹配数、进程实例、父子关系和自身/子树资源。采样只能发现两次刷新之间至少存在于一个快照中的进程；排查极短命进程时应降低 `--interval-ms`，最小 100ms。
+
+### 已删除但仍占用的文件
+
+日志轮转、发布替换或人工删除后，如果旧进程仍持有 FD，目录中已经看不到文件，但空间不会释放。可以直接找出持有者：
+
+```bash
+# 列出所有当前用户权限范围内可见的 deleted-open 文件
+psmore deleted
+
+# 只关注预计至少占用 100MiB 的文件，支持小数和 k/m/g/t 单位
+psmore deleted --min-size 100m
+
+# JSON 适合巡检归档或接入磁盘告警
+psmore deleted --min-size 1g --json
+
+# 发现任意大文件即以退出码 3 失败；cron 只读取退出码
+psmore deleted --min-size 500m --expect none --quiet
+```
+
+同一个已删除 inode 可能被多个进程或多个 FD 持有。psmore 会保留每条 FD 证据，但总文件数和空间按 device+inode 去重，避免重复计算。Linux 从打开 FD 的 metadata 读取实际分配块，`estimate_basis` 为 `allocated_blocks`；macOS `lsof` 不提供分配块，因此使用逻辑大小上界并明确标记 `logical_size_upper_bound`。稀疏文件、压缩文件系统、快照和文件系统延迟仍可能使最终释放量与估算不同。
+
+JSON 使用 `psmore.deleted-open-files` schema v1，包含唯一文件数、FD 引用数、持有进程数、逻辑大小、预计可释放字节、PID/命令、路径及 inode 身份。指定 `--expect any|none` 后，已确认违反策略退出 `3`；如果零命中但权限或采集竞态使扫描不完整，策略状态为 `inconclusive`、`passed` 为 `null`，命令退出 `1`，不会把“看不见”误判成“没有”。`--quiet` 必须与 expectation 一起使用。psmore 只诊断，不会关闭 FD、截断 `/proc/<pid>/fd/*` 或向进程发送信号；确认业务影响后应优先正常重启或关闭持有进程。
 
 ### 持久快照对比
 
