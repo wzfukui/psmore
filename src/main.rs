@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     io,
+    path::Path,
     process::Command,
     time::{Duration, Instant},
 };
@@ -116,6 +117,52 @@ impl ProcessProvider for MacOsProcessProvider {
                     process.command = command.clone();
                 }
             }
+        }
+
+        let ps_processes: HashMap<u32, (u32, String, String)> = Command::new("ps")
+            .args(["-ww", "-axo", "pid=,ppid=,state=,command="])
+            .output()
+            .ok()
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .filter_map(|line| {
+                        let mut fields = line.trim_start().splitn(4, char::is_whitespace);
+                        let pid = fields.next()?.parse().ok()?;
+                        let ppid = fields.next()?.parse().ok()?;
+                        let state = fields.next()?.to_string();
+                        let command = fields.next().unwrap_or("").trim().to_string();
+                        Some((pid, (ppid, state, command)))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let known_pids: HashSet<u32> = processes
+            .iter()
+            .map(|process| process.pid.as_u32())
+            .collect();
+        for (pid, (ppid, state, command)) in ps_processes {
+            if known_pids.contains(&pid) || pid == 0 {
+                continue;
+            }
+            let executable = command.split_whitespace().next().unwrap_or("").to_string();
+            let name = Path::new(&executable)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty())
+                .unwrap_or(&executable)
+                .to_string();
+            processes.push(ProcessInfo {
+                pid: Pid::from_u32(pid),
+                parent: Some(Pid::from_u32(ppid)),
+                name,
+                command,
+                executable,
+                cpu: 0.0,
+                memory: 0,
+                runtime: 0,
+                status: state,
+            });
         }
 
         // sysinfo can omit PPID for ordinary macOS readers.  The native ps
@@ -328,8 +375,33 @@ impl App {
                 for (index, child) in descendants.iter().enumerate() {
                     let mut child_path = last_path.clone();
                     child_path.push(is_last);
-                    self.walk(*child, child_path, index == descendants.len() - 1, matched);
+                    if !self.search.is_empty() && has_match {
+                        self.walk_context(*child, child_path, index == descendants.len() - 1);
+                    } else {
+                        self.walk(*child, child_path, index == descendants.len() - 1, matched);
+                    }
                 }
+            }
+        }
+    }
+
+    /// Once a search hit is visible, show its complete descendant context.
+    /// Search still filters the ancestors and unrelated branches, but it must
+    /// not hide the children that explain what the matched process owns.
+    fn walk_context(&mut self, pid: Pid, last_path: Vec<bool>, is_last: bool) {
+        let descendants = self.children.get(&Some(pid)).cloned().unwrap_or_default();
+        let depth = last_path.len();
+        self.visible.push(TreeRow {
+            pid,
+            depth,
+            last_path: last_path.clone(),
+            is_last,
+        });
+        if self.expanded.contains(&pid) && !self.collapsed.contains(&pid) {
+            for (index, child) in descendants.iter().enumerate() {
+                let mut child_path = last_path.clone();
+                child_path.push(is_last);
+                self.walk_context(*child, child_path, index == descendants.len() - 1);
             }
         }
     }
