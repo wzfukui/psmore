@@ -1,0 +1,922 @@
+use std::{
+    collections::{HashMap, HashSet},
+    time::{Duration, Instant},
+};
+
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use sysinfo::Pid;
+use unicode_width::UnicodeWidthStr;
+
+use crate::{
+    history::ResourceHistory,
+    inspection::inspect_process,
+    model::{
+        ChangeSummary, MarqueePhase, ProcessChange, ProcessEvent, ProcessInfo, ProcessInspection,
+        ResourceAggregate, SortMode, TreeRow, diff_processes, process_path,
+    },
+    network::{NetworkScan, scan_network},
+    provider::{NativeProcessProvider, ProcessProvider},
+    snapshot::BaselineSnapshot,
+};
+
+pub(crate) fn aggregate_resources(
+    processes: &HashMap<Pid, ProcessInfo>,
+    children: &HashMap<Option<Pid>, Vec<Pid>>,
+) -> HashMap<Pid, ResourceAggregate> {
+    fn visit(
+        pid: Pid,
+        processes: &HashMap<Pid, ProcessInfo>,
+        children: &HashMap<Option<Pid>, Vec<Pid>>,
+        cache: &mut HashMap<Pid, ResourceAggregate>,
+        visiting: &mut HashSet<Pid>,
+    ) -> ResourceAggregate {
+        if let Some(total) = cache.get(&pid) {
+            return *total;
+        }
+        if !visiting.insert(pid) {
+            return ResourceAggregate::default();
+        }
+        let mut total = processes
+            .get(&pid)
+            .map(|process| ResourceAggregate {
+                cpu: process.cpu,
+                memory: process.memory,
+                process_count: usize::from(pid.as_u32() != 0),
+            })
+            .unwrap_or_default();
+        if let Some(descendants) = children.get(&Some(pid)) {
+            for child in descendants {
+                if *child != pid {
+                    total.add(visit(*child, processes, children, cache, visiting));
+                }
+            }
+        }
+        visiting.remove(&pid);
+        cache.insert(pid, total);
+        total
+    }
+
+    let mut resources = HashMap::with_capacity(processes.len());
+    let mut visiting = HashSet::new();
+    let mut pids: Vec<Pid> = processes.keys().copied().collect();
+    pids.sort_by_key(|pid| pid.as_u32());
+    for pid in pids {
+        visit(pid, processes, children, &mut resources, &mut visiting);
+    }
+    resources
+}
+
+pub(crate) fn sort_processes(
+    pids: &mut [Pid],
+    mode: SortMode,
+    processes: &HashMap<Pid, ProcessInfo>,
+    resources: &HashMap<Pid, ResourceAggregate>,
+) {
+    pids.sort_by(|left, right| {
+        let left_resource = resources.get(left).copied().unwrap_or_default();
+        let right_resource = resources.get(right).copied().unwrap_or_default();
+        let hot_order = match mode {
+            SortMode::Stable => std::cmp::Ordering::Equal,
+            SortMode::SubtreeCpu => right_resource.cpu.total_cmp(&left_resource.cpu),
+            SortMode::SubtreeMemory => right_resource.memory.cmp(&left_resource.memory),
+        };
+        hot_order.then_with(|| {
+            let left_name = processes
+                .get(left)
+                .map(|process| process.name.to_lowercase())
+                .unwrap_or_default();
+            let right_name = processes
+                .get(right)
+                .map(|process| process.name.to_lowercase())
+                .unwrap_or_default();
+            (left_name, left.as_u32()).cmp(&(right_name, right.as_u32()))
+        })
+    });
+}
+
+pub(crate) struct App {
+    pub(crate) provider: NativeProcessProvider,
+    pub(crate) processes: HashMap<Pid, ProcessInfo>,
+    pub(crate) children: HashMap<Option<Pid>, Vec<Pid>>,
+    pub(crate) resources: HashMap<Pid, ResourceAggregate>,
+    pub(crate) history: ResourceHistory,
+    pub(crate) trend_pid: Option<Pid>,
+    pub(crate) baseline: Option<BaselineSnapshot>,
+    pub(crate) show_snapshot_diff: bool,
+    pub(crate) snapshot_diff_scroll: u16,
+    pub(crate) network_scan: Option<NetworkScan>,
+    pub(crate) network_selected: usize,
+    pub(crate) network_filter: String,
+    pub(crate) network_searching: bool,
+    pub(crate) sort_mode: SortMode,
+    pub(crate) visible: Vec<TreeRow>,
+    pub(crate) selected: usize,
+    pub(crate) expanded: HashSet<Pid>,
+    pub(crate) collapsed: HashSet<Pid>,
+    pub(crate) search: String,
+    pub(crate) searching: bool,
+    pub(crate) focus: Option<Pid>,
+    pub(crate) last_refresh: Instant,
+    pub(crate) marquee_offset: usize,
+    pub(crate) last_marquee: Instant,
+    pub(crate) marquee_pid: Option<Pid>,
+    pub(crate) marquee_phase: MarqueePhase,
+    pub(crate) page_size: usize,
+    pub(crate) error: Option<String>,
+    pub(crate) paused: bool,
+    pub(crate) show_events: bool,
+    pub(crate) events: Vec<ProcessEvent>,
+    pub(crate) last_changes: ChangeSummary,
+    pub(crate) inspection: Option<ProcessInspection>,
+    pub(crate) inspection_scroll: u16,
+}
+
+impl App {
+    pub(crate) fn new() -> Self {
+        let mut app = Self {
+            provider: NativeProcessProvider::new(),
+            processes: HashMap::new(),
+            children: HashMap::new(),
+            resources: HashMap::new(),
+            history: ResourceHistory::default(),
+            trend_pid: None,
+            baseline: None,
+            show_snapshot_diff: false,
+            snapshot_diff_scroll: 0,
+            network_scan: None,
+            network_selected: 0,
+            network_filter: String::new(),
+            network_searching: false,
+            sort_mode: SortMode::Stable,
+            visible: Vec::new(),
+            selected: 0,
+            expanded: HashSet::new(),
+            collapsed: HashSet::new(),
+            search: String::new(),
+            searching: false,
+            focus: None,
+            last_refresh: Instant::now(),
+            marquee_offset: 0,
+            last_marquee: Instant::now(),
+            marquee_pid: None,
+            marquee_phase: MarqueePhase::Scrolling,
+            page_size: 10,
+            error: None,
+            paused: false,
+            show_events: false,
+            events: Vec::new(),
+            last_changes: ChangeSummary::default(),
+            inspection: None,
+            inspection_scroll: 0,
+        };
+        app.refresh();
+        app
+    }
+
+    pub(crate) fn refresh(&mut self) {
+        let next_processes: HashMap<Pid, ProcessInfo> = self
+            .provider
+            .refresh()
+            .into_iter()
+            .map(|p| (p.pid, p))
+            .collect();
+        let changes = if self.processes.is_empty() {
+            Vec::new()
+        } else {
+            diff_processes(&self.processes, &next_processes)
+        };
+        self.processes = next_processes;
+        self.record_changes(changes);
+        self.children.clear();
+        for process in self.processes.values() {
+            self.children
+                .entry(process.parent)
+                .or_default()
+                .push(process.pid);
+        }
+        self.resources = aggregate_resources(&self.processes, &self.children);
+        let observed_at = Instant::now();
+        self.history
+            .record(&self.processes, &self.resources, observed_at);
+        self.sort_children();
+        if self.expanded.is_empty() {
+            self.expanded.insert(Pid::from_u32(0));
+            self.expanded.extend(
+                self.children
+                    .values()
+                    .flatten()
+                    .filter(|pid| {
+                        self.children
+                            .get(&Some(**pid))
+                            .map(|c| !c.is_empty())
+                            .unwrap_or(false)
+                    })
+                    .copied(),
+            );
+        }
+        self.rebuild_visible();
+        self.last_refresh = observed_at;
+        self.error = None;
+    }
+
+    fn record_changes(&mut self, changes: Vec<ProcessChange>) {
+        let mut summary = ChangeSummary::default();
+        let now = Instant::now();
+        for change in changes {
+            match &change {
+                ProcessChange::Started { .. } => summary.started += 1,
+                ProcessChange::Exited { .. } => summary.exited += 1,
+                ProcessChange::Reparented { .. } => summary.reparented += 1,
+            }
+            self.events.push(ProcessEvent {
+                change,
+                observed_at: now,
+            });
+        }
+        self.last_changes = summary;
+        const MAX_EVENTS: usize = 200;
+        if self.events.len() > MAX_EVENTS {
+            self.events.drain(..self.events.len() - MAX_EVENTS);
+        }
+    }
+
+    pub(crate) fn recent_change(&self, pid: Pid) -> Option<&ProcessChange> {
+        self.events
+            .iter()
+            .rev()
+            .find(|event| {
+                event.change.pid() == pid && event.observed_at.elapsed() <= Duration::from_secs(5)
+            })
+            .map(|event| &event.change)
+    }
+
+    fn toggle_paused(&mut self) {
+        self.paused = !self.paused;
+        if !self.paused {
+            self.refresh();
+        }
+    }
+
+    fn open_inspection(&mut self) {
+        let Some(process) = self
+            .selected_pid()
+            .and_then(|pid| self.processes.get(&pid))
+            .cloned()
+        else {
+            return;
+        };
+        self.show_events = false;
+        self.inspection = Some(inspect_process(&process));
+        self.inspection_scroll = 0;
+    }
+
+    fn refresh_inspection(&mut self) {
+        let Some(pid) = self.inspection.as_ref().map(|inspection| inspection.pid) else {
+            self.open_inspection();
+            return;
+        };
+        let Some(process) = self.processes.get(&pid).cloned() else {
+            if let Some(inspection) = &mut self.inspection {
+                inspection.warning = Some("process has exited since this snapshot".into());
+            }
+            return;
+        };
+        self.inspection = Some(inspect_process(&process));
+        self.inspection_scroll = 0;
+    }
+
+    fn rebuild_visible(&mut self) {
+        let old_pid = self.visible.get(self.selected).map(|row| row.pid);
+        self.visible.clear();
+        let matched: HashSet<Pid> = self
+            .processes
+            .values()
+            .filter(|p| {
+                self.search.is_empty()
+                    || format!("{} {} {}", p.name, p.command, p.pid)
+                        .to_lowercase()
+                        .contains(&self.search.to_lowercase())
+            })
+            .map(|p| p.pid)
+            .collect();
+
+        if let Some(focus) = self.focus {
+            let mut chain = Vec::new();
+            let mut current = Some(focus);
+            while let Some(pid) = current {
+                chain.push(pid);
+                current = self.processes.get(&pid).and_then(|p| p.parent);
+            }
+            chain.reverse();
+            for (depth, pid) in chain.iter().enumerate() {
+                self.visible.push(TreeRow {
+                    pid: *pid,
+                    depth,
+                    last_path: vec![false; depth],
+                    is_last: depth == chain.len().saturating_sub(1),
+                });
+            }
+            self.walk_children(focus, chain.len(), vec![false; chain.len()], &matched);
+        } else {
+            let roots = [Pid::from_u32(0)];
+            for (index, pid) in roots.iter().enumerate() {
+                self.walk(*pid, Vec::new(), index == roots.len() - 1, &matched);
+            }
+        }
+        if self.visible.is_empty() && !self.processes.is_empty() {
+            let mut all: Vec<Pid> = self.processes.keys().copied().collect();
+            all.sort_by_key(|p| p.as_u32());
+            for pid in all {
+                if matched.contains(&pid) {
+                    self.visible.push(TreeRow {
+                        pid,
+                        depth: 0,
+                        last_path: Vec::new(),
+                        is_last: true,
+                    });
+                }
+            }
+        }
+        self.selected = old_pid
+            .and_then(|pid| self.visible.iter().position(|row| row.pid == pid))
+            .unwrap_or(self.selected.min(self.visible.len().saturating_sub(1)));
+    }
+
+    fn walk(&mut self, pid: Pid, last_path: Vec<bool>, is_last: bool, matched: &HashSet<Pid>) {
+        let has_match = matched.contains(&pid);
+        let descendants = self.children.get(&Some(pid)).cloned().unwrap_or_default();
+        let descendant_match = descendants
+            .iter()
+            .any(|child| self.has_matching_descendant(*child, matched));
+        if has_match || descendant_match || self.search.is_empty() {
+            let depth = last_path.len();
+            self.visible.push(TreeRow {
+                pid,
+                depth,
+                last_path: last_path.clone(),
+                is_last,
+            });
+            if self.expanded.contains(&pid)
+                || (!self.search.is_empty() && descendant_match && !self.collapsed.contains(&pid))
+            {
+                for (index, child) in descendants.iter().enumerate() {
+                    let mut child_path = last_path.clone();
+                    child_path.push(is_last);
+                    if !self.search.is_empty() && has_match {
+                        self.walk_context(*child, child_path, index == descendants.len() - 1);
+                    } else {
+                        self.walk(*child, child_path, index == descendants.len() - 1, matched);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Once a search hit is visible, show its complete descendant context.
+    /// Search still filters the ancestors and unrelated branches, but it must
+    /// not hide the children that explain what the matched process owns.
+    fn walk_context(&mut self, pid: Pid, last_path: Vec<bool>, is_last: bool) {
+        let descendants = self.children.get(&Some(pid)).cloned().unwrap_or_default();
+        let depth = last_path.len();
+        self.visible.push(TreeRow {
+            pid,
+            depth,
+            last_path: last_path.clone(),
+            is_last,
+        });
+        if self.expanded.contains(&pid) && !self.collapsed.contains(&pid) {
+            for (index, child) in descendants.iter().enumerate() {
+                let mut child_path = last_path.clone();
+                child_path.push(is_last);
+                self.walk_context(*child, child_path, index == descendants.len() - 1);
+            }
+        }
+    }
+
+    fn walk_children(
+        &mut self,
+        pid: Pid,
+        depth: usize,
+        last_path: Vec<bool>,
+        matched: &HashSet<Pid>,
+    ) {
+        let descendants = self.children.get(&Some(pid)).cloned().unwrap_or_default();
+        for (index, child) in descendants.iter().enumerate() {
+            if matched.contains(child)
+                || self.search.is_empty()
+                || self.has_matching_descendant(*child, matched)
+            {
+                let mut child_path = last_path.clone();
+                child_path.push(index == descendants.len() - 1);
+                self.visible.push(TreeRow {
+                    pid: *child,
+                    depth,
+                    last_path: child_path.clone(),
+                    is_last: index == descendants.len() - 1,
+                });
+                if self.expanded.contains(child)
+                    || (self.search.is_empty() && !self.collapsed.contains(child))
+                    || (!self.search.is_empty()
+                        && self.has_matching_descendant(*child, matched)
+                        && !self.collapsed.contains(child))
+                {
+                    self.walk_children(*child, depth + 1, child_path, matched);
+                }
+            }
+        }
+    }
+
+    fn has_matching_descendant(&self, pid: Pid, matched: &HashSet<Pid>) -> bool {
+        if matched.contains(&pid) {
+            return true;
+        }
+        self.children
+            .get(&Some(pid))
+            .map(|children| {
+                children
+                    .iter()
+                    .any(|p| self.has_matching_descendant(*p, matched))
+            })
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn selected_pid(&self) -> Option<Pid> {
+        self.visible.get(self.selected).map(|row| row.pid)
+    }
+
+    fn selected_context(&self) -> Option<String> {
+        let pid = self.selected_pid()?;
+        let process = self.processes.get(&pid)?;
+        Some(process_path(process))
+    }
+
+    pub(crate) fn advance_marquee(&mut self, width: usize) {
+        let selected = self.selected_pid();
+        if self.marquee_pid != selected {
+            self.marquee_pid = selected;
+            self.marquee_offset = 0;
+            self.marquee_phase = MarqueePhase::Scrolling;
+            self.last_marquee = Instant::now();
+        }
+        let Some(context) = self.selected_context() else {
+            return;
+        };
+        let max_offset = context.width().saturating_sub(width);
+        if width == 0 || max_offset == 0 {
+            self.marquee_offset = 0;
+            self.marquee_phase = MarqueePhase::Scrolling;
+            return;
+        }
+        let now = Instant::now();
+        match self.marquee_phase {
+            MarqueePhase::Scrolling => {
+                if now.duration_since(self.last_marquee) >= Duration::from_millis(125) {
+                    self.marquee_offset = self.marquee_offset.saturating_add(1);
+                    self.last_marquee = now;
+                    if self.marquee_offset >= max_offset {
+                        self.marquee_offset = max_offset;
+                        self.marquee_phase = MarqueePhase::TailPause;
+                    }
+                }
+            }
+            MarqueePhase::TailPause => {
+                if now.duration_since(self.last_marquee) >= Duration::from_millis(2500) {
+                    self.marquee_offset = 0;
+                    self.marquee_phase = MarqueePhase::ResetPause;
+                    self.last_marquee = now;
+                }
+            }
+            MarqueePhase::ResetPause => {
+                if now.duration_since(self.last_marquee) >= Duration::from_millis(1000) {
+                    self.marquee_phase = MarqueePhase::Scrolling;
+                    self.last_marquee = now;
+                }
+            }
+        }
+    }
+
+    fn select_first_match(&mut self) {
+        if self.search.is_empty() {
+            return;
+        }
+        let query = self.search.to_lowercase();
+        if let Some(index) = self.visible.iter().position(|row| {
+            self.processes
+                .get(&row.pid)
+                .map(|p| {
+                    format!("{} {} {}", p.name, p.command, p.pid)
+                        .to_lowercase()
+                        .contains(&query)
+                })
+                .unwrap_or(false)
+        }) {
+            self.selected = index;
+        }
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if self.visible.is_empty() {
+            return;
+        }
+        let max = self.visible.len() - 1;
+        self.selected = (self.selected as isize + delta).clamp(0, max as isize) as usize;
+    }
+
+    fn toggle_focus(&mut self) {
+        self.focus = if self.focus == self.selected_pid() {
+            None
+        } else {
+            self.selected_pid()
+        };
+        self.selected = 0;
+        self.rebuild_visible();
+    }
+
+    fn toggle_selected_expanded(&mut self) {
+        if let Some(pid) = self.selected_pid()
+            && self
+                .children
+                .get(&Some(pid))
+                .map(|c| !c.is_empty())
+                .unwrap_or(false)
+        {
+            if !self.expanded.insert(pid) {
+                self.expanded.remove(&pid);
+                self.collapsed.insert(pid);
+            } else {
+                self.collapsed.remove(&pid);
+            }
+            self.rebuild_visible();
+        }
+    }
+
+    fn sort_children(&mut self) {
+        for children in self.children.values_mut() {
+            sort_processes(children, self.sort_mode, &self.processes, &self.resources);
+        }
+    }
+
+    fn cycle_sort_mode(&mut self) {
+        self.sort_mode = self.sort_mode.next();
+        self.sort_children();
+        self.rebuild_visible();
+    }
+
+    fn reveal_parent(&mut self) {
+        let Some(pid) = self.selected_pid() else {
+            return;
+        };
+        let Some(parent) = self.processes.get(&pid).and_then(|p| p.parent) else {
+            return;
+        };
+
+        // Expose the complete ancestor path, but keep the parent's other branches collapsed.
+        let mut current = Some(parent);
+        while let Some(ancestor) = current {
+            self.expanded.insert(ancestor);
+            self.collapsed.remove(&ancestor);
+            current = self.processes.get(&ancestor).and_then(|p| p.parent);
+        }
+        if let Some(siblings) = self.children.get(&Some(parent)).cloned() {
+            for sibling in siblings {
+                if sibling != pid {
+                    self.expanded.remove(&sibling);
+                    self.collapsed.insert(sibling);
+                }
+            }
+        }
+        self.rebuild_visible();
+        if let Some(index) = self.visible.iter().position(|row| row.pid == parent) {
+            self.selected = index;
+        }
+    }
+
+    fn finish_search(&mut self) {
+        if !self.searching {
+            return;
+        }
+        self.searching = false;
+        self.search.clear();
+        self.rebuild_visible();
+    }
+
+    fn capture_baseline(&mut self) {
+        self.baseline = Some(BaselineSnapshot::capture(
+            &self.processes,
+            &self.resources,
+            Instant::now(),
+        ));
+        self.snapshot_diff_scroll = 0;
+    }
+
+    fn open_network(&mut self) {
+        self.network_scan = Some(scan_network(&self.processes));
+        self.network_selected = 0;
+        self.network_filter.clear();
+        self.network_searching = false;
+        self.show_events = false;
+        self.inspection = None;
+        self.trend_pid = None;
+        self.show_snapshot_diff = false;
+    }
+
+    fn refresh_network(&mut self) {
+        self.network_scan = Some(scan_network(&self.processes));
+        let visible = self.network_visible_indices();
+        self.network_selected = self.network_selected.min(visible.len().saturating_sub(1));
+    }
+
+    pub(crate) fn network_visible_indices(&self) -> Vec<usize> {
+        self.network_scan
+            .as_ref()
+            .map(|scan| {
+                scan.listeners
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, listener)| listener.matches(&self.network_filter))
+                    .map(|(index, _)| index)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn move_network_selection(&mut self, delta: isize) {
+        let visible_len = self.network_visible_indices().len();
+        if visible_len == 0 {
+            self.network_selected = 0;
+            return;
+        }
+        self.network_selected = (self.network_selected as isize + delta)
+            .clamp(0, visible_len.saturating_sub(1) as isize)
+            as usize;
+    }
+
+    fn jump_to_process(&mut self, pid: Pid) {
+        if !self.processes.contains_key(&pid) {
+            return;
+        }
+        self.network_scan = None;
+        self.network_filter.clear();
+        self.network_searching = false;
+        self.search.clear();
+        self.searching = false;
+        self.focus = None;
+        let mut current = Some(pid);
+        while let Some(process_pid) = current {
+            self.expanded.insert(process_pid);
+            self.collapsed.remove(&process_pid);
+            current = self
+                .processes
+                .get(&process_pid)
+                .and_then(|process| process.parent);
+        }
+        self.rebuild_visible();
+        if let Some(index) = self.visible.iter().position(|row| row.pid == pid) {
+            self.selected = index;
+        }
+    }
+
+    pub(crate) fn on_key(&mut self, key: KeyEvent) -> bool {
+        if key.kind != KeyEventKind::Press {
+            return false;
+        }
+        if self.show_snapshot_diff {
+            match key.code {
+                KeyCode::Char('q') => return true,
+                KeyCode::Esc | KeyCode::Char('d') => {
+                    self.show_snapshot_diff = false;
+                    self.snapshot_diff_scroll = 0;
+                }
+                KeyCode::Char('b') => self.capture_baseline(),
+                KeyCode::Char('x') => {
+                    self.baseline = None;
+                    self.show_snapshot_diff = false;
+                    self.snapshot_diff_scroll = 0;
+                }
+                KeyCode::Char('r') => self.refresh(),
+                KeyCode::Char(' ') => self.toggle_paused(),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.snapshot_diff_scroll = self.snapshot_diff_scroll.saturating_add(1);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.snapshot_diff_scroll = self.snapshot_diff_scroll.saturating_sub(1);
+                }
+                KeyCode::PageDown => {
+                    self.snapshot_diff_scroll = self.snapshot_diff_scroll.saturating_add(10);
+                }
+                KeyCode::PageUp => {
+                    self.snapshot_diff_scroll = self.snapshot_diff_scroll.saturating_sub(10);
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
+                _ => {}
+            }
+            return false;
+        }
+        if self.network_scan.is_some() {
+            if self.network_searching {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.network_searching = false;
+                        self.network_filter.clear();
+                        self.network_selected = 0;
+                    }
+                    KeyCode::Enter => self.network_searching = false,
+                    KeyCode::Backspace => {
+                        self.network_filter.pop();
+                        self.network_selected = 0;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => self.move_network_selection(1),
+                    KeyCode::Up | KeyCode::Char('k') => self.move_network_selection(-1),
+                    KeyCode::PageDown => self.move_network_selection(10),
+                    KeyCode::PageUp => self.move_network_selection(-10),
+                    KeyCode::Char(c) if key.modifiers.is_empty() => {
+                        self.network_filter.push(c);
+                        self.network_selected = 0;
+                    }
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return true;
+                    }
+                    _ => {}
+                }
+                return false;
+            }
+            match key.code {
+                KeyCode::Char('q') => return true,
+                KeyCode::Esc | KeyCode::Char('n') => {
+                    self.network_scan = None;
+                    self.network_filter.clear();
+                    self.network_searching = false;
+                }
+                KeyCode::Char('r') => self.refresh_network(),
+                KeyCode::Char('/') => {
+                    self.network_searching = true;
+                    self.network_filter.clear();
+                    self.network_selected = 0;
+                }
+                KeyCode::Char('x') => {
+                    self.network_filter.clear();
+                    self.network_selected = 0;
+                }
+                KeyCode::Down | KeyCode::Char('j') => self.move_network_selection(1),
+                KeyCode::Up | KeyCode::Char('k') => self.move_network_selection(-1),
+                KeyCode::PageDown => self.move_network_selection(10),
+                KeyCode::PageUp => self.move_network_selection(-10),
+                KeyCode::Enter => {
+                    let pid = self
+                        .network_visible_indices()
+                        .get(self.network_selected)
+                        .and_then(|index| {
+                            self.network_scan
+                                .as_ref()
+                                .and_then(|scan| scan.listeners.get(*index))
+                        })
+                        .and_then(|listener| listener.pid);
+                    if let Some(pid) = pid {
+                        self.jump_to_process(pid);
+                    }
+                }
+                KeyCode::Char(' ') => self.toggle_paused(),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
+                _ => {}
+            }
+            return false;
+        }
+        if self.trend_pid.is_some() {
+            match key.code {
+                KeyCode::Char('q') => return true,
+                KeyCode::Esc | KeyCode::Char('t') => self.trend_pid = None,
+                KeyCode::Char(' ') => self.toggle_paused(),
+                KeyCode::Char('r') => self.refresh(),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
+                _ => {}
+            }
+            return false;
+        }
+        if self.inspection.is_some() {
+            match key.code {
+                KeyCode::Char('q') => return true,
+                KeyCode::Esc => {
+                    self.inspection = None;
+                    self.inspection_scroll = 0;
+                }
+                KeyCode::Enter | KeyCode::Char('r') => self.refresh_inspection(),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.inspection_scroll = self.inspection_scroll.saturating_add(1);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.inspection_scroll = self.inspection_scroll.saturating_sub(1);
+                }
+                KeyCode::PageDown => {
+                    self.inspection_scroll = self.inspection_scroll.saturating_add(10);
+                }
+                KeyCode::PageUp => {
+                    self.inspection_scroll = self.inspection_scroll.saturating_sub(10);
+                }
+                KeyCode::Char(' ') => self.toggle_paused(),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
+                _ => {}
+            }
+            return false;
+        }
+        if self.show_events {
+            match key.code {
+                KeyCode::Char('q') => return true,
+                KeyCode::Esc | KeyCode::Char('e') => self.show_events = false,
+                KeyCode::Char(' ') => self.toggle_paused(),
+                KeyCode::Char('r') => self.refresh(),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
+                _ => {}
+            }
+            return false;
+        }
+        if self.searching {
+            match key.code {
+                KeyCode::Esc => {
+                    self.searching = false;
+                    self.search.clear();
+                    self.rebuild_visible();
+                }
+                KeyCode::Enter => {
+                    // `/` is a transient locator. Keep the selected process,
+                    // then restore the complete tree for relationship work.
+                    self.finish_search();
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.move_selection(1);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.move_selection(-1);
+                }
+                KeyCode::PageDown => {
+                    self.move_selection(self.page_size as isize);
+                }
+                KeyCode::PageUp => {
+                    self.move_selection(-(self.page_size as isize));
+                }
+                KeyCode::Left => {
+                    self.reveal_parent();
+                }
+                KeyCode::Right => {
+                    self.toggle_selected_expanded();
+                }
+                KeyCode::Backspace => {
+                    self.search.pop();
+                    self.rebuild_visible();
+                }
+                KeyCode::Char(c) if key.modifiers.is_empty() => {
+                    self.search.push(c);
+                    self.rebuild_visible();
+                    self.select_first_match();
+                }
+                _ => {}
+            }
+            return false;
+        }
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => return true,
+            KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
+            KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
+            KeyCode::PageDown => self.move_selection(self.page_size as isize),
+            KeyCode::PageUp => self.move_selection(-(self.page_size as isize)),
+            KeyCode::Left => {
+                self.reveal_parent();
+            }
+            KeyCode::Right => self.toggle_selected_expanded(),
+            KeyCode::Char('/') => {
+                self.searching = true;
+                self.search.clear();
+            }
+            KeyCode::Char('f') => self.toggle_focus(),
+            KeyCode::Char('s') => self.cycle_sort_mode(),
+            KeyCode::Char('r') => self.refresh(),
+            KeyCode::Char(' ') => self.toggle_paused(),
+            KeyCode::Char('e') => {
+                self.show_events = true;
+                self.inspection = None;
+            }
+            KeyCode::Char('t') => {
+                self.trend_pid = self.selected_pid();
+                self.show_events = false;
+                self.inspection = None;
+            }
+            KeyCode::Char('b') => self.capture_baseline(),
+            KeyCode::Char('d') if self.baseline.is_some() => {
+                self.show_snapshot_diff = true;
+                self.snapshot_diff_scroll = 0;
+                self.show_events = false;
+                self.inspection = None;
+                self.trend_pid = None;
+            }
+            KeyCode::Char('x') => {
+                self.baseline = None;
+                self.show_snapshot_diff = false;
+                self.snapshot_diff_scroll = 0;
+            }
+            KeyCode::Char('n') => self.open_network(),
+            KeyCode::Enter => self.open_inspection(),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
+            _ => {}
+        }
+        false
+    }
+}

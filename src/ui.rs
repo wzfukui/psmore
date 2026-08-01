@@ -1,0 +1,1036 @@
+use ratatui::{
+    Frame,
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    symbols,
+    text::{Line, Span, Text},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Sparkline, Wrap},
+};
+use sysinfo::Pid;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+use crate::{
+    app::App,
+    model::{
+        InspectionField, ProcessChange, ProcessEvent, ProcessInspection, TreeRow,
+        process_command_line, process_path,
+    },
+    network::NetworkListener,
+    provider::platform_name,
+    snapshot::{ProcessSnapshotEntry, SnapshotDiff},
+};
+
+fn row_label_and_context(app: &App, row: &TreeRow) -> (String, String) {
+    let p = &app.processes[&row.pid];
+    let child_count = app
+        .children
+        .get(&Some(row.pid))
+        .map(|c| c.len())
+        .unwrap_or(0);
+    let marker = if app
+        .children
+        .get(&Some(row.pid))
+        .map(|c| !c.is_empty())
+        .unwrap_or(false)
+    {
+        if app.expanded.contains(&row.pid) {
+            "▾"
+        } else {
+            "▸"
+        }
+    } else {
+        "·"
+    };
+    let mut prefix = String::new();
+    for is_last in row
+        .last_path
+        .iter()
+        .skip(1)
+        .take(row.depth.saturating_sub(1))
+    {
+        prefix.push_str(if *is_last { "  " } else { "│ " });
+    }
+    if row.depth > 0 {
+        prefix.push_str(if row.is_last { "└─" } else { "├─" });
+    }
+    let context = process_path(p);
+    let name = if child_count > 0 && !app.expanded.contains(&row.pid) {
+        format!("{} ({})", p.name, child_count)
+    } else {
+        p.name.clone()
+    };
+    (
+        format!("{}{} {}  [{}]", prefix, marker, name, row.pid),
+        context,
+    )
+}
+
+fn marquee(text: &str, offset: usize, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if text.width() <= width {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let start = offset.min(chars.len().saturating_sub(1));
+    let mut result = String::new();
+    let mut used = 0;
+    let mut index = start;
+    while used < width {
+        let ch = chars[index];
+        let char_width = ch.width().unwrap_or(1);
+        if used + char_width > width {
+            break;
+        }
+        result.push(ch);
+        used += char_width;
+        index += 1;
+        if index >= chars.len() {
+            break;
+        }
+    }
+    result
+}
+
+fn wrapped_lines(text: &str, width: usize) -> usize {
+    if width == 0 {
+        return 1;
+    }
+    text.width().max(1).div_ceil(width)
+}
+
+fn detail_height(app: &App, area: ratatui::layout::Rect) -> u16 {
+    let Some(pid) = app.selected_pid() else {
+        return 4;
+    };
+    let Some(process) = app.processes.get(&pid) else {
+        return 4;
+    };
+    let width = area.width.saturating_sub(2).max(1) as usize;
+    let command = process_command_line(process);
+    let children = app
+        .children
+        .get(&Some(pid))
+        .map(|items| items.len())
+        .unwrap_or(0);
+    let subtree = app.resources.get(&pid).copied().unwrap_or_default();
+    let summary = format!(
+        "PID {}  PPID {}  children {}  status {}  CPU {:.1}%  MEM {} MB  runtime {}s",
+        pid,
+        process
+            .parent
+            .map(|parent| parent.to_string())
+            .unwrap_or_else(|| "-".into()),
+        children,
+        process.status,
+        process.cpu,
+        process.memory / 1024 / 1024,
+        process.runtime
+    );
+    let tree = format!(
+        "TREE {} proc (self + descendants)  CPU {:.1}%  MEM {} MB",
+        subtree.process_count,
+        subtree.cpu,
+        subtree.memory / 1024 / 1024
+    );
+    let content_lines = wrapped_lines(&summary, width)
+        + wrapped_lines(&tree, width)
+        + wrapped_lines(&command, width);
+    let desired = (content_lines + 2).max(4) as u16;
+    desired.min(area.height.saturating_sub(5).max(4))
+}
+
+fn parent_label(parent: Option<Pid>) -> String {
+    parent
+        .map(|pid| pid.to_string())
+        .unwrap_or_else(|| "-".into())
+}
+
+fn event_line(event: &ProcessEvent) -> Line<'static> {
+    let age = event.observed_at.elapsed().as_secs();
+    let (color, text) = match &event.change {
+        ProcessChange::Started { pid, name, parent } => (
+            Color::LightGreen,
+            format!(
+                "{:>4}s  + {} [{}]  parent {}",
+                age,
+                name,
+                pid,
+                parent_label(*parent)
+            ),
+        ),
+        ProcessChange::Exited { pid, name } => (
+            Color::LightRed,
+            format!("{:>4}s  - {} [{}]", age, name, pid),
+        ),
+        ProcessChange::Reparented {
+            pid,
+            name,
+            old_parent,
+            new_parent,
+        } => (
+            Color::LightYellow,
+            format!(
+                "{:>4}s  ↪ {} [{}]  {} → {}",
+                age,
+                name,
+                pid,
+                parent_label(*old_parent),
+                parent_label(*new_parent)
+            ),
+        ),
+    };
+    Line::from(Span::styled(text, Style::default().fg(color)))
+}
+
+fn draw_event_overlay(frame: &mut Frame, app: &App, area: Rect) {
+    let width = area.width.saturating_sub(2).clamp(1, 100);
+    let height = area.height.saturating_sub(2).clamp(1, 18);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let line_limit = height.saturating_sub(2) as usize;
+    let lines = if app.events.is_empty() {
+        vec![Line::from(" No process changes captured yet ")]
+    } else {
+        app.events
+            .iter()
+            .rev()
+            .take(line_limit)
+            .map(event_line)
+            .collect()
+    };
+    let title = format!(" process changes ({})  Esc/e close ", app.events.len());
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
+fn push_inspection_fields(lines: &mut Vec<Line<'static>>, title: &str, fields: &[InspectionField]) {
+    if fields.is_empty() {
+        return;
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!("{title} ({})", fields.len()),
+        Style::default()
+            .fg(Color::LightCyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    for field in fields {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {:<24}", field.label),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::raw(field.value.clone()),
+        ]));
+    }
+}
+
+fn inspection_lines(inspection: &ProcessInspection) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("USER ", Style::default().fg(Color::Cyan)),
+            Span::raw(inspection.user.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled("CWD  ", Style::default().fg(Color::Cyan)),
+            Span::raw(inspection.cwd.clone()),
+        ]),
+    ];
+    if let Some(warning) = &inspection.warning {
+        lines.push(Line::from(Span::styled(
+            format!("WARNING  {warning}"),
+            Style::default().fg(Color::LightRed),
+        )));
+    }
+    push_inspection_fields(&mut lines, "RUNTIME CONTEXT", &inspection.runtime);
+    push_inspection_fields(&mut lines, "SECURITY", &inspection.security);
+    push_inspection_fields(&mut lines, "NAMESPACES", &inspection.namespaces);
+    push_inspection_fields(&mut lines, "RESOURCE LIMITS", &inspection.limits);
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!("NETWORK ({})", inspection.sockets.len()),
+        Style::default()
+            .fg(Color::LightCyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    if inspection.sockets.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No sockets visible",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for socket in &inspection.sockets {
+            let state = if socket.state.is_empty() {
+                "-"
+            } else {
+                &socket.state
+            };
+            lines.push(Line::from(format!(
+                "  {:<6} {:<12} fd {:<6} {}",
+                socket.protocol, state, socket.fd, socket.endpoint
+            )));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!("OPEN FILE DESCRIPTORS ({})", inspection.files.len()),
+        Style::default()
+            .fg(Color::LightCyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    if inspection.files.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No file descriptors visible",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for file in &inspection.files {
+            lines.push(Line::from(format!(
+                "  fd {:<6} {:<6} {:<2} {}",
+                file.fd, file.kind, file.access, file.name
+            )));
+        }
+    }
+    lines
+}
+
+fn draw_inspection_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
+    let Some(inspection) = &app.inspection else {
+        return;
+    };
+    let width = area.width.saturating_sub(2).clamp(1, 140);
+    let height = area.height.saturating_sub(2).max(1);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let lines = inspection_lines(inspection);
+    let content_height = height.saturating_sub(2) as usize;
+    let content_width = width.saturating_sub(2).max(1) as usize;
+    let visual_lines = lines
+        .iter()
+        .map(|line| line.width().max(1).div_ceil(content_width))
+        .sum::<usize>();
+    let max_scroll = visual_lines
+        .saturating_sub(content_height)
+        .min(u16::MAX as usize) as u16;
+    app.inspection_scroll = app.inspection_scroll.min(max_scroll);
+    let title = format!(
+        " inspect {} [{}]  Enter/r refresh  ↑↓ scroll  Esc close ",
+        inspection.name, inspection.pid
+    );
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .scroll((app.inspection_scroll, 0))
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
+fn f32_stats(values: &[f32]) -> (f32, f32, f32) {
+    if values.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
+    let current = *values.last().unwrap_or(&0.0);
+    let average = values.iter().copied().sum::<f32>() / values.len() as f32;
+    let maximum = values.iter().copied().fold(0.0_f32, f32::max);
+    (current, average, maximum)
+}
+
+fn memory_stats(values: &[u64]) -> (u64, u64, u64) {
+    if values.is_empty() {
+        return (0, 0, 0);
+    }
+    let current = *values.last().unwrap_or(&0);
+    let average =
+        (values.iter().map(|value| *value as u128).sum::<u128>() / values.len() as u128) as u64;
+    let maximum = values.iter().copied().max().unwrap_or(0);
+    (current, average, maximum)
+}
+
+fn cpu_sparkline_data(values: &[f32]) -> Vec<u64> {
+    values
+        .iter()
+        .map(|value| (value.max(0.0) * 100.0).round() as u64)
+        .collect()
+}
+
+fn memory_sparkline_data(values: &[u64]) -> Vec<u64> {
+    values
+        .iter()
+        .map(|value| ((*value as f64 / 1024.0 / 1024.0) * 10.0).round() as u64)
+        .collect()
+}
+
+fn draw_trend_overlay(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(pid) = app.trend_pid else {
+        return;
+    };
+    let width = area.width.saturating_sub(2).clamp(1, 120);
+    let height = area.height.saturating_sub(2).clamp(1, 22);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let name = app
+        .processes
+        .get(&pid)
+        .map(|process| process.name.as_str())
+        .or_else(|| app.history.name(pid))
+        .unwrap_or("exited process");
+    let title = format!(" trends {name} [{pid}]  t/Esc close  r sample ");
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+
+    let Some(samples) = app.history.samples(pid) else {
+        frame.render_widget(Paragraph::new("No samples available"), inner);
+        return;
+    };
+    if inner.height < 10 || inner.width < 10 {
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{} samples; enlarge terminal for charts",
+                samples.len()
+            )),
+            inner,
+        );
+        return;
+    }
+
+    let own_cpu: Vec<f32> = samples.iter().map(|sample| sample.own_cpu).collect();
+    let subtree_cpu: Vec<f32> = samples.iter().map(|sample| sample.subtree_cpu).collect();
+    let own_memory: Vec<u64> = samples.iter().map(|sample| sample.own_memory).collect();
+    let subtree_memory: Vec<u64> = samples.iter().map(|sample| sample.subtree_memory).collect();
+    let own_cpu_data = cpu_sparkline_data(&own_cpu);
+    let subtree_cpu_data = cpu_sparkline_data(&subtree_cpu);
+    let own_memory_data = memory_sparkline_data(&own_memory);
+    let subtree_memory_data = memory_sparkline_data(&subtree_memory);
+    let cpu_scale = own_cpu_data
+        .iter()
+        .chain(&subtree_cpu_data)
+        .copied()
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let memory_scale = own_memory_data
+        .iter()
+        .chain(&subtree_memory_data)
+        .copied()
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let (own_cpu_now, own_cpu_avg, own_cpu_max) = f32_stats(&own_cpu);
+    let (tree_cpu_now, tree_cpu_avg, tree_cpu_max) = f32_stats(&subtree_cpu);
+    let (own_mem_now, own_mem_avg, own_mem_max) = memory_stats(&own_memory);
+    let (tree_mem_now, tree_mem_avg, tree_mem_max) = memory_stats(&subtree_memory);
+    let window = samples
+        .front()
+        .zip(samples.back())
+        .map(|(first, last)| {
+            last.observed_at
+                .saturating_duration_since(first.observed_at)
+                .as_secs()
+        })
+        .unwrap_or(0);
+    let subtree_processes = samples
+        .back()
+        .map(|sample| sample.subtree_processes)
+        .unwrap_or(0);
+
+    let chunks = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Min(0),
+    ])
+    .split(inner);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(format!(
+                " {} samples / {}s window | subtree {} proc | newest at right",
+                samples.len(),
+                window,
+                subtree_processes
+            )),
+            Line::from(" shared scale per metric: self and tree charts are directly comparable"),
+        ]),
+        chunks[0],
+    );
+    frame.render_widget(
+        Sparkline::default()
+            .block(Block::default().borders(Borders::TOP).title(format!(
+                " CPU self   now {own_cpu_now:.1}%  avg {own_cpu_avg:.1}%  max {own_cpu_max:.1}% "
+            )))
+            .data(&own_cpu_data)
+            .max(cpu_scale)
+            .bar_set(symbols::bar::NINE_LEVELS)
+            .style(Style::default().fg(Color::Yellow)),
+        chunks[1],
+    );
+    frame.render_widget(
+        Sparkline::default()
+            .block(Block::default().borders(Borders::TOP).title(format!(
+                " CPU tree   now {tree_cpu_now:.1}%  avg {tree_cpu_avg:.1}%  max {tree_cpu_max:.1}% "
+            )))
+            .data(&subtree_cpu_data)
+            .max(cpu_scale)
+            .bar_set(symbols::bar::NINE_LEVELS)
+            .style(Style::default().fg(Color::LightRed)),
+        chunks[2],
+    );
+    frame.render_widget(
+        Sparkline::default()
+            .block(Block::default().borders(Borders::TOP).title(format!(
+                " MEM self   now {} MB  avg {} MB  max {} MB ",
+                own_mem_now / 1024 / 1024,
+                own_mem_avg / 1024 / 1024,
+                own_mem_max / 1024 / 1024
+            )))
+            .data(&own_memory_data)
+            .max(memory_scale)
+            .bar_set(symbols::bar::NINE_LEVELS)
+            .style(Style::default().fg(Color::Cyan)),
+        chunks[3],
+    );
+    frame.render_widget(
+        Sparkline::default()
+            .block(Block::default().borders(Borders::TOP).title(format!(
+                " MEM tree   now {} MB  avg {} MB  max {} MB ",
+                tree_mem_now / 1024 / 1024,
+                tree_mem_avg / 1024 / 1024,
+                tree_mem_max / 1024 / 1024
+            )))
+            .data(&subtree_memory_data)
+            .max(memory_scale)
+            .bar_set(symbols::bar::NINE_LEVELS)
+            .style(Style::default().fg(Color::LightMagenta)),
+        chunks[4],
+    );
+}
+
+fn format_signed_bytes(delta: i128) -> String {
+    let sign = if delta >= 0 { "+" } else { "-" };
+    let bytes = delta.unsigned_abs();
+    if bytes >= 1024 * 1024 {
+        format!("{sign}{:.1} MB", bytes as f64 / 1024.0 / 1024.0)
+    } else if bytes >= 1024 {
+        format!("{sign}{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{sign}{bytes} B")
+    }
+}
+
+fn snapshot_entry_line(prefix: &str, entry: &ProcessSnapshotEntry, color: Color) -> Line<'static> {
+    let parent = parent_label(entry.parent);
+    let command = if entry.command.is_empty() {
+        "[command unavailable]".to_string()
+    } else {
+        entry.command.clone()
+    };
+    Line::from(Span::styled(
+        format!(
+            " {prefix} {} [{}] parent {} | tree {} proc {} MB | {}",
+            entry.name,
+            entry.pid,
+            parent,
+            entry.subtree.process_count,
+            entry.subtree.memory / 1024 / 1024,
+            command
+        ),
+        Style::default().fg(color),
+    ))
+}
+
+fn snapshot_diff_lines(diff: &SnapshotDiff) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        format!(
+            "PROCESS CHANGES  +{} started  -{} exited  ↪{} reparented",
+            diff.started.len(),
+            diff.exited.len(),
+            diff.reparented.len()
+        ),
+        Style::default()
+            .fg(Color::LightCyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    if diff.started.is_empty() && diff.exited.is_empty() && diff.reparented.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " no process identity or relationship changes",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for entry in &diff.started {
+            lines.push(snapshot_entry_line("+", entry, Color::LightGreen));
+        }
+        for entry in &diff.exited {
+            lines.push(snapshot_entry_line("-", entry, Color::LightRed));
+        }
+        for entry in &diff.reparented {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    " ↪ {} [{}] parent {} → {}",
+                    entry.name,
+                    entry.pid,
+                    parent_label(entry.old_parent),
+                    parent_label(entry.new_parent)
+                ),
+                Style::default().fg(Color::LightYellow),
+            )));
+        }
+    }
+
+    let mut memory_growth: Vec<_> = diff
+        .resource_deltas
+        .iter()
+        .filter(|delta| delta.subtree_memory > 0)
+        .collect();
+    memory_growth.sort_by_key(|delta| std::cmp::Reverse(delta.subtree_memory));
+    let memory_growth_count = memory_growth.len();
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        if memory_growth_count > 50 {
+            format!("TOP TREE MEMORY GROWTH ({memory_growth_count}, showing 50)")
+        } else {
+            format!("TOP TREE MEMORY GROWTH ({memory_growth_count})")
+        },
+        Style::default()
+            .fg(Color::LightMagenta)
+            .add_modifier(Modifier::BOLD),
+    )));
+    if memory_growth.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " no surviving process subtree increased memory",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for delta in memory_growth.into_iter().take(50) {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    " {}  {} [{}] | now {} MB | own {} | children {:+}",
+                    format_signed_bytes(delta.subtree_memory),
+                    delta.name,
+                    delta.pid,
+                    delta.current_subtree.memory / 1024 / 1024,
+                    format_signed_bytes(delta.own_memory),
+                    delta.subtree_processes
+                ),
+                Style::default().fg(Color::LightMagenta),
+            )));
+        }
+    }
+
+    let mut cpu_growth: Vec<_> = diff
+        .resource_deltas
+        .iter()
+        .filter(|delta| delta.subtree_cpu > 0.1)
+        .collect();
+    cpu_growth.sort_by(|left, right| right.subtree_cpu.total_cmp(&left.subtree_cpu));
+    let cpu_growth_count = cpu_growth.len();
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        if cpu_growth_count > 50 {
+            format!("TOP TREE CPU INCREASE ({cpu_growth_count}, showing 50)")
+        } else {
+            format!("TOP TREE CPU INCREASE ({cpu_growth_count})")
+        },
+        Style::default()
+            .fg(Color::LightRed)
+            .add_modifier(Modifier::BOLD),
+    )));
+    if cpu_growth.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " no surviving process subtree increased CPU by more than 0.1%",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for delta in cpu_growth.into_iter().take(50) {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    " {:+.1}%  {} [{}] | now {:.1}% | own {:+.1}%",
+                    delta.subtree_cpu,
+                    delta.name,
+                    delta.pid,
+                    delta.current_subtree.cpu,
+                    delta.own_cpu
+                ),
+                Style::default().fg(Color::LightRed),
+            )));
+        }
+    }
+    lines
+}
+
+fn draw_snapshot_diff_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
+    let Some(baseline) = &app.baseline else {
+        return;
+    };
+    let width = area.width.saturating_sub(2).clamp(1, 140);
+    let height = area.height.saturating_sub(2).max(1);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let diff = baseline.diff(&app.processes, &app.resources);
+    let lines = snapshot_diff_lines(&diff);
+    let content_height = height.saturating_sub(4) as usize;
+    let max_scroll = lines
+        .len()
+        .saturating_sub(content_height)
+        .min(u16::MAX as usize) as u16;
+    app.snapshot_diff_scroll = app.snapshot_diff_scroll.min(max_scroll);
+    let age = baseline.captured_at.elapsed().as_secs();
+    let current_count = app.processes.len().saturating_sub(1);
+    let system = diff
+        .system_delta
+        .as_ref()
+        .map(|delta| {
+            format!(
+                "system ΔCPU {:+.1}% ΔMEM {} proc {:+}",
+                delta.subtree_cpu,
+                format_signed_bytes(delta.subtree_memory),
+                delta.subtree_processes
+            )
+        })
+        .unwrap_or_else(|| "system totals unavailable".into());
+    let title = format!(
+        " baseline diff {}s  {}→{} proc  {}  ↑↓ scroll  b reset  x clear  d/Esc close ",
+        age,
+        baseline.len(),
+        current_count,
+        system
+    );
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .scroll((app.snapshot_diff_scroll, 0)),
+        popup,
+    );
+}
+
+fn network_listener_line(listener: &NetworkListener) -> String {
+    let owner = listener
+        .pid
+        .map(|pid| format!("{} [{pid}]", listener.process))
+        .unwrap_or_else(|| listener.process.clone());
+    let namespace = if listener.namespace.is_empty() {
+        String::new()
+    } else {
+        format!(" | {}", listener.namespace)
+    };
+    format!(
+        " {:<4} {:<7} {:<30} | {} | fd {}{}",
+        listener.protocol, listener.state, listener.endpoint, owner, listener.fd, namespace
+    )
+}
+
+fn draw_network_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
+    let Some(scan) = &app.network_scan else {
+        return;
+    };
+    let width = area.width.saturating_sub(2).clamp(1, 150);
+    let height = area.height.saturating_sub(2).max(1);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(popup);
+    let visible = app.network_visible_indices();
+    app.network_selected = app.network_selected.min(visible.len().saturating_sub(1));
+    let items = visible
+        .iter()
+        .filter_map(|index| scan.listeners.get(*index))
+        .map(|listener| {
+            let style = if listener.pid.is_some() {
+                Style::default().fg(Color::White)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            ListItem::new(network_listener_line(listener)).style(style)
+        })
+        .collect::<Vec<_>>();
+    let mode = if app.network_searching {
+        format!(" find: {}_", app.network_filter)
+    } else if app.network_filter.is_empty() {
+        String::new()
+    } else {
+        format!(" filter: {}", app.network_filter)
+    };
+    let title = format!(
+        " network listeners {}/{}{} ",
+        visible.len(),
+        scan.listeners.len(),
+        mode
+    );
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
+    let mut state = ListState::default();
+    if !visible.is_empty() {
+        state.select(Some(app.network_selected));
+    }
+    frame.render_widget(Clear, popup);
+    frame.render_stateful_widget(list, chunks[0], &mut state);
+    let warning = scan
+        .warning
+        .as_deref()
+        .unwrap_or("ownership complete for visible processes");
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(" ↑↓/jk move | / find | Enter jump | r rescan | x clear | n/Esc close "),
+            Line::from(Span::styled(
+                format!(" {warning}"),
+                Style::default().fg(if scan.warning.is_some() {
+                    Color::Yellow
+                } else {
+                    Color::DarkGray
+                }),
+            )),
+        ]),
+        chunks[1],
+    );
+}
+
+pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
+    let area = frame.area();
+    let detail_height = detail_height(app, area);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(3),
+            Constraint::Length(detail_height),
+            Constraint::Length(2),
+        ])
+        .split(area);
+    app.page_size = chunks[0].height.saturating_sub(2).max(1) as usize;
+    let mut title = match (&app.focus, app.searching) {
+        (Some(pid), true) => format!(" psmore  focus={}  search: {}", pid, app.search),
+        (Some(pid), false) if !app.search.is_empty() => {
+            format!(" psmore  focus={}  filter: {}", pid, app.search)
+        }
+        (Some(pid), false) => format!(" psmore  focus={} ", pid),
+        (None, true) => format!(" psmore  search: {}", app.search),
+        (None, false) if !app.search.is_empty() => format!(" psmore  filter: {}", app.search),
+        (None, false) => format!(" psmore  {} process relationships ", platform_name()),
+    };
+    if app.paused {
+        title.push_str(" PAUSED ");
+    }
+    title.push_str(&format!(" sort={} ", app.sort_mode.label()));
+    let selected_pid = app.selected_pid();
+    let selected_parent =
+        selected_pid.and_then(|pid| app.processes.get(&pid).and_then(|p| p.parent));
+    let selected_depth = app.visible.get(app.selected).map(|row| row.depth);
+    let selected_name =
+        selected_pid.and_then(|pid| app.processes.get(&pid).map(|process| process.name.clone()));
+    let row_parts: Vec<(String, String)> = app
+        .visible
+        .iter()
+        .map(|row| row_label_and_context(app, row))
+        .collect();
+    let path_column = row_parts
+        .iter()
+        .map(|(label, _)| label.width())
+        .max()
+        .unwrap_or(0)
+        + 2;
+    let tree_width = chunks[0].width.saturating_sub(2) as usize;
+    let path_width = tree_width.saturating_sub(path_column);
+    app.advance_marquee(path_width);
+    let items: Vec<ListItem> = app
+        .visible
+        .iter()
+        .zip(row_parts.iter())
+        .map(|(row, (label, context))| {
+            let p = &app.processes[&row.pid];
+            let line = format!(
+                "{}{}{}",
+                label,
+                " ".repeat(path_column.saturating_sub(label.width())),
+                marquee(
+                    context,
+                    if Some(row.pid) == selected_pid {
+                        app.marquee_offset
+                    } else {
+                        0
+                    },
+                    path_width,
+                )
+            );
+            let same_name_as_selected = app.searching
+                && Some(row.pid) != selected_pid
+                && selected_name
+                    .as_deref()
+                    .map(|name| name == p.name)
+                    .unwrap_or(false);
+            let recent_change = app.recent_change(row.pid);
+            let sibling_background_allowed = selected_depth.map(|depth| depth > 2).unwrap_or(false);
+            let style = if Some(row.pid) == selected_pid {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else if same_name_as_selected {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else if matches!(recent_change, Some(ProcessChange::Started { .. })) {
+                Style::default()
+                    .fg(Color::LightGreen)
+                    .add_modifier(Modifier::BOLD)
+            } else if matches!(recent_change, Some(ProcessChange::Reparented { .. })) {
+                Style::default()
+                    .fg(Color::LightYellow)
+                    .add_modifier(Modifier::BOLD)
+            } else if sibling_background_allowed
+                && selected_parent.is_some()
+                && p.parent == selected_parent
+                && Some(row.pid) != selected_pid
+            {
+                // Crossterm has no portable alpha channel. Dim cyan gives
+                // sibling rows a clear, approximately 30% emphasis.
+                Style::default()
+                    .fg(Color::Cyan)
+                    .bg(Color::Rgb(0, 64, 72))
+                    .add_modifier(Modifier::DIM)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            ListItem::new(line).style(style)
+        })
+        .collect();
+    let tree = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
+    let mut tree_state = ListState::default();
+    tree_state.select(Some(app.selected));
+    frame.render_stateful_widget(tree, chunks[0], &mut tree_state);
+
+    let detail = if let Some(pid) = app.selected_pid() {
+        let p = &app.processes[&pid];
+        let command = process_command_line(p);
+        let children = app.children.get(&Some(pid)).map(|c| c.len()).unwrap_or(0);
+        let subtree = app.resources.get(&pid).copied().unwrap_or_default();
+        let mut detail_lines = vec![Line::from(vec![
+            Span::styled(
+                format!("PID {}", pid),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(
+                "  PPID {}  children {}  status {}  CPU {:.1}%  MEM {} MB  runtime {}s",
+                p.parent
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "-".into()),
+                children,
+                p.status,
+                p.cpu,
+                p.memory / 1024 / 1024,
+                p.runtime
+            )),
+        ])];
+        detail_lines.push(Line::from(vec![
+            Span::styled(
+                "TREE",
+                Style::default()
+                    .fg(Color::LightMagenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(
+                " {} proc (self + descendants)  CPU {:.1}%  MEM {} MB",
+                subtree.process_count,
+                subtree.cpu,
+                subtree.memory / 1024 / 1024
+            )),
+        ]));
+        detail_lines.push(Line::from(command));
+        Text::from(detail_lines)
+    } else {
+        Text::from("No processes found")
+    };
+    frame.render_widget(
+        Paragraph::new(detail)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" selected process "),
+            )
+            .wrap(Wrap { trim: false }),
+        chunks[1],
+    );
+    let total_processes = app.processes.len().saturating_sub(1);
+    let total_pages = app.visible.len().div_ceil(app.page_size);
+    let total_pages = total_pages.max(1);
+    let current_page = (app.selected / app.page_size + 1).min(total_pages);
+    let live_state = if app.paused { "PAUSED" } else { "LIVE" };
+    let baseline_state = app
+        .baseline
+        .as_ref()
+        .map(|baseline| format!("base {}s", baseline.captured_at.elapsed().as_secs()))
+        .unwrap_or_else(|| "no base".into());
+    let footer = Paragraph::new(vec![
+        Line::from(format!(
+            " {} proc | page {}/{} | {} | {} | sort {} | +{} -{} ↪{} | q quit ",
+            total_processes,
+            current_page,
+            total_pages,
+            live_state,
+            baseline_state,
+            app.sort_mode.label(),
+            app.last_changes.started,
+            app.last_changes.exited,
+            app.last_changes.reparented,
+        )),
+        Line::from(
+            " ↑↓/jk move | ←/→ tree | / find | s sort | t trend | n ports | b base | d diff | Enter ",
+        ),
+    ])
+    .style(Style::default().fg(if app.paused {
+        Color::Yellow
+    } else {
+        Color::DarkGray
+    }));
+    frame.render_widget(footer, chunks[2]);
+
+    if app.network_scan.is_some() {
+        draw_network_overlay(frame, app, area);
+    } else if app.show_snapshot_diff {
+        draw_snapshot_diff_overlay(frame, app, area);
+    } else if app.trend_pid.is_some() {
+        draw_trend_overlay(frame, app, area);
+    } else if app.inspection.is_some() {
+        draw_inspection_overlay(frame, app, area);
+    } else if app.show_events {
+        draw_event_overlay(frame, app, area);
+    }
+}
