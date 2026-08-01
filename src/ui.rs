@@ -14,10 +14,10 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     app::App,
     model::{
-        HotspotMetric, HotspotScope, InspectionField, ProcessChange, ProcessEvent,
-        ProcessInspection, TreeRow, TrendView, process_command_line, process_path,
+        AttentionSeverity, HotspotMetric, HotspotScope, InspectionField, ProcessChange,
+        ProcessEvent, ProcessInspection, TreeRow, TrendView, process_command_line, process_path,
     },
-    network::NetworkListener,
+    network::NetworkEndpoint,
     provider::platform_name,
     snapshot::{ProcessSnapshotEntry, SnapshotDiff},
 };
@@ -156,7 +156,9 @@ fn parent_label(parent: Option<Pid>) -> String {
 fn event_line(event: &ProcessEvent) -> Line<'static> {
     let age = event.observed_at.elapsed().as_secs();
     let (color, text) = match &event.change {
-        ProcessChange::Started { pid, name, parent } => (
+        ProcessChange::Started {
+            pid, name, parent, ..
+        } => (
             Color::LightGreen,
             format!(
                 "{:>4}s  + {} [{}]  parent {}",
@@ -166,7 +168,7 @@ fn event_line(event: &ProcessEvent) -> Line<'static> {
                 parent_label(*parent)
             ),
         ),
-        ProcessChange::Exited { pid, name } => (
+        ProcessChange::Exited { pid, name, .. } => (
             Color::LightRed,
             format!("{:>4}s  - {} [{}]", age, name, pid),
         ),
@@ -175,6 +177,7 @@ fn event_line(event: &ProcessEvent) -> Line<'static> {
             name,
             old_parent,
             new_parent,
+            ..
         } => (
             Color::LightYellow,
             format!(
@@ -323,7 +326,27 @@ fn draw_inspection_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         width,
         height,
     );
-    let lines = inspection_lines(inspection);
+    let mut lines = inspection_lines(inspection);
+    let inspection_status = if app.inspection_is_scanning() {
+        let elapsed = app.inspection_elapsed();
+        lines.insert(0, Line::from(""));
+        lines.insert(
+            0,
+            Line::from(Span::styled(
+                format!(
+                    " {} collecting process context in the background ({:.1}s)",
+                    activity_spinner(elapsed),
+                    elapsed.as_secs_f64()
+                ),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+        );
+        "  scanning"
+    } else {
+        ""
+    };
     let content_height = height.saturating_sub(2) as usize;
     let content_width = width.saturating_sub(2).max(1) as usize;
     let visual_lines = lines
@@ -335,8 +358,8 @@ fn draw_inspection_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         .min(u16::MAX as usize) as u16;
     app.inspection_scroll = app.inspection_scroll.min(max_scroll);
     let title = format!(
-        " inspect {} [{}]  Enter/r refresh  ↑↓ scroll  Esc close ",
-        inspection.name, inspection.pid
+        " inspect {} [{}]{}  Enter/r refresh  ↑↓ scroll  Esc close ",
+        inspection.name, inspection.pid, inspection_status
     );
     frame.render_widget(Clear, popup);
     frame.render_widget(
@@ -909,26 +932,34 @@ fn draw_snapshot_diff_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
     );
 }
 
-fn network_listener_line(listener: &NetworkListener) -> String {
-    let owner = listener
+fn network_endpoint_line(endpoint: &NetworkEndpoint) -> String {
+    let owner = endpoint
         .pid
-        .map(|pid| format!("{} [{pid}]", listener.process))
-        .unwrap_or_else(|| listener.process.clone());
-    let namespace = if listener.namespace.is_empty() {
+        .map(|pid| format!("{} [{pid}]", endpoint.process))
+        .unwrap_or_else(|| endpoint.process.clone());
+    let namespace = if endpoint.namespace.is_empty() {
         String::new()
     } else {
-        format!(" | {}", listener.namespace)
+        format!(" | {}", endpoint.namespace)
+    };
+    let route = if endpoint.remote_endpoint.is_empty() {
+        endpoint.local_endpoint.clone()
+    } else {
+        format!("{} → {}", endpoint.local_endpoint, endpoint.remote_endpoint)
     };
     format!(
-        " {:<4} {:<7} {:<30} | {} | fd {}{}",
-        listener.protocol, listener.state, listener.endpoint, owner, listener.fd, namespace
+        " {:<4} {:<11} {:<45} | {} | fd {}{}",
+        endpoint.protocol, endpoint.state, route, owner, endpoint.fd, namespace
     )
 }
 
+fn activity_spinner(elapsed: Duration) -> &'static str {
+    const FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+    let index = (elapsed.as_millis() / 125) as usize % FRAMES.len();
+    FRAMES[index]
+}
+
 fn draw_network_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
-    let Some(scan) = &app.network_scan else {
-        return;
-    };
     let width = area.width.saturating_sub(2).clamp(1, 150);
     let height = area.height.saturating_sub(2).max(1);
     let popup = Rect::new(
@@ -937,19 +968,50 @@ fn draw_network_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         width,
         height,
     );
+    frame.render_widget(Clear, popup);
+    let Some(scan) = &app.network_scan else {
+        let elapsed = app.network_scan_elapsed();
+        let spinner = activity_spinner(elapsed);
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!(
+                        " {spinner} collecting TCP, UDP and Unix endpoints in the background ({:.1}s)",
+                        elapsed.as_secs_f64()
+                    ),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    " The process tree remains live. Press n/Esc to close; the scan may finish in the background.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ])
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" network scan "),
+            ),
+            popup,
+        );
+        return;
+    };
     let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(popup);
     let visible = app.network_visible_indices();
     app.network_selected = app.network_selected.min(visible.len().saturating_sub(1));
     let items = visible
         .iter()
-        .filter_map(|index| scan.listeners.get(*index))
-        .map(|listener| {
-            let style = if listener.pid.is_some() {
+        .filter_map(|index| scan.endpoints.get(*index))
+        .map(|endpoint| {
+            let style = if endpoint.pid.is_some() {
                 Style::default().fg(Color::White)
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            ListItem::new(network_listener_line(listener)).style(style)
+            ListItem::new(network_endpoint_line(endpoint)).style(style)
         })
         .collect::<Vec<_>>();
     let mode = if app.network_searching {
@@ -959,11 +1021,23 @@ fn draw_network_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         format!(" filter: {}", app.network_filter)
     };
+    let scanning = if app.network_is_scanning() {
+        let elapsed = app.network_scan_elapsed();
+        format!(
+            "  {} rescanning {:.1}s",
+            activity_spinner(elapsed),
+            elapsed.as_secs_f64()
+        )
+    } else {
+        String::new()
+    };
     let title = format!(
-        " network listeners {}/{}{} ",
+        " network {} {}/{}{}{} ",
+        app.network_scope.label(),
         visible.len(),
-        scan.listeners.len(),
-        mode
+        scan.endpoints.len(),
+        mode,
+        scanning,
     );
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
@@ -977,18 +1051,22 @@ fn draw_network_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
     if !visible.is_empty() {
         state.select(Some(app.network_selected));
     }
-    frame.render_widget(Clear, popup);
     frame.render_stateful_widget(list, chunks[0], &mut state);
-    let warning = scan
-        .warning
-        .as_deref()
-        .unwrap_or("ownership complete for visible processes");
+    let warning = if app.network_is_scanning() {
+        "showing the previous snapshot while a fresh scan runs"
+    } else {
+        scan.warning
+            .as_deref()
+            .unwrap_or("ownership complete for visible processes")
+    };
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(" ↑↓/jk move | / find | Enter jump | r rescan | x clear | n/Esc close "),
+            Line::from(
+                " ↑↓/jk move | v listeners/all | / find | Enter jump | r rescan | x clear | n/Esc close ",
+            ),
             Line::from(Span::styled(
                 format!(" {warning}"),
-                Style::default().fg(if scan.warning.is_some() {
+                Style::default().fg(if scan.warning.is_some() || app.network_is_scanning() {
                     Color::Yellow
                 } else {
                     Color::DarkGray
@@ -1006,6 +1084,158 @@ fn hotspot_color(metric: HotspotMetric) -> Color {
         HotspotMetric::Read => Color::LightCyan,
         HotspotMetric::Write => Color::Yellow,
     }
+}
+
+fn attention_color(severity: AttentionSeverity) -> Color {
+    match severity {
+        AttentionSeverity::Critical => Color::LightRed,
+        AttentionSeverity::Warning => Color::Yellow,
+        AttentionSeverity::Watch => Color::LightBlue,
+    }
+}
+
+fn draw_attention_overlay(frame: &mut Frame, app: &App, area: Rect) {
+    let width = area.width.saturating_sub(2).clamp(1, 150);
+    let height = area.height.saturating_sub(2).max(1);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" attention cockpit ");
+    let inner = block.inner(popup);
+    let sections = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(3),
+        Constraint::Length(6),
+    ])
+    .split(inner);
+    let findings = app.attention_findings();
+    let critical = findings
+        .iter()
+        .filter(|finding| finding.severity == AttentionSeverity::Critical)
+        .count();
+    let warning = findings
+        .iter()
+        .filter(|finding| finding.severity == AttentionSeverity::Warning)
+        .count();
+    let watch = findings.len().saturating_sub(critical + warning);
+    let selected_index = app
+        .attention_selected
+        .and_then(|pid| findings.iter().position(|finding| finding.pid == pid));
+    let capacity = sections[1].height.max(1) as usize;
+    let offset = selected_index
+        .map(|index| index.saturating_sub(capacity.saturating_sub(1)))
+        .unwrap_or(0);
+    let items: Vec<ListItem> =
+        if findings.is_empty() {
+            vec![ListItem::new(
+            " no current findings — no unhealthy state, churn, sustained load, or rapid growth",
+        )
+        .style(Style::default().fg(Color::DarkGray))]
+        } else {
+            findings
+                .iter()
+                .skip(offset)
+                .take(capacity)
+                .filter_map(|finding| {
+                    let process = app.processes.get(&finding.pid)?;
+                    let first_reason = finding.reasons.first().map(String::as_str).unwrap_or("");
+                    Some(
+                        ListItem::new(format!(
+                            " {:<5} {:>3}  {} [{}]  {}",
+                            finding.severity.label(),
+                            finding.score,
+                            process.name,
+                            finding.pid,
+                            first_reason
+                        ))
+                        .style(Style::default().fg(attention_color(finding.severity))),
+                    )
+                })
+                .collect()
+        };
+    let list = List::new(items).highlight_style(
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    );
+    let mut state = ListState::default();
+    if let Some(index) = selected_index {
+        state.select(Some(index.saturating_sub(offset)));
+    }
+    let detail = selected_index
+        .and_then(|index| findings.get(index))
+        .and_then(|finding| {
+            let process = app.processes.get(&finding.pid)?;
+            let mut lines = vec![Line::from(vec![
+                Span::styled(
+                    format!(
+                        " {} {} score {} ",
+                        finding.severity.label(),
+                        process.name,
+                        finding.score
+                    ),
+                    Style::default()
+                        .fg(attention_color(finding.severity))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!("PID {}  {}", finding.pid, process_path(process))),
+            ])];
+            for reason in &finding.reasons {
+                lines.push(Line::from(format!(" • {reason}")));
+            }
+            lines.push(Line::from(Span::styled(
+                format!(" command: {}", process_command_line(process)),
+                Style::default().fg(Color::DarkGray),
+            )));
+            Some(lines)
+        })
+        .unwrap_or_else(|| {
+            vec![
+                Line::from(" No process currently requires attention."),
+                Line::from(Span::styled(
+                    " Findings are evidence-based hints, not a claim that a process is faulty.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]
+        });
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(
+                    format!(" CRIT {critical} "),
+                    Style::default().fg(Color::LightRed),
+                ),
+                Span::styled(
+                    format!(" WARN {warning} "),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled(
+                    format!(" WATCH {watch} "),
+                    Style::default().fg(Color::LightBlue),
+                ),
+                Span::raw(" — explainable signals from state, lifecycle, resource history"),
+            ]),
+            Line::from(
+                " ↑↓/jk move | Enter jump | t trend | i inspect | r sample | Space pause | a/Esc close",
+            ),
+        ]),
+        sections[0],
+    );
+    frame.render_stateful_widget(list, sections[1], &mut state);
+    frame.render_widget(
+        Paragraph::new(detail)
+            .block(Block::default().borders(Borders::TOP).title(" evidence "))
+            .wrap(Wrap { trim: false }),
+        sections[2],
+    );
 }
 
 fn hotspot_value(app: &App, pid: Pid, metric: HotspotMetric) -> (String, usize) {
@@ -1409,7 +1639,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
             app.last_changes.reparented,
         )),
         Line::from(
-            " ↑↓/jk move | ←/→ tree | / find | h hot | s sort | t trend | n ports | b base | d diff | o report ",
+            " ↑↓/jk move | ←/→ tree | / find | a attention | h hot | s sort | t trend | n ports | b base | d diff | o report ",
         ),
     ])
     .style(Style::default().fg(if app.paused {
@@ -1419,9 +1649,11 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     }));
     frame.render_widget(footer, chunks[2]);
 
-    if app.show_hotspots {
+    if app.show_attention {
+        draw_attention_overlay(frame, app, area);
+    } else if app.show_hotspots {
         draw_hotspot_overlay(frame, app, area);
-    } else if app.network_scan.is_some() {
+    } else if app.show_network {
         draw_network_overlay(frame, app, area);
     } else if app.show_snapshot_diff {
         draw_snapshot_diff_overlay(frame, app, area);

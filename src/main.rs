@@ -37,6 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = Terminal::new(backend)?;
     let mut app = App::new();
     let result = loop {
+        app.poll_background_jobs();
         terminal.draw(|frame| draw(frame, &mut app))?;
         if handle_pending_input(&mut app)? {
             break Ok(());
@@ -76,15 +77,15 @@ mod tests {
     #[cfg(not(target_os = "linux"))]
     use crate::network::parse_lsof_network_output;
     #[cfg(target_os = "linux")]
-    use crate::network::{parse_linux_inet_listeners, parse_linux_unix_listeners};
+    use crate::network::{parse_linux_inet_sockets, parse_linux_unix_sockets};
     use crate::{
-        app::{aggregate_resources, rank_hotspots, sort_processes},
+        app::{aggregate_resources, rank_attention_findings, rank_hotspots, sort_processes},
         history::ResourceHistory,
         model::{
-            HotspotMetric, HotspotScope, ProcessChange, ProcessInfo, ResourceAggregate, SortMode,
-            diff_processes, process_path,
+            AttentionFinding, AttentionSeverity, HotspotMetric, HotspotScope, ProcessChange,
+            ProcessEvent, ProcessInfo, ResourceAggregate, SortMode, diff_processes, process_path,
         },
-        network::NetworkListener,
+        network::{NetworkEndpoint, NetworkScan, NetworkScope},
         provider::{bytes_per_second, is_sampler_process, parse_ps_snapshot, platform_name},
         report::{ReportInput, export_report},
         snapshot::BaselineSnapshot,
@@ -170,17 +171,19 @@ mod tests {
 
     #[test]
     fn network_listener_filter_matches_port_process_pid_and_namespace() {
-        let listener = NetworkListener {
+        let listener = NetworkEndpoint {
             pid: Some(Pid::from_u32(42)),
             process: "api-server".into(),
             fd: "7".into(),
             protocol: "TCP".into(),
-            endpoint: "127.0.0.1:8080".into(),
+            local_endpoint: "127.0.0.1:8080".into(),
+            remote_endpoint: "10.0.0.8:443".into(),
             state: "LISTEN".into(),
             namespace: "net:[1234]".into(),
         };
 
         assert!(listener.matches("8080"));
+        assert!(listener.matches("10.0.0.8"));
         assert!(listener.matches("API"));
         assert!(listener.matches("42"));
         assert!(listener.matches("1234"));
@@ -212,16 +215,19 @@ mod tests {
                 ProcessChange::Exited {
                     pid: Pid::from_u32(11),
                     name: "exited".into(),
+                    command: "/usr/bin/exited".into(),
                 },
                 ProcessChange::Reparented {
                     pid: Pid::from_u32(12),
                     name: "adopted".into(),
+                    command: "/usr/bin/adopted".into(),
                     old_parent: Some(Pid::from_u32(1)),
                     new_parent: Some(Pid::from_u32(2)),
                 },
                 ProcessChange::Started {
                     pid: Pid::from_u32(13),
                     name: "started".into(),
+                    command: "/usr/bin/started".into(),
                     parent: Some(Pid::from_u32(1)),
                 },
             ]
@@ -304,17 +310,23 @@ f4r\nar\ntREG\nn/opt/service/config.toml\n";
     #[test]
     fn parses_lsof_tcp_and_udp_listeners() {
         let output = b"p42\ncserver\nf3u\nPTCP\nn127.0.0.1:8080\nTST=LISTEN\n\
-f4u\nPUDP\nn*:5353\n";
+f4u\nPUDP\nn*:5353\n\
+f5u\nPTCP\nn127.0.0.1:50000->10.0.0.8:443\nTST=ESTABLISHED\n";
 
         let listeners = parse_lsof_network_output(output);
 
-        assert_eq!(listeners.len(), 2);
+        assert_eq!(listeners.len(), 3);
         assert_eq!(listeners[0].pid, Some(Pid::from_u32(42)));
         assert_eq!(listeners[0].protocol, "TCP");
-        assert_eq!(listeners[0].endpoint, "127.0.0.1:8080");
+        assert_eq!(listeners[0].local_endpoint, "127.0.0.1:8080");
+        assert!(listeners[0].remote_endpoint.is_empty());
         assert_eq!(listeners[0].state, "LISTEN");
         assert_eq!(listeners[1].protocol, "UDP");
         assert_eq!(listeners[1].state, "BOUND");
+        assert_eq!(listeners[2].local_endpoint, "127.0.0.1:50000");
+        assert_eq!(listeners[2].remote_endpoint, "10.0.0.8:443");
+        assert_eq!(listeners[2].state, "ESTABLISHED");
+        assert!(!listeners[2].is_listener());
     }
 
     #[cfg(target_os = "linux")]
@@ -341,20 +353,27 @@ f4u\nPUDP\nn*:5353\n";
         let udp = "  sl  local_address rem_address st tx_queue tr tm->when retrnsmt uid timeout inode\n\
 0: 00000000:0035 00000000:0000 07 00000000:00000000 00:00000000 00000000 1000 0 22345\n";
         let unix = "Num RefCount Protocol Flags Type St Inode Path\n\
-00000000: 00000002 00000000 00010000 0001 01 32345 /run/test.sock\n";
+00000000: 00000002 00000000 00010000 0001 01 32345 /run/test.sock\n\
+00000001: 00000003 00000000 00000000 0001 03 32346\n";
 
-        let tcp = parse_linux_inet_listeners(tcp, "TCP", false, "net:[1]");
-        let udp = parse_linux_inet_listeners(udp, "UDP", false, "net:[1]");
-        let unix = parse_linux_unix_listeners(unix, "net:[1]");
+        let tcp = parse_linux_inet_sockets(tcp, "TCP", false, "net:[1]");
+        let udp = parse_linux_inet_sockets(udp, "UDP", false, "net:[1]");
+        let unix = parse_linux_unix_sockets(unix, "net:[1]");
 
-        assert_eq!(tcp.len(), 1);
-        assert_eq!(tcp[0].endpoint, "127.0.0.1:8080");
+        assert_eq!(tcp.len(), 2);
+        assert_eq!(tcp[0].local_endpoint, "127.0.0.1:8080");
+        assert!(tcp[0].remote_endpoint.is_empty());
         assert_eq!(tcp[0].inode, "12345");
+        assert_eq!(tcp[1].state, "ESTABLISHED");
+        assert_eq!(tcp[1].remote_endpoint, "127.0.0.1:4660");
         assert_eq!(udp.len(), 1);
-        assert_eq!(udp[0].endpoint, "0.0.0.0:53");
+        assert_eq!(udp[0].local_endpoint, "0.0.0.0:53");
         assert_eq!(udp[0].state, "BOUND");
-        assert_eq!(unix.len(), 1);
-        assert_eq!(unix[0].endpoint, "/run/test.sock");
+        assert_eq!(unix.len(), 2);
+        assert_eq!(unix[0].local_endpoint, "/run/test.sock");
+        assert_eq!(unix[0].state, "LISTEN");
+        assert_eq!(unix[1].state, "CONNECTED");
+        assert!(!unix[1].local_endpoint.is_empty());
     }
 
     #[cfg(target_os = "linux")]
@@ -602,6 +621,132 @@ Max address space         unlimited            unlimited            bytes\n";
                 HotspotScope::Subtree,
             ),
             vec![Pid::from_u32(10), Pid::from_u32(11), Pid::from_u32(20)]
+        );
+    }
+
+    #[test]
+    fn ranks_explainable_attention_findings_from_state_churn_and_history() {
+        let mut zombie = test_process(10, 1, "zombie-worker");
+        zombie.status = "Zombie".into();
+        let flapping = test_process(11, 1, "flapping-worker");
+        let mut busy = test_process(12, 1, "busy-worker");
+        busy.cpu = 65.0;
+        busy.write_rate = 20 * 1024 * 1024;
+        let mut grower = test_process(13, 1, "growing-worker");
+        grower.memory = 64 * 1024 * 1024;
+        let mut quiet = test_process(14, 1, "quiet-worker");
+        quiet.cpu = 0.2;
+        let flicker = test_process(15, 1, "visibility-flicker");
+        let mut processes: HashMap<Pid, ProcessInfo> =
+            [zombie, flapping, busy, grower, quiet, flicker]
+                .into_iter()
+                .map(|process| (process.pid, process))
+                .collect();
+        let resources: HashMap<Pid, ResourceAggregate> = processes
+            .keys()
+            .map(|pid| (*pid, ResourceAggregate::default()))
+            .collect();
+        let started = Instant::now();
+        let mut history = ResourceHistory::with_sample_limit(30);
+        history.record(&processes, &resources, started);
+        processes.get_mut(&Pid::from_u32(13)).unwrap().memory = 256 * 1024 * 1024;
+        for step in 1..=3 {
+            history.record(
+                &processes,
+                &resources,
+                started + Duration::from_secs(step * 2),
+            );
+        }
+        let mut events = Vec::new();
+        for offset in 0..3 {
+            let restarted_pid = Pid::from_u32(101 + offset);
+            events.push(ProcessEvent {
+                change: ProcessChange::Started {
+                    pid: restarted_pid,
+                    name: "flapping-worker".into(),
+                    command: "/usr/bin/flapping-worker".into(),
+                    parent: Some(Pid::from_u32(1)),
+                },
+                observed_at: Instant::now(),
+            });
+            events.push(ProcessEvent {
+                change: ProcessChange::Exited {
+                    pid: restarted_pid,
+                    name: "flapping-worker".into(),
+                    command: "/usr/bin/flapping-worker".into(),
+                },
+                observed_at: Instant::now(),
+            });
+        }
+        for _ in 0..3 {
+            events.push(ProcessEvent {
+                change: ProcessChange::Started {
+                    pid: Pid::from_u32(15),
+                    name: "visibility-flicker".into(),
+                    command: "/usr/bin/visibility-flicker".into(),
+                    parent: Some(Pid::from_u32(1)),
+                },
+                observed_at: Instant::now(),
+            });
+            events.push(ProcessEvent {
+                change: ProcessChange::Exited {
+                    pid: Pid::from_u32(15),
+                    name: "visibility-flicker".into(),
+                    command: "/usr/bin/visibility-flicker".into(),
+                },
+                observed_at: Instant::now(),
+            });
+        }
+
+        let findings = rank_attention_findings(&processes, &history, &events);
+
+        assert_eq!(findings[0].pid, Pid::from_u32(10));
+        assert_eq!(findings[0].severity, AttentionSeverity::Critical);
+        assert_eq!(findings[0].score, 100);
+        let flapping = findings
+            .iter()
+            .find(|finding| finding.pid == Pid::from_u32(11))
+            .expect("flapping finding");
+        assert_eq!(flapping.severity, AttentionSeverity::Watch);
+        assert!(
+            flapping
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("3 distinct starts / 3 exits"))
+        );
+        let busy = findings
+            .iter()
+            .find(|finding| finding.pid == Pid::from_u32(12))
+            .expect("busy finding");
+        assert!(
+            busy.reasons
+                .iter()
+                .any(|reason| reason.contains("sustained CPU"))
+        );
+        assert!(
+            busy.reasons
+                .iter()
+                .any(|reason| reason.contains("write I/O"))
+        );
+        let grower = findings
+            .iter()
+            .find(|finding| finding.pid == Pid::from_u32(13))
+            .expect("memory growth finding");
+        assert!(
+            grower
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("memory grew"))
+        );
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.pid != Pid::from_u32(14))
+        );
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.pid != Pid::from_u32(15))
         );
     }
 
@@ -879,6 +1024,25 @@ Max address space         unlimited            unlimited            bytes\n";
             std::process::id()
         ));
         fs::create_dir(&directory).expect("create report test directory");
+        let attention_findings = vec![AttentionFinding {
+            pid: Pid::from_u32(42),
+            severity: AttentionSeverity::Warning,
+            score: 55,
+            reasons: vec!["sustained CPU 55.0% avg".into()],
+        }];
+        let network_scan = NetworkScan {
+            endpoints: vec![NetworkEndpoint {
+                pid: Some(Pid::from_u32(42)),
+                process: "worker".into(),
+                fd: "7".into(),
+                protocol: "TCP".into(),
+                local_endpoint: "127.0.0.1:50000".into(),
+                remote_endpoint: "10.0.0.8:443".into(),
+                state: "ESTABLISHED".into(),
+                namespace: String::new(),
+            }],
+            warning: None,
+        };
 
         let path = export_report(
             ReportInput {
@@ -889,8 +1053,12 @@ Max address space         unlimited            unlimited            bytes\n";
                 processes: &processes,
                 resources: &resources,
                 events: &[],
-                network: None,
+                attention_findings: &attention_findings,
+                network: Some(&network_scan),
+                network_scope: NetworkScope::All,
+                network_scan_in_progress: false,
                 inspection: None,
+                inspection_in_progress: false,
                 baseline: None,
             },
             &directory,
@@ -906,6 +1074,10 @@ Max address space         unlimited            unlimited            bytes\n";
         assert_eq!(report["platform"], platform_name());
         assert_eq!(report["selected_pid"], 42);
         assert_eq!(report["paused"], true);
+        assert_eq!(
+            report["collection_status"]["network_scan_in_progress"],
+            false
+        );
         assert_eq!(report["process_count"], 2);
         assert_eq!(report["system"]["write_bytes_per_second"], 8_192);
         assert_eq!(report["processes"][0]["pid"], 0);
@@ -913,7 +1085,15 @@ Max address space         unlimited            unlimited            bytes\n";
         assert_eq!(report["processes"][2]["pid"], 42);
         assert_eq!(report["processes"][2]["read_bytes_per_second"], 4_096);
         assert!(report["privacy_notice"].as_str().is_some());
-        assert!(report["network_scan"].is_null());
+        assert_eq!(report["attention_findings"][0]["pid"], 42);
+        assert_eq!(report["attention_findings"][0]["severity"], "WARN");
+        assert_eq!(report["attention_findings"][0]["score"], 55);
+        assert_eq!(report["network_scan"]["scope"], "all connections");
+        assert_eq!(
+            report["network_scan"]["endpoints"][0]["remote_endpoint"],
+            "10.0.0.8:443"
+        );
+        assert_eq!(report["network_scan"]["endpoints"][0]["listener"], false);
         assert!(report["selected_inspection"].is_null());
         assert!(report["baseline"].is_null());
         #[cfg(unix)]

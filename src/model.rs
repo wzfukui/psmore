@@ -25,15 +25,18 @@ pub(crate) enum ProcessChange {
     Started {
         pid: Pid,
         name: String,
+        command: String,
         parent: Option<Pid>,
     },
     Exited {
         pid: Pid,
         name: String,
+        command: String,
     },
     Reparented {
         pid: Pid,
         name: String,
+        command: String,
         old_parent: Option<Pid>,
         new_parent: Option<Pid>,
     },
@@ -67,6 +70,31 @@ pub(crate) struct StatusNotice {
     pub(crate) message: String,
     pub(crate) is_error: bool,
     pub(crate) observed_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum AttentionSeverity {
+    Watch,
+    Warning,
+    Critical,
+}
+
+impl AttentionSeverity {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Watch => "WATCH",
+            Self::Warning => "WARN",
+            Self::Critical => "CRIT",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AttentionFinding {
+    pub(crate) pid: Pid,
+    pub(crate) severity: AttentionSeverity,
+    pub(crate) score: u16,
+    pub(crate) reasons: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -157,20 +185,24 @@ pub(crate) fn diff_processes(
             (None, Some(process)) => changes.push(ProcessChange::Started {
                 pid,
                 name: process.name.clone(),
+                command: process_command_line(process),
                 parent: process.parent,
             }),
             (Some(process), None) => changes.push(ProcessChange::Exited {
                 pid,
                 name: process.name.clone(),
+                command: process_command_line(process),
             }),
             (Some(old), Some(new)) if process_instance_changed(old, new) => {
                 changes.push(ProcessChange::Exited {
                     pid,
                     name: old.name.clone(),
+                    command: process_command_line(old),
                 });
                 changes.push(ProcessChange::Started {
                     pid,
                     name: new.name.clone(),
+                    command: process_command_line(new),
                     parent: new.parent,
                 });
             }
@@ -178,6 +210,7 @@ pub(crate) fn diff_processes(
                 changes.push(ProcessChange::Reparented {
                     pid,
                     name: new.name.clone(),
+                    command: process_command_line(new),
                     old_parent: old.parent,
                     new_parent: new.parent,
                 });

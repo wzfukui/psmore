@@ -12,24 +12,33 @@ use crate::inspection::{parse_proc_endpoint, proc_socket_state};
 use crate::model::ProcessInfo;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct NetworkListener {
+pub(crate) struct NetworkEndpoint {
     pub(crate) pid: Option<Pid>,
     pub(crate) process: String,
     pub(crate) fd: String,
     pub(crate) protocol: String,
-    pub(crate) endpoint: String,
+    pub(crate) local_endpoint: String,
+    pub(crate) remote_endpoint: String,
     pub(crate) state: String,
     pub(crate) namespace: String,
 }
 
-impl NetworkListener {
+impl NetworkEndpoint {
+    pub(crate) fn is_listener(&self) -> bool {
+        self.state == "LISTEN"
+            || (self.protocol == "UDP"
+                && self.remote_endpoint.is_empty()
+                && matches!(self.state.as_str(), "BOUND" | "UNCONN"))
+    }
+
     pub(crate) fn matches(&self, query: &str) -> bool {
         let query = query.to_lowercase();
         query.is_empty()
             || format!(
-                "{} {} {} {} {} {} {}",
+                "{} {} {} {} {} {} {} {}",
                 self.protocol,
-                self.endpoint,
+                self.local_endpoint,
+                self.remote_endpoint,
                 self.state,
                 self.process,
                 self.pid.map(|pid| pid.to_string()).unwrap_or_default(),
@@ -41,24 +50,55 @@ impl NetworkListener {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum NetworkScope {
+    #[default]
+    Listeners,
+    All,
+}
+
+impl NetworkScope {
+    pub(crate) fn toggle(&mut self) {
+        *self = match self {
+            Self::Listeners => Self::All,
+            Self::All => Self::Listeners,
+        };
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Listeners => "listeners",
+            Self::All => "all connections",
+        }
+    }
+
+    pub(crate) fn includes(self, endpoint: &NetworkEndpoint) -> bool {
+        self == Self::All || endpoint.is_listener()
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct NetworkScan {
-    pub(crate) listeners: Vec<NetworkListener>,
+    pub(crate) endpoints: Vec<NetworkEndpoint>,
     pub(crate) warning: Option<String>,
 }
 
-fn sort_listeners(listeners: &mut [NetworkListener]) {
-    listeners.sort_by(|left, right| {
+fn sort_endpoints(endpoints: &mut [NetworkEndpoint]) {
+    endpoints.sort_by(|left, right| {
         (
             &left.protocol,
-            &left.endpoint,
+            &left.local_endpoint,
+            &left.remote_endpoint,
+            &left.state,
             &left.namespace,
             left.pid.map(Pid::as_u32),
             &left.fd,
         )
             .cmp(&(
                 &right.protocol,
-                &right.endpoint,
+                &right.local_endpoint,
+                &right.remote_endpoint,
+                &right.state,
                 &right.namespace,
                 right.pid.map(Pid::as_u32),
                 &right.fd,
@@ -78,17 +118,27 @@ struct LsofNetworkRecord {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn flush_lsof_listener(record: &mut LsofNetworkRecord, listeners: &mut Vec<NetworkListener>) {
+fn flush_lsof_endpoint(record: &mut LsofNetworkRecord, endpoints: &mut Vec<NetworkEndpoint>) {
     if record.pid.is_some() && !record.protocol.is_empty() && !record.endpoint.is_empty() {
-        listeners.push(NetworkListener {
+        let (local_endpoint, remote_endpoint) = record
+            .endpoint
+            .split_once("->")
+            .map(|(local, remote)| (local.to_string(), remote.to_string()))
+            .unwrap_or_else(|| (record.endpoint.clone(), String::new()));
+        endpoints.push(NetworkEndpoint {
             pid: record.pid,
             process: record.process.clone(),
             fd: record.fd.clone(),
             protocol: record.protocol.clone(),
-            endpoint: record.endpoint.clone(),
+            local_endpoint,
+            remote_endpoint: remote_endpoint.clone(),
             state: if record.state.is_empty() {
-                if record.protocol == "UDP" {
+                if !remote_endpoint.is_empty() {
+                    "CONNECTED".into()
+                } else if record.protocol == "UDP" {
                     "BOUND".into()
+                } else if record.protocol == "UNIX" {
+                    "OPEN".into()
                 } else {
                     "-".into()
                 }
@@ -105,8 +155,8 @@ fn flush_lsof_listener(record: &mut LsofNetworkRecord, listeners: &mut Vec<Netwo
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn parse_lsof_network_output(output: &[u8]) -> Vec<NetworkListener> {
-    let mut listeners = Vec::new();
+pub(crate) fn parse_lsof_network_output(output: &[u8]) -> Vec<NetworkEndpoint> {
+    let mut endpoints = Vec::new();
     let mut record = LsofNetworkRecord::default();
     for line in String::from_utf8_lossy(output).lines() {
         if line.is_empty() {
@@ -115,13 +165,13 @@ pub(crate) fn parse_lsof_network_output(output: &[u8]) -> Vec<NetworkListener> {
         let (field, value) = line.split_at(1);
         match field {
             "p" => {
-                flush_lsof_listener(&mut record, &mut listeners);
+                flush_lsof_endpoint(&mut record, &mut endpoints);
                 record.pid = value.parse::<u32>().ok().map(Pid::from_u32);
                 record.process.clear();
             }
             "c" => record.process = value.to_string(),
             "f" => {
-                flush_lsof_listener(&mut record, &mut listeners);
+                flush_lsof_endpoint(&mut record, &mut endpoints);
                 record.fd = value.to_string();
             }
             "P" => record.protocol = value.to_string(),
@@ -134,41 +184,44 @@ pub(crate) fn parse_lsof_network_output(output: &[u8]) -> Vec<NetworkListener> {
             _ => {}
         }
     }
-    flush_lsof_listener(&mut record, &mut listeners);
-    listeners
+    flush_lsof_endpoint(&mut record, &mut endpoints);
+    endpoints
 }
 
 #[cfg(not(target_os = "linux"))]
 fn scan_network_native(_processes: &HashMap<Pid, ProcessInfo>) -> NetworkScan {
-    let mut listeners = Vec::new();
+    let mut endpoints = Vec::new();
     let mut errors = Vec::new();
     for args in [
-        ["-nP", "-iTCP", "-sTCP:LISTEN", "-FpcfPnT"].as_slice(),
+        ["-nP", "-iTCP", "-FpcfPnT"].as_slice(),
         ["-nP", "-iUDP", "-FpcfPnT"].as_slice(),
+        ["-nP", "-U", "-FpcfPnT"].as_slice(),
     ] {
         match Command::new("lsof").args(args).output() {
-            Ok(output) => listeners.extend(parse_lsof_network_output(&output.stdout)),
+            Ok(output) => endpoints.extend(parse_lsof_network_output(&output.stdout)),
             Err(error) => errors.push(error.to_string()),
         }
     }
-    listeners.sort_by(|left, right| {
+    endpoints.sort_by(|left, right| {
         (
             left.pid.map(Pid::as_u32),
             &left.fd,
             &left.protocol,
-            &left.endpoint,
+            &left.local_endpoint,
+            &left.remote_endpoint,
         )
             .cmp(&(
                 right.pid.map(Pid::as_u32),
                 &right.fd,
                 &right.protocol,
-                &right.endpoint,
+                &right.local_endpoint,
+                &right.remote_endpoint,
             ))
     });
-    listeners.dedup();
-    sort_listeners(&mut listeners);
+    endpoints.dedup();
+    sort_endpoints(&mut endpoints);
     NetworkScan {
-        listeners,
+        endpoints,
         warning: (!errors.is_empty()).then(|| format!("cannot run lsof: {}", errors.join("; "))),
     }
 }
@@ -184,83 +237,98 @@ struct LinuxSocketOwner {
 
 #[cfg(target_os = "linux")]
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct LinuxRawListener {
+pub(crate) struct LinuxRawSocket {
     pub(crate) protocol: String,
-    pub(crate) endpoint: String,
+    pub(crate) local_endpoint: String,
+    pub(crate) remote_endpoint: String,
     pub(crate) state: String,
     pub(crate) inode: String,
     pub(crate) namespace: String,
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn parse_linux_inet_listeners(
+pub(crate) fn parse_linux_inet_sockets(
     content: &str,
     protocol: &str,
     ipv6: bool,
     namespace: &str,
-) -> Vec<LinuxRawListener> {
-    let mut listeners = Vec::new();
+) -> Vec<LinuxRawSocket> {
+    let mut sockets = Vec::new();
     for line in content.lines().skip(1) {
         let fields: Vec<&str> = line.split_whitespace().collect();
-        let (Some(local), Some(state), Some(inode)) = (fields.get(1), fields.get(3), fields.get(9))
+        let (Some(local), Some(remote), Some(state), Some(inode)) =
+            (fields.get(1), fields.get(2), fields.get(3), fields.get(9))
         else {
             continue;
         };
-        if protocol == "TCP" && *state != "0A" {
-            continue;
-        }
-        let Some((endpoint, _, port)) = parse_proc_endpoint(local, ipv6) else {
+        let Some((local_endpoint, _, port)) = parse_proc_endpoint(local, ipv6) else {
             continue;
         };
         if port == 0 {
             continue;
         }
-        listeners.push(LinuxRawListener {
+        let Some((remote_endpoint, remote_unspecified, remote_port)) =
+            parse_proc_endpoint(remote, ipv6)
+        else {
+            continue;
+        };
+        let remote_endpoint = if remote_unspecified && remote_port == 0 {
+            String::new()
+        } else {
+            remote_endpoint
+        };
+        sockets.push(LinuxRawSocket {
             protocol: protocol.into(),
-            endpoint,
-            state: if protocol == "UDP" {
-                if *state == "07" {
-                    "BOUND".into()
-                } else {
-                    proc_socket_state(protocol, state).into()
-                }
+            local_endpoint,
+            remote_endpoint: remote_endpoint.clone(),
+            state: if protocol == "UDP" && remote_endpoint.is_empty() && *state == "07" {
+                "BOUND".into()
             } else {
-                "LISTEN".into()
+                proc_socket_state(protocol, state).into()
             },
             inode: (*inode).into(),
             namespace: namespace.into(),
         });
     }
-    listeners
+    sockets
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn parse_linux_unix_listeners(content: &str, namespace: &str) -> Vec<LinuxRawListener> {
-    let mut listeners = Vec::new();
+pub(crate) fn parse_linux_unix_sockets(content: &str, namespace: &str) -> Vec<LinuxRawSocket> {
+    let mut sockets = Vec::new();
     for line in content.lines().skip(1) {
         let fields: Vec<&str> = line.split_whitespace().collect();
-        let (Some(flags), Some(inode)) = (fields.get(3), fields.get(6)) else {
+        let (Some(flags), Some(state), Some(inode)) = (fields.get(3), fields.get(5), fields.get(6))
+        else {
             continue;
         };
         let listening = u32::from_str_radix(flags, 16)
             .map(|flags| flags & 0x0001_0000 != 0)
             .unwrap_or(false);
-        if !listening {
-            continue;
-        }
-        listeners.push(LinuxRawListener {
+        sockets.push(LinuxRawSocket {
             protocol: "UNIX".into(),
-            endpoint: fields
+            local_endpoint: fields
                 .get(7..)
                 .map(|parts| parts.join(" "))
                 .filter(|path| !path.is_empty())
                 .unwrap_or_else(|| format!("socket:[{inode}]")),
-            state: "LISTEN".into(),
+            remote_endpoint: String::new(),
+            state: if listening {
+                "LISTEN"
+            } else {
+                match *state {
+                    "03" => "CONNECTED",
+                    "02" => "CONNECTING",
+                    "01" => "OPEN",
+                    _ => "UNKNOWN",
+                }
+            }
+            .into(),
             inode: (*inode).into(),
             namespace: namespace.into(),
         });
     }
-    listeners
+    sockets
 }
 
 #[cfg(target_os = "linux")]
@@ -318,54 +386,56 @@ fn scan_network_native(processes: &HashMap<Pid, ProcessInfo>) -> NetworkScan {
             ("udp6", "UDP", true),
         ] {
             if let Ok(content) = fs::read_to_string(format!("{net_root}/{file}")) {
-                raw.extend(parse_linux_inet_listeners(
+                raw.extend(parse_linux_inet_sockets(
                     &content, protocol, ipv6, &namespace,
                 ));
             }
         }
         if let Ok(content) = fs::read_to_string(format!("{net_root}/unix")) {
-            raw.extend(parse_linux_unix_listeners(&content, &namespace));
+            raw.extend(parse_linux_unix_sockets(&content, &namespace));
         }
     }
 
-    let mut listeners = Vec::new();
-    for listener in raw {
+    let mut endpoints = Vec::new();
+    for endpoint in raw {
         let matching_owners = owners
-            .get(&listener.inode)
+            .get(&endpoint.inode)
             .map(|owners| {
                 owners
                     .iter()
-                    .filter(|owner| owner.namespace == listener.namespace)
+                    .filter(|owner| owner.namespace == endpoint.namespace)
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
         if matching_owners.is_empty() {
-            listeners.push(NetworkListener {
+            endpoints.push(NetworkEndpoint {
                 pid: None,
                 process: "[owner unavailable]".into(),
                 fd: "-".into(),
-                protocol: listener.protocol,
-                endpoint: listener.endpoint,
-                state: listener.state,
-                namespace: listener.namespace,
+                protocol: endpoint.protocol,
+                local_endpoint: endpoint.local_endpoint,
+                remote_endpoint: endpoint.remote_endpoint,
+                state: endpoint.state,
+                namespace: endpoint.namespace,
             });
         } else {
             for owner in matching_owners {
-                listeners.push(NetworkListener {
+                endpoints.push(NetworkEndpoint {
                     pid: Some(owner.pid),
                     process: owner.process.clone(),
                     fd: owner.fd.clone(),
-                    protocol: listener.protocol.clone(),
-                    endpoint: listener.endpoint.clone(),
-                    state: listener.state.clone(),
-                    namespace: listener.namespace.clone(),
+                    protocol: endpoint.protocol.clone(),
+                    local_endpoint: endpoint.local_endpoint.clone(),
+                    remote_endpoint: endpoint.remote_endpoint.clone(),
+                    state: endpoint.state.clone(),
+                    namespace: endpoint.namespace.clone(),
                 });
             }
         }
     }
-    sort_listeners(&mut listeners);
+    sort_endpoints(&mut endpoints);
     NetworkScan {
-        listeners,
+        endpoints,
         warning: (protected_processes > 0).then(|| {
             format!("socket ownership hidden for {protected_processes} protected processes")
         }),

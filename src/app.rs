@@ -1,5 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
+    sync::mpsc::{self, Receiver, TryRecvError},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -11,11 +13,12 @@ use crate::{
     history::ResourceHistory,
     inspection::inspect_process,
     model::{
-        ChangeSummary, HotspotMetric, HotspotScope, MarqueePhase, ProcessChange, ProcessEvent,
-        ProcessInfo, ProcessInspection, ResourceAggregate, SortMode, StatusNotice, TreeRow,
-        TrendView, diff_processes, process_path,
+        AttentionFinding, AttentionSeverity, ChangeSummary, HotspotMetric, HotspotScope,
+        MarqueePhase, ProcessChange, ProcessEvent, ProcessInfo, ProcessInspection,
+        ResourceAggregate, SortMode, StatusNotice, TreeRow, TrendView, diff_processes,
+        process_path,
     },
-    network::{NetworkScan, scan_network},
+    network::{NetworkScan, NetworkScope, scan_network},
     provider::{NativeProcessProvider, ProcessProvider, platform_name},
     report::{ReportInput, export_report},
     snapshot::BaselineSnapshot,
@@ -170,6 +173,278 @@ pub(crate) fn rank_hotspots(
     pids
 }
 
+const MIB: u64 = 1024 * 1024;
+const GIB: u64 = 1024 * MIB;
+const ATTENTION_ACTIVITY_SAMPLES: usize = 5;
+const ATTENTION_GROWTH_SAMPLES: usize = 30;
+const ATTENTION_CHURN_WINDOW: Duration = Duration::from_secs(60);
+
+fn attention_bytes(value: u64) -> String {
+    if value >= GIB {
+        format!("{:.1} GiB", value as f64 / GIB as f64)
+    } else {
+        format!("{:.1} MiB", value as f64 / MIB as f64)
+    }
+}
+
+fn attention_rate(value: u64) -> String {
+    format!("{}/s", attention_bytes(value))
+}
+
+pub(crate) fn rank_attention_findings(
+    processes: &HashMap<Pid, ProcessInfo>,
+    history: &ResourceHistory,
+    events: &[ProcessEvent],
+) -> Vec<AttentionFinding> {
+    let mut churn: HashMap<String, (HashSet<Pid>, HashSet<Pid>)> = HashMap::new();
+    for event in events
+        .iter()
+        .filter(|event| event.observed_at.elapsed() <= ATTENTION_CHURN_WINDOW)
+    {
+        match &event.change {
+            ProcessChange::Started { pid, command, .. } => {
+                churn
+                    .entry(command.to_lowercase())
+                    .or_default()
+                    .0
+                    .insert(*pid);
+            }
+            ProcessChange::Exited { pid, command, .. } => {
+                churn
+                    .entry(command.to_lowercase())
+                    .or_default()
+                    .1
+                    .insert(*pid);
+            }
+            ProcessChange::Reparented { .. } => {}
+        }
+    }
+    let mut churn_representatives: HashMap<String, Pid> = HashMap::new();
+    for process in processes
+        .values()
+        .filter(|process| process.pid.as_u32() != 0)
+    {
+        let identity = crate::model::process_command_line(process).to_lowercase();
+        churn_representatives
+            .entry(identity)
+            .and_modify(|pid| {
+                if process.pid.as_u32() < pid.as_u32() {
+                    *pid = process.pid;
+                }
+            })
+            .or_insert(process.pid);
+    }
+
+    let mut findings = Vec::new();
+    for process in processes
+        .values()
+        .filter(|process| process.pid.as_u32() != 0)
+    {
+        let mut reasons = Vec::new();
+        let mut score = 0_u16;
+        let status = process.status.trim();
+        let normalized_status = status.to_lowercase();
+        let state_is_critical = normalized_status == "z"
+            || normalized_status.starts_with("zombie")
+            || normalized_status.starts_with("dead");
+        if state_is_critical {
+            score = 100;
+            reasons.push(format!("unhealthy process state: {status}"));
+        } else if normalized_status == "t"
+            || normalized_status.starts_with('t')
+            || normalized_status.contains("stop")
+        {
+            score = score.saturating_add(70);
+            reasons.push(format!("stopped or traced process state: {status}"));
+        }
+
+        let process_identity = crate::model::process_command_line(process).to_lowercase();
+        let represents_identity =
+            churn_representatives.get(&process_identity) == Some(&process.pid);
+        if let Some((started_pids, exited_pids)) = churn
+            .get(&process_identity)
+            .filter(|(started, exited)| started.len() >= 2 && exited.len() >= 2)
+            .filter(|_| represents_identity)
+        {
+            let starts = started_pids.len();
+            let exits = exited_pids.len();
+            let cycles = starts.min(exits);
+            score = score.saturating_add(if cycles >= 10 {
+                60
+            } else if cycles >= 4 {
+                35
+            } else {
+                25
+            });
+            reasons.push(format!(
+                "lifecycle churn: {starts} distinct starts / {exits} exits in 60s"
+            ));
+        }
+
+        let samples = history.samples(process.pid);
+        let activity: Vec<_> = samples
+            .into_iter()
+            .flat_map(|samples| samples.iter().rev().take(ATTENTION_ACTIVITY_SAMPLES))
+            .collect();
+        let sample_count = activity.len();
+        let (average_cpu, average_read, average_write) = if sample_count > 0 {
+            let count = sample_count as f64;
+            (
+                activity
+                    .iter()
+                    .map(|sample| f64::from(sample.own_cpu))
+                    .sum::<f64>()
+                    / count,
+                activity
+                    .iter()
+                    .map(|sample| sample.own_read_rate as u128)
+                    .sum::<u128>()
+                    / sample_count as u128,
+                activity
+                    .iter()
+                    .map(|sample| sample.own_write_rate as u128)
+                    .sum::<u128>()
+                    / sample_count as u128,
+            )
+        } else {
+            (
+                f64::from(process.cpu),
+                u128::from(process.read_rate),
+                u128::from(process.write_rate),
+            )
+        };
+        let average_read = average_read.min(u128::from(u64::MAX)) as u64;
+        let average_write = average_write.min(u128::from(u64::MAX)) as u64;
+        let cpu_is_sustained = sample_count >= 3;
+        let report_cpu = if cpu_is_sustained {
+            average_cpu
+        } else {
+            f64::from(process.cpu)
+        };
+        if report_cpu >= 25.0 {
+            score = score.saturating_add(if report_cpu >= 80.0 {
+                45
+            } else if report_cpu >= 50.0 {
+                30
+            } else {
+                20
+            });
+            reasons.push(if cpu_is_sustained {
+                format!(
+                    "sustained CPU {average_cpu:.1}% avg (now {:.1}%)",
+                    process.cpu
+                )
+            } else {
+                format!("CPU {:.1}% in the current sample", process.cpu)
+            });
+        }
+
+        if process.memory >= 512 * MIB {
+            score = score.saturating_add(if process.memory >= 4 * GIB {
+                35
+            } else if process.memory >= GIB {
+                20
+            } else {
+                10
+            });
+            reasons.push(format!(
+                "memory footprint {}",
+                attention_bytes(process.memory)
+            ));
+        }
+
+        let memory_window = samples.and_then(|samples| {
+            let newest = samples.back()?;
+            let oldest = samples.get(samples.len().saturating_sub(ATTENTION_GROWTH_SAMPLES))?;
+            Some((newest, oldest))
+        });
+        let memory_growth = memory_window.and_then(|(newest, oldest)| {
+            let growth = newest.own_memory.saturating_sub(oldest.own_memory);
+            let meaningful_ratio = oldest.own_memory >= 32 * MIB
+                && newest.own_memory >= oldest.own_memory.saturating_add(oldest.own_memory / 5);
+            if growth >= 128 * MIB && meaningful_ratio {
+                Some((newest, oldest, growth))
+            } else {
+                None
+            }
+        });
+        if let Some((newest, oldest, growth)) = memory_growth {
+            score = score.saturating_add(if growth >= 512 * MIB { 45 } else { 25 });
+            let elapsed = newest
+                .observed_at
+                .saturating_duration_since(oldest.observed_at)
+                .as_secs();
+            reasons.push(format!(
+                "memory grew {} in {}s",
+                attention_bytes(growth),
+                elapsed.max(1)
+            ));
+        }
+
+        for (label, rate) in [("read", average_read), ("write", average_write)] {
+            if rate < MIB {
+                continue;
+            }
+            score = score.saturating_add(if rate >= 100 * MIB {
+                35
+            } else if rate >= 10 * MIB {
+                20
+            } else {
+                10
+            });
+            reasons.push(format!("{label} I/O {} avg", attention_rate(rate)));
+        }
+
+        if reasons.is_empty() {
+            continue;
+        }
+        let score = score.min(100);
+        let severity = if state_is_critical || score >= 80 {
+            AttentionSeverity::Critical
+        } else if score >= 40 {
+            AttentionSeverity::Warning
+        } else {
+            AttentionSeverity::Watch
+        };
+        findings.push(AttentionFinding {
+            pid: process.pid,
+            severity,
+            score,
+            reasons,
+        });
+    }
+    findings.sort_by(|left, right| {
+        right
+            .severity
+            .cmp(&left.severity)
+            .then_with(|| right.score.cmp(&left.score))
+            .then_with(|| {
+                let left_name = processes
+                    .get(&left.pid)
+                    .map(|process| process.name.to_lowercase())
+                    .unwrap_or_default();
+                let right_name = processes
+                    .get(&right.pid)
+                    .map(|process| process.name.to_lowercase())
+                    .unwrap_or_default();
+                (left_name, left.pid.as_u32()).cmp(&(right_name, right.pid.as_u32()))
+            })
+    });
+    findings
+}
+
+struct NetworkTask {
+    receiver: Receiver<NetworkScan>,
+    started_at: Instant,
+}
+
+struct InspectionTask {
+    receiver: Receiver<ProcessInspection>,
+    started_at: Instant,
+    pid: Pid,
+    start_time: u64,
+}
+
 pub(crate) struct App {
     pub(crate) provider: NativeProcessProvider,
     pub(crate) processes: HashMap<Pid, ProcessInfo>,
@@ -182,10 +457,15 @@ pub(crate) struct App {
     pub(crate) hotspot_metric: HotspotMetric,
     pub(crate) hotspot_scope: HotspotScope,
     pub(crate) hotspot_selected: Option<Pid>,
+    pub(crate) show_attention: bool,
+    pub(crate) attention_selected: Option<Pid>,
     pub(crate) baseline: Option<BaselineSnapshot>,
     pub(crate) show_snapshot_diff: bool,
     pub(crate) snapshot_diff_scroll: u16,
     pub(crate) network_scan: Option<NetworkScan>,
+    pub(crate) show_network: bool,
+    network_task: Option<NetworkTask>,
+    pub(crate) network_scope: NetworkScope,
     pub(crate) network_selected: usize,
     pub(crate) network_filter: String,
     pub(crate) network_searching: bool,
@@ -210,6 +490,7 @@ pub(crate) struct App {
     pub(crate) events: Vec<ProcessEvent>,
     pub(crate) last_changes: ChangeSummary,
     pub(crate) inspection: Option<ProcessInspection>,
+    inspection_task: Option<InspectionTask>,
     pub(crate) inspection_scroll: u16,
 }
 
@@ -227,10 +508,15 @@ impl App {
             hotspot_metric: HotspotMetric::default(),
             hotspot_scope: HotspotScope::default(),
             hotspot_selected: None,
+            show_attention: false,
+            attention_selected: None,
             baseline: None,
             show_snapshot_diff: false,
             snapshot_diff_scroll: 0,
             network_scan: None,
+            show_network: false,
+            network_task: None,
+            network_scope: NetworkScope::default(),
             network_selected: 0,
             network_filter: String::new(),
             network_searching: false,
@@ -255,6 +541,7 @@ impl App {
             events: Vec::new(),
             last_changes: ChangeSummary::default(),
             inspection: None,
+            inspection_task: None,
             inspection_scroll: 0,
         };
         app.refresh();
@@ -306,8 +593,111 @@ impl App {
         if self.show_hotspots {
             self.ensure_hotspot_selection();
         }
+        if self.show_attention {
+            self.ensure_attention_selection();
+        }
         self.last_refresh = observed_at;
         self.error = None;
+    }
+
+    pub(crate) fn poll_background_jobs(&mut self) {
+        let network_result = self
+            .network_task
+            .as_ref()
+            .map(|task| task.receiver.try_recv());
+        match network_result {
+            Some(Ok(scan)) => {
+                let elapsed = self
+                    .network_task
+                    .take()
+                    .map(|task| task.started_at.elapsed())
+                    .unwrap_or_default();
+                let endpoint_count = scan.endpoints.len();
+                self.network_scan = Some(scan);
+                let visible = self.network_visible_indices();
+                self.network_selected = self.network_selected.min(visible.len().saturating_sub(1));
+                self.notice = Some(StatusNotice {
+                    message: format!(
+                        "network scan complete: {endpoint_count} endpoints in {:.1}s",
+                        elapsed.as_secs_f64()
+                    ),
+                    is_error: false,
+                    observed_at: Instant::now(),
+                });
+            }
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.network_task = None;
+                if self.network_scan.is_none() {
+                    self.show_network = false;
+                }
+                self.notice = Some(StatusNotice {
+                    message: "network scan failed: background worker stopped".into(),
+                    is_error: true,
+                    observed_at: Instant::now(),
+                });
+            }
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
+
+        let inspection_result = self
+            .inspection_task
+            .as_ref()
+            .map(|task| task.receiver.try_recv());
+        match inspection_result {
+            Some(Ok(mut inspection)) => {
+                let task = self.inspection_task.take();
+                if let Some(task) = task {
+                    let same_instance = self
+                        .processes
+                        .get(&task.pid)
+                        .map(|process| {
+                            task.start_time == 0
+                                || process.start_time == 0
+                                || process.start_time == task.start_time
+                        })
+                        .unwrap_or(false);
+                    if !same_instance {
+                        let warning =
+                            "process exited or PID was reused while inspection was running";
+                        inspection.warning = Some(match inspection.warning {
+                            Some(existing) => format!("{existing}; {warning}"),
+                            None => warning.into(),
+                        });
+                    }
+                }
+                self.inspection = Some(inspection);
+                self.inspection_scroll = 0;
+            }
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.inspection_task = None;
+                if let Some(inspection) = &mut self.inspection {
+                    inspection.warning = Some("inspection background worker stopped".into());
+                }
+            }
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
+    }
+
+    pub(crate) fn network_is_scanning(&self) -> bool {
+        self.network_task.is_some()
+    }
+
+    pub(crate) fn network_scan_elapsed(&self) -> Duration {
+        self.network_task
+            .as_ref()
+            .map(|task| task.started_at.elapsed())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn inspection_is_scanning(&self) -> bool {
+        self.inspection_task.is_some()
+    }
+
+    pub(crate) fn inspection_elapsed(&self) -> Duration {
+        self.inspection_task
+            .as_ref()
+            .map(|task| task.started_at.elapsed())
+            .unwrap_or_default()
     }
 
     fn record_changes(&mut self, changes: Vec<ProcessChange>) {
@@ -348,6 +738,44 @@ impl App {
         }
     }
 
+    fn start_inspection(&mut self, process: ProcessInfo, clear_previous: bool) {
+        if self.inspection_task.is_some() {
+            return;
+        }
+        if clear_previous {
+            self.inspection = Some(ProcessInspection {
+                pid: process.pid,
+                name: process.name.clone(),
+                user: process.user.clone(),
+                cwd: process.cwd.clone(),
+                ..ProcessInspection::default()
+            });
+            self.inspection_scroll = 0;
+        }
+        let pid = process.pid;
+        let start_time = process.start_time;
+        let (sender, receiver) = mpsc::channel();
+        match thread::Builder::new()
+            .name(format!("psmore-inspect-{}", pid.as_u32()))
+            .spawn(move || {
+                let _ = sender.send(inspect_process(&process));
+            }) {
+            Ok(_) => {
+                self.inspection_task = Some(InspectionTask {
+                    receiver,
+                    started_at: Instant::now(),
+                    pid,
+                    start_time,
+                });
+            }
+            Err(error) => {
+                if let Some(inspection) = &mut self.inspection {
+                    inspection.warning = Some(format!("cannot start inspection: {error}"));
+                }
+            }
+        }
+    }
+
     fn open_inspection(&mut self) {
         let Some(process) = self
             .selected_pid()
@@ -357,11 +785,13 @@ impl App {
             return;
         };
         self.show_events = false;
-        self.inspection = Some(inspect_process(&process));
-        self.inspection_scroll = 0;
+        self.start_inspection(process, true);
     }
 
     fn refresh_inspection(&mut self) {
+        if self.inspection_task.is_some() {
+            return;
+        }
         let Some(pid) = self.inspection.as_ref().map(|inspection| inspection.pid) else {
             self.open_inspection();
             return;
@@ -372,8 +802,7 @@ impl App {
             }
             return;
         };
-        self.inspection = Some(inspect_process(&process));
-        self.inspection_scroll = 0;
+        self.start_inspection(process, false);
     }
 
     fn rebuild_visible(&mut self) {
@@ -703,6 +1132,7 @@ impl App {
     }
 
     fn export_diagnostic_report(&mut self) {
+        let attention_findings = self.attention_findings();
         let result = std::env::current_dir().and_then(|directory| {
             export_report(
                 ReportInput {
@@ -713,8 +1143,12 @@ impl App {
                     processes: &self.processes,
                     resources: &self.resources,
                     events: &self.events,
+                    attention_findings: &attention_findings,
                     network: self.network_scan.as_ref(),
+                    network_scope: self.network_scope,
+                    network_scan_in_progress: self.network_is_scanning(),
                     inspection: self.inspection.as_ref(),
+                    inspection_in_progress: self.inspection_is_scanning(),
                     baseline: self.baseline.as_ref(),
                 },
                 &directory,
@@ -734,31 +1168,137 @@ impl App {
         });
     }
 
+    fn start_network_scan(&mut self, clear_previous: bool) {
+        if self.network_task.is_some() {
+            return;
+        }
+        if clear_previous {
+            self.network_scan = None;
+        }
+        let processes = self.processes.clone();
+        let (sender, receiver) = mpsc::channel();
+        match thread::Builder::new()
+            .name("psmore-network-scan".into())
+            .spawn(move || {
+                let _ = sender.send(scan_network(&processes));
+            }) {
+            Ok(_) => {
+                self.network_task = Some(NetworkTask {
+                    receiver,
+                    started_at: Instant::now(),
+                });
+            }
+            Err(error) => {
+                self.show_network = false;
+                self.notice = Some(StatusNotice {
+                    message: format!("cannot start network scan: {error}"),
+                    is_error: true,
+                    observed_at: Instant::now(),
+                });
+            }
+        }
+    }
+
     fn open_network(&mut self) {
-        self.network_scan = Some(scan_network(&self.processes));
+        self.show_network = true;
+        self.start_network_scan(true);
+        self.network_scope = NetworkScope::default();
         self.network_selected = 0;
         self.network_filter.clear();
         self.network_searching = false;
         self.show_events = false;
         self.inspection = None;
+        self.inspection_task = None;
         self.trend_pid = None;
         self.show_snapshot_diff = false;
         self.show_hotspots = false;
         self.hotspot_selected = None;
+        self.show_attention = false;
+        self.attention_selected = None;
     }
 
     fn open_hotspots(&mut self) {
         self.show_hotspots = true;
         self.hotspot_metric = HotspotMetric::default();
         self.hotspot_scope = HotspotScope::default();
-        self.network_scan = None;
+        self.show_network = false;
         self.network_filter.clear();
         self.network_searching = false;
         self.show_events = false;
         self.inspection = None;
+        self.inspection_task = None;
         self.trend_pid = None;
         self.show_snapshot_diff = false;
+        self.show_attention = false;
+        self.attention_selected = None;
         self.reset_hotspot_selection();
+    }
+
+    fn open_attention(&mut self) {
+        self.show_attention = true;
+        self.show_network = false;
+        self.network_filter.clear();
+        self.network_searching = false;
+        self.show_events = false;
+        self.inspection = None;
+        self.inspection_task = None;
+        self.trend_pid = None;
+        self.show_snapshot_diff = false;
+        self.show_hotspots = false;
+        self.hotspot_selected = None;
+        self.reset_attention_selection();
+    }
+
+    pub(crate) fn attention_findings(&self) -> Vec<AttentionFinding> {
+        rank_attention_findings(&self.processes, &self.history, &self.events)
+    }
+
+    fn reset_attention_selection(&mut self) {
+        self.attention_selected = self.attention_findings().first().map(|finding| finding.pid);
+    }
+
+    fn ensure_attention_selection(&mut self) {
+        let findings = self.attention_findings();
+        let selection_is_visible = self
+            .attention_selected
+            .map(|pid| findings.iter().any(|finding| finding.pid == pid))
+            .unwrap_or(false);
+        if !selection_is_visible {
+            self.attention_selected = findings.first().map(|finding| finding.pid);
+        }
+    }
+
+    fn move_attention_selection(&mut self, delta: isize) {
+        let findings = self.attention_findings();
+        if findings.is_empty() {
+            self.attention_selected = None;
+            return;
+        }
+        let current = self
+            .attention_selected
+            .and_then(|pid| findings.iter().position(|finding| finding.pid == pid))
+            .unwrap_or(0);
+        let next =
+            (current as isize + delta).clamp(0, findings.len().saturating_sub(1) as isize) as usize;
+        self.attention_selected = findings.get(next).map(|finding| finding.pid);
+    }
+
+    fn open_attention_trend(&mut self) {
+        let Some(pid) = self.attention_selected else {
+            return;
+        };
+        self.show_attention = false;
+        self.attention_selected = None;
+        self.trend_pid = Some(pid);
+        self.trend_view = TrendView::default();
+    }
+
+    fn inspect_attention_process(&mut self) {
+        let Some(pid) = self.attention_selected else {
+            return;
+        };
+        self.jump_to_process(pid);
+        self.open_inspection();
     }
 
     pub(crate) fn hotspot_ranked(&self, metric: HotspotMetric) -> Vec<Pid> {
@@ -799,19 +1339,18 @@ impl App {
     }
 
     fn refresh_network(&mut self) {
-        self.network_scan = Some(scan_network(&self.processes));
-        let visible = self.network_visible_indices();
-        self.network_selected = self.network_selected.min(visible.len().saturating_sub(1));
+        self.start_network_scan(false);
     }
 
     pub(crate) fn network_visible_indices(&self) -> Vec<usize> {
         self.network_scan
             .as_ref()
             .map(|scan| {
-                scan.listeners
+                scan.endpoints
                     .iter()
                     .enumerate()
-                    .filter(|(_, listener)| listener.matches(&self.network_filter))
+                    .filter(|(_, endpoint)| self.network_scope.includes(endpoint))
+                    .filter(|(_, endpoint)| endpoint.matches(&self.network_filter))
                     .map(|(index, _)| index)
                     .collect()
             })
@@ -833,11 +1372,13 @@ impl App {
         if !self.processes.contains_key(&pid) {
             return;
         }
-        self.network_scan = None;
+        self.show_network = false;
         self.network_filter.clear();
         self.network_searching = false;
         self.show_hotspots = false;
         self.hotspot_selected = None;
+        self.show_attention = false;
+        self.attention_selected = None;
         self.search.clear();
         self.searching = false;
         self.focus = None;
@@ -866,6 +1407,31 @@ impl App {
             && key.code == KeyCode::Char('o')
         {
             self.export_diagnostic_report();
+            return false;
+        }
+        if self.show_attention {
+            match key.code {
+                KeyCode::Char('q') => return true,
+                KeyCode::Esc | KeyCode::Char('a') => {
+                    self.show_attention = false;
+                    self.attention_selected = None;
+                }
+                KeyCode::Down | KeyCode::Char('j') => self.move_attention_selection(1),
+                KeyCode::Up | KeyCode::Char('k') => self.move_attention_selection(-1),
+                KeyCode::PageDown => self.move_attention_selection(10),
+                KeyCode::PageUp => self.move_attention_selection(-10),
+                KeyCode::Char('r') => self.refresh(),
+                KeyCode::Char(' ') => self.toggle_paused(),
+                KeyCode::Enter => {
+                    if let Some(pid) = self.attention_selected {
+                        self.jump_to_process(pid);
+                    }
+                }
+                KeyCode::Char('t') => self.open_attention_trend(),
+                KeyCode::Char('i') => self.inspect_attention_process(),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
+                _ => {}
+            }
             return false;
         }
         if self.show_hotspots {
@@ -933,7 +1499,7 @@ impl App {
             }
             return false;
         }
-        if self.network_scan.is_some() {
+        if self.show_network {
             if self.network_searching {
                 match key.code {
                     KeyCode::Esc => {
@@ -964,7 +1530,7 @@ impl App {
             match key.code {
                 KeyCode::Char('q') => return true,
                 KeyCode::Esc | KeyCode::Char('n') => {
-                    self.network_scan = None;
+                    self.show_network = false;
                     self.network_filter.clear();
                     self.network_searching = false;
                 }
@@ -978,6 +1544,10 @@ impl App {
                     self.network_filter.clear();
                     self.network_selected = 0;
                 }
+                KeyCode::Char('v') => {
+                    self.network_scope.toggle();
+                    self.network_selected = 0;
+                }
                 KeyCode::Down | KeyCode::Char('j') => self.move_network_selection(1),
                 KeyCode::Up | KeyCode::Char('k') => self.move_network_selection(-1),
                 KeyCode::PageDown => self.move_network_selection(10),
@@ -989,7 +1559,7 @@ impl App {
                         .and_then(|index| {
                             self.network_scan
                                 .as_ref()
-                                .and_then(|scan| scan.listeners.get(*index))
+                                .and_then(|scan| scan.endpoints.get(*index))
                         })
                         .and_then(|listener| listener.pid);
                     if let Some(pid) = pid {
@@ -1019,6 +1589,7 @@ impl App {
                 KeyCode::Char('q') => return true,
                 KeyCode::Esc => {
                     self.inspection = None;
+                    self.inspection_task = None;
                     self.inspection_scroll = 0;
                 }
                 KeyCode::Enter | KeyCode::Char('r') => self.refresh_inspection(),
@@ -1115,12 +1686,14 @@ impl App {
             KeyCode::Char('e') => {
                 self.show_events = true;
                 self.inspection = None;
+                self.inspection_task = None;
             }
             KeyCode::Char('t') => {
                 self.trend_pid = self.selected_pid();
                 self.trend_view = TrendView::default();
                 self.show_events = false;
                 self.inspection = None;
+                self.inspection_task = None;
             }
             KeyCode::Char('b') => self.capture_baseline(),
             KeyCode::Char('d') if self.baseline.is_some() => {
@@ -1128,6 +1701,7 @@ impl App {
                 self.snapshot_diff_scroll = 0;
                 self.show_events = false;
                 self.inspection = None;
+                self.inspection_task = None;
                 self.trend_pid = None;
             }
             KeyCode::Char('x') => {
@@ -1137,6 +1711,7 @@ impl App {
             }
             KeyCode::Char('n') => self.open_network(),
             KeyCode::Char('h') => self.open_hotspots(),
+            KeyCode::Char('a') => self.open_attention(),
             KeyCode::Enter => self.open_inspection(),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
             _ => {}

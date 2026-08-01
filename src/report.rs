@@ -14,10 +14,11 @@ use sysinfo::{Pid, System};
 
 use crate::{
     model::{
-        InspectionField, OpenFileInfo, ProcessChange, ProcessEvent, ProcessInfo, ProcessInspection,
-        ResourceAggregate, SocketInfo, SortMode, process_command_line, process_path,
+        AttentionFinding, InspectionField, OpenFileInfo, ProcessChange, ProcessEvent, ProcessInfo,
+        ProcessInspection, ResourceAggregate, SocketInfo, SortMode, process_command_line,
+        process_path,
     },
-    network::{NetworkListener, NetworkScan},
+    network::{NetworkEndpoint, NetworkScan, NetworkScope},
     snapshot::{BaselineSnapshot, ProcessSnapshotEntry, SnapshotResourceDelta},
 };
 
@@ -32,8 +33,12 @@ pub(crate) struct ReportInput<'a> {
     pub(crate) processes: &'a HashMap<Pid, ProcessInfo>,
     pub(crate) resources: &'a HashMap<Pid, ResourceAggregate>,
     pub(crate) events: &'a [ProcessEvent],
+    pub(crate) attention_findings: &'a [AttentionFinding],
     pub(crate) network: Option<&'a NetworkScan>,
+    pub(crate) network_scope: NetworkScope,
+    pub(crate) network_scan_in_progress: bool,
     pub(crate) inspection: Option<&'a ProcessInspection>,
+    pub(crate) inspection_in_progress: bool,
     pub(crate) baseline: Option<&'a BaselineSnapshot>,
 }
 
@@ -48,11 +53,13 @@ struct DiagnosticReport {
     hostname: Option<String>,
     selected_pid: Option<u32>,
     paused: bool,
+    collection_status: CollectionStatusReport,
     sort_mode: &'static str,
     process_count: usize,
     system: AggregateReport,
     processes: Vec<ProcessReport>,
     recent_events: Vec<EventReport>,
+    attention_findings: Vec<AttentionReport>,
     network_scan: Option<NetworkReport>,
     selected_inspection: Option<InspectionReport>,
     baseline: Option<BaselineReport>,
@@ -62,6 +69,12 @@ struct DiagnosticReport {
 struct ToolReport {
     name: &'static str,
     version: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct CollectionStatusReport {
+    network_scan_in_progress: bool,
+    inspection_in_progress: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -112,38 +125,52 @@ struct EventReport {
     kind: &'static str,
     pid: u32,
     name: String,
+    command: String,
     parent_pid: Option<u32>,
     old_parent_pid: Option<u32>,
     new_parent_pid: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
-struct NetworkReport {
-    warning: Option<String>,
-    listeners: Vec<NetworkListenerReport>,
+struct AttentionReport {
+    pid: u32,
+    severity: &'static str,
+    score: u16,
+    reasons: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
-struct NetworkListenerReport {
+struct NetworkReport {
+    scope: &'static str,
+    warning: Option<String>,
+    endpoints: Vec<NetworkEndpointReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct NetworkEndpointReport {
     pid: Option<u32>,
     process: String,
     fd: String,
     protocol: String,
-    endpoint: String,
+    local_endpoint: String,
+    remote_endpoint: String,
     state: String,
     namespace: String,
+    listener: bool,
 }
 
-impl From<&NetworkListener> for NetworkListenerReport {
-    fn from(value: &NetworkListener) -> Self {
+impl From<&NetworkEndpoint> for NetworkEndpointReport {
+    fn from(value: &NetworkEndpoint) -> Self {
         Self {
             pid: value.pid.map(Pid::as_u32),
             process: value.process.clone(),
             fd: value.fd.clone(),
             protocol: value.protocol.clone(),
-            endpoint: value.endpoint.clone(),
+            local_endpoint: value.local_endpoint.clone(),
+            remote_endpoint: value.remote_endpoint.clone(),
             state: value.state.clone(),
             namespace: value.namespace.clone(),
+            listener: value.is_listener(),
         }
     }
 }
@@ -324,20 +351,27 @@ fn elapsed_millis(elapsed: std::time::Duration) -> u64 {
 fn event_report(event: &ProcessEvent, generated_at: u64) -> EventReport {
     let observed_at = generated_at.saturating_sub(elapsed_millis(event.observed_at.elapsed()));
     match &event.change {
-        ProcessChange::Started { pid, name, parent } => EventReport {
+        ProcessChange::Started {
+            pid,
+            name,
+            command,
+            parent,
+        } => EventReport {
             observed_at_unix_ms: observed_at,
             kind: "started",
             pid: pid.as_u32(),
             name: name.clone(),
+            command: command.clone(),
             parent_pid: parent.map(Pid::as_u32),
             old_parent_pid: None,
             new_parent_pid: None,
         },
-        ProcessChange::Exited { pid, name } => EventReport {
+        ProcessChange::Exited { pid, name, command } => EventReport {
             observed_at_unix_ms: observed_at,
             kind: "exited",
             pid: pid.as_u32(),
             name: name.clone(),
+            command: command.clone(),
             parent_pid: None,
             old_parent_pid: None,
             new_parent_pid: None,
@@ -345,6 +379,7 @@ fn event_report(event: &ProcessEvent, generated_at: u64) -> EventReport {
         ProcessChange::Reparented {
             pid,
             name,
+            command,
             old_parent,
             new_parent,
         } => EventReport {
@@ -352,6 +387,7 @@ fn event_report(event: &ProcessEvent, generated_at: u64) -> EventReport {
             kind: "reparented",
             pid: pid.as_u32(),
             name: name.clone(),
+            command: command.clone(),
             parent_pid: None,
             old_parent_pid: old_parent.map(Pid::as_u32),
             new_parent_pid: new_parent.map(Pid::as_u32),
@@ -444,11 +480,12 @@ fn build_report(input: ReportInput<'_>, generated_at: u64) -> DiagnosticReport {
         .copied()
         .unwrap_or_default();
     let network_scan = input.network.map(|scan| NetworkReport {
+        scope: input.network_scope.label(),
         warning: scan.warning.clone(),
-        listeners: scan
-            .listeners
+        endpoints: scan
+            .endpoints
             .iter()
-            .map(NetworkListenerReport::from)
+            .map(NetworkEndpointReport::from)
             .collect(),
     });
     let baseline = input
@@ -467,6 +504,10 @@ fn build_report(input: ReportInput<'_>, generated_at: u64) -> DiagnosticReport {
         hostname: System::host_name(),
         selected_pid: input.selected_pid.map(Pid::as_u32),
         paused: input.paused,
+        collection_status: CollectionStatusReport {
+            network_scan_in_progress: input.network_scan_in_progress,
+            inspection_in_progress: input.inspection_in_progress,
+        },
         sort_mode: input.sort_mode.label(),
         process_count: input.processes.len().saturating_sub(1),
         system: root.into(),
@@ -475,6 +516,16 @@ fn build_report(input: ReportInput<'_>, generated_at: u64) -> DiagnosticReport {
             .events
             .iter()
             .map(|event| event_report(event, generated_at))
+            .collect(),
+        attention_findings: input
+            .attention_findings
+            .iter()
+            .map(|finding| AttentionReport {
+                pid: finding.pid.as_u32(),
+                severity: finding.severity.label(),
+                score: finding.score,
+                reasons: finding.reasons.clone(),
+            })
             .collect(),
         network_scan,
         selected_inspection: input.inspection.map(inspection_report),
