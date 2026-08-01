@@ -410,6 +410,98 @@ fn push_inspection_fields(lines: &mut Vec<Line<'static>>, title: &str, fields: &
     }
 }
 
+fn thread_cpu_style(cpu_percent: f32) -> Style {
+    let color = if cpu_percent >= 50.0 {
+        Color::LightRed
+    } else if cpu_percent >= 10.0 {
+        Color::LightYellow
+    } else if cpu_percent > 0.0 {
+        Color::LightGreen
+    } else {
+        Color::DarkGray
+    };
+    Style::default().fg(color)
+}
+
+fn safe_thread_name(name: &str) -> String {
+    if name.is_empty() {
+        return "[unnamed]".into();
+    }
+    name.chars()
+        .map(|character| {
+            if character.is_control() {
+                '\u{fffd}'
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+fn push_thread_lines(lines: &mut Vec<Line<'static>>, inspection: &ProcessInspection) {
+    if inspection.thread_count == 0 && inspection.thread_warning.is_none() {
+        return;
+    }
+    lines.push(Line::from(""));
+    let sampling = if inspection.thread_sample_ms > 0 {
+        format!("{}ms sample", inspection.thread_sample_ms)
+    } else {
+        "scheduler estimate".into()
+    };
+    lines.push(Line::from(Span::styled(
+        format!(
+            "HOT THREADS (showing {}/{}; {sampling})",
+            inspection.threads.len(),
+            inspection.thread_count
+        ),
+        Style::default()
+            .fg(Color::LightCyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    if let Some(warning) = &inspection.thread_warning {
+        lines.push(Line::from(Span::styled(
+            format!("  WARNING  {warning}"),
+            Style::default().fg(Color::LightYellow),
+        )));
+    }
+    if inspection.threads.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No thread details visible",
+            Style::default().fg(Color::DarkGray),
+        )));
+        return;
+    }
+    lines.push(Line::from(Span::styled(
+        "           TID    CPU  STATE            PRI  NI CORE  NAME",
+        Style::default().fg(Color::DarkGray),
+    )));
+    for thread in &inspection.threads {
+        let nice = thread
+            .nice
+            .map(|nice| nice.to_string())
+            .unwrap_or_else(|| "-".into());
+        let processor = thread
+            .processor
+            .map(|processor| processor.to_string())
+            .unwrap_or_else(|| "-".into());
+        lines.push(Line::from(vec![
+            Span::raw(format!("  {:>12} ", thread.id)),
+            Span::styled(
+                format!("{:>6.1}%", thread.cpu_percent),
+                thread_cpu_style(thread.cpu_percent),
+            ),
+            Span::raw(format!(
+                "  {:<15} {:>3} {:>3} {:>4}  {}",
+                thread.state,
+                thread.priority,
+                nice,
+                processor,
+                safe_thread_name(&thread.name)
+            )),
+        ]));
+    }
+}
+
 fn inspection_lines(inspection: &ProcessInspection) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(vec![
@@ -427,6 +519,7 @@ fn inspection_lines(inspection: &ProcessInspection) -> Vec<Line<'static>> {
             Style::default().fg(Color::LightRed),
         )));
     }
+    push_thread_lines(&mut lines, inspection);
     push_inspection_fields(&mut lines, "RUNTIME CONTEXT", &inspection.runtime);
     push_inspection_fields(&mut lines, "SECURITY", &inspection.security);
     push_inspection_fields(&mut lines, "NAMESPACES", &inspection.namespaces);
@@ -1632,7 +1725,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         (None, false) if !app.search.is_empty() => format!(" psmore  filter: {}", app.search),
         (None, false) => format!(" psmore  {} process relationships ", platform_name()),
     };
-    if app.searching && !app.search.is_empty() {
+    if !app.search.is_empty() {
         if let Some(error) = &app.search_error {
             title.push_str(&format!("  query error: {error} "));
         } else {
@@ -1803,6 +1896,8 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         } else {
             " query: words | name:/user:/state: | cpu>20 | mem>500m | tree.mem>2g | !negate | Enter finish | Esc clear ".into()
         }
+    } else if !app.search.is_empty() {
+        " filter active | / new search or clear | ↑↓/jk move | Enter inspect | q quit ".into()
     } else {
         " ↑↓/jk move | ←/→ tree | / find | a attention | h hot | s sort | p actions | t trend | n network | b base | d diff | o report ".into()
     };

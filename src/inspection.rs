@@ -1,6 +1,9 @@
 #[cfg(not(target_os = "linux"))]
 use std::process::Command;
 
+#[cfg(target_os = "macos")]
+use std::{ffi::c_void, mem::MaybeUninit};
+
 #[cfg(target_os = "linux")]
 use std::{
     collections::{HashMap, HashSet},
@@ -8,6 +11,8 @@ use std::{
     net::{Ipv4Addr, Ipv6Addr},
     os::unix::fs::FileTypeExt,
     path::Path,
+    thread,
+    time::{Duration, Instant},
 };
 
 #[cfg(target_os = "linux")]
@@ -17,7 +22,168 @@ use sysinfo::Pid;
 use crate::model::InspectionField;
 #[cfg(not(target_os = "linux"))]
 use crate::model::LsofFileRecord;
-use crate::model::{OpenFileInfo, ProcessInfo, ProcessInspection, SocketInfo};
+use crate::model::{OpenFileInfo, ProcessInfo, ProcessInspection, SocketInfo, ThreadInfo};
+
+const MAX_THREAD_ROWS: usize = 50;
+
+#[cfg(target_os = "macos")]
+const PROC_PIDTHREADINFO: i32 = 5;
+#[cfg(target_os = "macos")]
+const PROC_PIDLISTTHREADS: i32 = 6;
+#[cfg(target_os = "macos")]
+const MAXTHREADNAMESIZE: usize = 64;
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct MacProcThreadInfo {
+    user_time: u64,
+    system_time: u64,
+    cpu_usage: i32,
+    policy: i32,
+    run_state: i32,
+    flags: i32,
+    sleep_time: i32,
+    current_priority: i32,
+    priority: i32,
+    max_priority: i32,
+    name: [i8; MAXTHREADNAMESIZE],
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn proc_pidinfo(pid: i32, flavor: i32, arg: u64, buffer: *mut c_void, buffer_size: i32) -> i32;
+}
+
+#[cfg(target_os = "macos")]
+fn mac_thread_state(state: i32) -> &'static str {
+    match state {
+        1 => "Running",
+        2 => "Stopped",
+        3 => "Waiting",
+        4 => "Uninterruptible",
+        5 => "Halted",
+        _ => "Unknown",
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn mac_thread_name(raw: &[i8; MAXTHREADNAMESIZE]) -> String {
+    let length = raw.iter().position(|byte| *byte == 0).unwrap_or(raw.len());
+    let bytes: Vec<u8> = raw[..length].iter().map(|byte| *byte as u8).collect();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+#[cfg(target_os = "macos")]
+fn mac_thread_ids(pid: i32) -> Result<Vec<u64>, String> {
+    let mut capacity = 64_usize;
+    loop {
+        let mut ids = vec![0_u64; capacity];
+        let buffer_size = ids
+            .len()
+            .checked_mul(std::mem::size_of::<u64>())
+            .and_then(|size| i32::try_from(size).ok())
+            .ok_or_else(|| "thread list is too large".to_string())?;
+        // SAFETY: `ids` is a writable buffer of exactly `buffer_size` bytes,
+        // and libproc only writes thread IDs for the requested live PID.
+        let bytes = unsafe {
+            proc_pidinfo(
+                pid,
+                PROC_PIDLISTTHREADS,
+                0,
+                ids.as_mut_ptr().cast(),
+                buffer_size,
+            )
+        };
+        if bytes <= 0 {
+            return Err(format!(
+                "cannot list macOS threads: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let count = bytes as usize / std::mem::size_of::<u64>();
+        if count < capacity || capacity >= 65_536 {
+            ids.truncate(count.min(capacity));
+            ids.retain(|thread_id| *thread_id != 0);
+            ids.sort_unstable();
+            ids.dedup();
+            return Ok(ids);
+        }
+        capacity = capacity.saturating_mul(2);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn collect_macos_threads(pid: i32) -> Result<(Vec<ThreadInfo>, usize, Option<String>), String> {
+    let ids = mac_thread_ids(pid)?;
+    let thread_count = ids.len();
+    let mut unreadable = 0_usize;
+    let mut last_failure = None;
+    let mut threads = Vec::with_capacity(thread_count.min(MAX_THREAD_ROWS));
+    for thread_id in ids {
+        let mut raw = MaybeUninit::<MacProcThreadInfo>::uninit();
+        let expected = i32::try_from(std::mem::size_of::<MacProcThreadInfo>())
+            .map_err(|_| "macOS thread structure size overflow".to_string())?;
+        // SAFETY: `raw` points to an uninitialized buffer with the exact C
+        // struct layout and size required by PROC_PIDTHREADINFO. The value
+        // is read only after libproc reports a complete structure.
+        let bytes = unsafe {
+            proc_pidinfo(
+                pid,
+                PROC_PIDTHREADINFO,
+                thread_id,
+                raw.as_mut_ptr().cast(),
+                expected,
+            )
+        };
+        if bytes != expected {
+            unreadable += 1;
+            last_failure = Some(format!(
+                "returned {bytes}/{expected} bytes ({})",
+                std::io::Error::last_os_error()
+            ));
+            continue;
+        }
+        // SAFETY: the successful call above initialized every byte of `raw`.
+        let raw = unsafe { raw.assume_init() };
+        threads.push(ThreadInfo {
+            id: thread_id,
+            name: mac_thread_name(&raw.name),
+            state: mac_thread_state(raw.run_state).into(),
+            // libproc uses TH_USAGE_SCALE=1000, where 1000 means one CPU.
+            cpu_percent: (raw.cpu_usage.max(0) as f32 / 10.0).min(100.0),
+            priority: raw.current_priority,
+            nice: None,
+            processor: None,
+        });
+    }
+    threads.sort_by(|left, right| {
+        right
+            .cpu_percent
+            .total_cmp(&left.cpu_percent)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    threads.truncate(MAX_THREAD_ROWS);
+    let warning = (unreadable > 0).then(|| {
+        let detail = last_failure
+            .map(|failure| format!("; last failure {failure}"))
+            .unwrap_or_default();
+        format!("{unreadable} macOS threads exited or became unreadable during collection{detail}")
+    });
+    Ok((threads, thread_count, warning))
+}
+
+#[cfg(target_os = "macos")]
+fn attach_macos_threads(inspection: &mut ProcessInspection) {
+    match collect_macos_threads(inspection.pid.as_u32() as i32) {
+        Ok((threads, thread_count, warning)) => {
+            inspection.threads = threads;
+            inspection.thread_count = thread_count;
+            inspection.thread_truncated = thread_count > MAX_THREAD_ROWS;
+            inspection.thread_warning = warning;
+        }
+        Err(error) => inspection.thread_warning = Some(error),
+    }
+}
 
 #[cfg(not(target_os = "linux"))]
 fn flush_lsof_record(record: &mut Option<LsofFileRecord>, inspection: &mut ProcessInspection) {
@@ -159,24 +325,224 @@ fn inspect_process_lsof(process: &ProcessInfo) -> ProcessInspection {
                         .into(),
                 );
             }
+            #[cfg(target_os = "macos")]
+            attach_macos_threads(&mut inspection);
             inspection
         }
-        Err(error) => ProcessInspection {
-            pid: process.pid,
-            name: process.name.clone(),
-            user: if process.user.is_empty() {
-                "[unavailable]".into()
+        Err(error) => {
+            let mut inspection = ProcessInspection {
+                pid: process.pid,
+                name: process.name.clone(),
+                user: if process.user.is_empty() {
+                    "[unavailable]".into()
+                } else {
+                    process.user.clone()
+                },
+                cwd: if process.cwd.is_empty() {
+                    "[unavailable]".into()
+                } else {
+                    process.cwd.clone()
+                },
+                warning: Some(format!("cannot run lsof: {error}")),
+                ..ProcessInspection::default()
+            };
+            #[cfg(target_os = "macos")]
+            attach_macos_threads(&mut inspection);
+            inspection
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, PartialEq)]
+struct LinuxThreadSample {
+    id: u64,
+    name: String,
+    state: String,
+    cpu_ticks: u64,
+    start_time_ticks: u64,
+    priority: i32,
+    nice: i32,
+    processor: Option<i32>,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_thread_state(state: char) -> &'static str {
+    match state {
+        'R' => "Running",
+        'S' => "Sleeping",
+        'D' => "Uninterruptible",
+        'T' => "Stopped",
+        't' => "Tracing",
+        'Z' => "Zombie",
+        'X' | 'x' => "Dead",
+        'I' => "Idle",
+        'P' => "Parked",
+        _ => "Unknown",
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_thread_stat(content: &str) -> Option<LinuxThreadSample> {
+    let open = content.find('(')?;
+    let close = content.rfind(')')?;
+    if close <= open {
+        return None;
+    }
+    let id = content[..open].trim().parse().ok()?;
+    let name = content[open + 1..close].to_string();
+    let fields: Vec<&str> = content[close + 1..].split_whitespace().collect();
+    if fields.len() <= 36 {
+        return None;
+    }
+    let state = fields[0].chars().next()?;
+    let user_ticks: u64 = fields[11].parse().ok()?;
+    let system_ticks: u64 = fields[12].parse().ok()?;
+    Some(LinuxThreadSample {
+        id,
+        name,
+        state: linux_thread_state(state).into(),
+        cpu_ticks: user_ticks.saturating_add(system_ticks),
+        start_time_ticks: fields[19].parse().ok()?,
+        priority: fields[15].parse().ok()?,
+        nice: fields[16].parse().ok()?,
+        processor: fields[36].parse().ok(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxThreadSampleSet {
+    rows: Vec<LinuxThreadSample>,
+    entries: usize,
+    unreadable: usize,
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_thread_samples(proc_root: &str) -> Result<LinuxThreadSampleSet, String> {
+    let task_root = format!("{proc_root}/task");
+    let entries =
+        fs::read_dir(&task_root).map_err(|error| format!("cannot read {task_root}: {error}"))?;
+    let mut rows = Vec::new();
+    let mut entry_count = 0_usize;
+    let mut unreadable = 0_usize;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            unreadable += 1;
+            continue;
+        };
+        entry_count += 1;
+        let stat_path = entry.path().join("stat");
+        let sample = fs::read_to_string(&stat_path)
+            .ok()
+            .and_then(|content| parse_linux_thread_stat(&content));
+        match sample {
+            Some(sample) => rows.push(sample),
+            None => unreadable += 1,
+        }
+    }
+    rows.sort_by_key(|sample| sample.id);
+    Ok(LinuxThreadSampleSet {
+        rows,
+        entries: entry_count,
+        unreadable,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_clock_ticks_per_second() -> Result<f64, String> {
+    // SAFETY: sysconf with _SC_CLK_TCK has no pointer arguments or side effects.
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks <= 0 {
+        Err("cannot determine Linux CLK_TCK".into())
+    } else {
+        Ok(ticks as f64)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn build_linux_thread_rows(
+    before: &[LinuxThreadSample],
+    after: &[LinuxThreadSample],
+    elapsed: Duration,
+    ticks_per_second: f64,
+) -> Vec<ThreadInfo> {
+    let before: HashMap<u64, &LinuxThreadSample> =
+        before.iter().map(|sample| (sample.id, sample)).collect();
+    let elapsed_seconds = elapsed.as_secs_f64();
+    let mut rows: Vec<ThreadInfo> = after
+        .iter()
+        .map(|sample| {
+            let delta_ticks = before
+                .get(&sample.id)
+                .filter(|previous| previous.start_time_ticks == sample.start_time_ticks)
+                .map(|previous| sample.cpu_ticks.saturating_sub(previous.cpu_ticks))
+                .unwrap_or(0);
+            let cpu_percent = if elapsed_seconds > 0.0 && ticks_per_second > 0.0 {
+                (delta_ticks as f64 / ticks_per_second / elapsed_seconds * 100.0) as f32
             } else {
-                process.user.clone()
-            },
-            cwd: if process.cwd.is_empty() {
-                "[unavailable]".into()
-            } else {
-                process.cwd.clone()
-            },
-            warning: Some(format!("cannot run lsof: {error}")),
-            ..ProcessInspection::default()
-        },
+                0.0
+            };
+            ThreadInfo {
+                id: sample.id,
+                name: sample.name.clone(),
+                state: sample.state.clone(),
+                cpu_percent: if cpu_percent.is_finite() {
+                    cpu_percent.max(0.0)
+                } else {
+                    0.0
+                },
+                priority: sample.priority,
+                nice: Some(sample.nice),
+                processor: sample.processor,
+            }
+        })
+        .collect();
+    rows.sort_by(|left, right| {
+        right
+            .cpu_percent
+            .total_cmp(&left.cpu_percent)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    rows.truncate(MAX_THREAD_ROWS);
+    rows
+}
+
+#[cfg(target_os = "linux")]
+fn attach_linux_threads(proc_root: &str, inspection: &mut ProcessInspection) {
+    let before = match read_linux_thread_samples(proc_root) {
+        Ok(samples) => samples,
+        Err(error) => {
+            inspection.thread_warning = Some(error);
+            return;
+        }
+    };
+    let started_at = Instant::now();
+    thread::sleep(Duration::from_millis(250));
+    let after = match read_linux_thread_samples(proc_root) {
+        Ok(samples) => samples,
+        Err(error) => {
+            inspection.thread_warning = Some(error);
+            return;
+        }
+    };
+    let elapsed = started_at.elapsed();
+    let ticks_per_second = match linux_clock_ticks_per_second() {
+        Ok(ticks) => ticks,
+        Err(error) => {
+            inspection.thread_warning = Some(error);
+            return;
+        }
+    };
+    inspection.threads =
+        build_linux_thread_rows(&before.rows, &after.rows, elapsed, ticks_per_second);
+    inspection.thread_count = after.entries;
+    inspection.thread_sample_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+    inspection.thread_truncated = after.rows.len() > MAX_THREAD_ROWS;
+    let unreadable = before.unreadable.saturating_add(after.unreadable);
+    if unreadable > 0 {
+        inspection.thread_warning = Some(format!(
+            "{unreadable} Linux thread samples were unreadable during collection"
+        ));
     }
 }
 
@@ -642,6 +1008,7 @@ fn inspect_process_linux(process: &ProcessInfo) -> ProcessInspection {
         inspection.cwd = "[unavailable]".into();
     }
     collect_linux_context(&proc_root, &mut inspection);
+    attach_linux_threads(&proc_root, &mut inspection);
 
     let fd_root = format!("{proc_root}/fd");
     let entries = match fs::read_dir(&fd_root) {
@@ -742,5 +1109,79 @@ pub(crate) fn inspect_process(process: &ProcessInfo) -> ProcessInspection {
     #[cfg(not(target_os = "linux"))]
     {
         inspect_process_lsof(process)
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_thread_tests {
+    use super::*;
+
+    #[test]
+    fn libproc_lists_the_current_process_threads() {
+        let (threads, total, warning) =
+            collect_macos_threads(std::process::id() as i32).expect("collect current threads");
+        assert!(total >= 1);
+        assert!(
+            !threads.is_empty(),
+            "libproc listed {total} threads but returned no details: {warning:?}"
+        );
+        assert!(threads.iter().all(|thread| {
+            thread.id != 0
+                && thread.cpu_percent.is_finite()
+                && (0.0..=100.0).contains(&thread.cpu_percent)
+        }));
+        assert!(threads.len() <= total);
+        if let Some(warning) = warning {
+            assert!(warning.contains("exited or became unreadable"));
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_thread_tests {
+    use super::*;
+
+    #[test]
+    fn parses_proc_thread_stat_with_spaces_and_computes_cpu_delta() {
+        let stat = "123 (worker pool) R 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37";
+        let before = parse_linux_thread_stat(stat).expect("parse thread stat");
+        assert_eq!(before.id, 123);
+        assert_eq!(before.name, "worker pool");
+        assert_eq!(before.cpu_ticks, 23);
+        assert_eq!(before.start_time_ticks, 19);
+        assert_eq!(before.priority, 15);
+        assert_eq!(before.nice, 16);
+        assert_eq!(before.processor, Some(36));
+
+        let mut after = before.clone();
+        after.cpu_ticks += 25;
+        let rows = build_linux_thread_rows(
+            &[before.clone()],
+            &[after.clone()],
+            Duration::from_millis(250),
+            100.0,
+        );
+        assert_eq!(rows.len(), 1);
+        assert!((rows[0].cpu_percent - 100.0).abs() < 0.01);
+
+        let mut reused = after;
+        reused.start_time_ticks += 1;
+        reused.cpu_ticks += 100;
+        let rows = build_linux_thread_rows(
+            &[LinuxThreadSample {
+                id: 123,
+                name: "worker pool".into(),
+                state: "Running".into(),
+                cpu_ticks: 23,
+                start_time_ticks: 19,
+                priority: 15,
+                nice: 16,
+                processor: Some(36),
+            }],
+            &[reused],
+            Duration::from_millis(250),
+            100.0,
+        );
+        assert_eq!(rows[0].cpu_percent, 0.0);
     }
 }

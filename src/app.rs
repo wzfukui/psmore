@@ -505,6 +505,11 @@ pub(crate) struct App {
 
 impl App {
     pub(crate) fn new() -> Self {
+        Self::new_with_query(String::new())
+    }
+
+    pub(crate) fn new_with_query(query: String) -> Self {
+        let has_initial_query = !query.is_empty();
         let mut app = Self {
             provider: NativeProcessProvider::new(),
             processes: HashMap::new(),
@@ -534,7 +539,7 @@ impl App {
             selected: 0,
             expanded: HashSet::new(),
             collapsed: HashSet::new(),
-            search: String::new(),
+            search: query,
             searching: false,
             search_error: None,
             search_matches: 0,
@@ -558,6 +563,9 @@ impl App {
             action_history: Vec::new(),
         };
         app.refresh();
+        if has_initial_query {
+            app.select_first_match();
+        }
         app
     }
 
@@ -1870,6 +1878,7 @@ impl App {
                     self.rebuild_visible();
                     self.select_first_match();
                 }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
                 _ => {}
             }
             return false;
@@ -1887,6 +1896,7 @@ impl App {
             KeyCode::Char('/') => {
                 self.searching = true;
                 self.search.clear();
+                self.rebuild_visible();
             }
             KeyCode::Char('f') => self.toggle_focus(),
             KeyCode::Char('s') => self.cycle_sort_mode(),

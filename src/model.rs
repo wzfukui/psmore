@@ -119,7 +119,18 @@ pub(crate) struct InspectionField {
     pub(crate) value: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ThreadInfo {
+    pub(crate) id: u64,
+    pub(crate) name: String,
+    pub(crate) state: String,
+    pub(crate) cpu_percent: f32,
+    pub(crate) priority: i32,
+    pub(crate) nice: Option<i32>,
+    pub(crate) processor: Option<i32>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ProcessInspection {
     pub(crate) pid: Pid,
     pub(crate) name: String,
@@ -129,6 +140,11 @@ pub(crate) struct ProcessInspection {
     pub(crate) security: Vec<InspectionField>,
     pub(crate) namespaces: Vec<InspectionField>,
     pub(crate) limits: Vec<InspectionField>,
+    pub(crate) threads: Vec<ThreadInfo>,
+    pub(crate) thread_count: usize,
+    pub(crate) thread_sample_ms: u64,
+    pub(crate) thread_truncated: bool,
+    pub(crate) thread_warning: Option<String>,
     pub(crate) sockets: Vec<SocketInfo>,
     pub(crate) files: Vec<OpenFileInfo>,
     pub(crate) warning: Option<String>,
@@ -145,6 +161,11 @@ impl Default for ProcessInspection {
             security: Vec::new(),
             namespaces: Vec::new(),
             limits: Vec::new(),
+            threads: Vec::new(),
+            thread_count: 0,
+            thread_sample_ms: 0,
+            thread_truncated: false,
+            thread_warning: None,
             sockets: Vec::new(),
             files: Vec::new(),
             warning: None,

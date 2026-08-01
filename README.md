@@ -28,6 +28,8 @@
 - `Space` 暂停/恢复自动刷新，暂停后进程树完全静止，仍可导航、搜索并按 `r` 手动采样
 - `e` 打开活动审计面板；内存中保留最近 100 次人工进程操作和 200 条进程变化，最新操作固定显示在变化列表上方，避免被高频短命进程淹没
 - `Enter` 深度检查选中进程，集中展示运行用户、工作目录、TCP/UDP/Unix 套接字和打开的文件描述符
+- 深度检查按 CPU 从高到低展示热点线程：macOS 通过系统 `libproc` 获取 64 位线程 ID、名称、状态和调度器 CPU 估值；Linux 对 `/proc/<pid>/task` 做约 250 ms 差分采样，并显示 TID、状态、优先级、nice 值和所在 CPU 核
+- 线程列表最多展示最热的 50 行，但始终保留真实线程总数、采样间隔、截断状态和采集警告；线程采集与其他深度检查一起在后台运行，不阻塞进程树
 - Linux 深度检查进一步展示线程、RSS/Swap、上下文切换、cgroup、systemd 单元、Docker/containerd/Podman/Kubernetes 线索、命名空间、Seccomp、能力位和关键资源限制
 - `s` 在稳定排序、子树 CPU、子树内存、子树读速率和子树写速率热点之间循环；热点模式保留父子层级，只重排同级进程
 - `h` 打开四象限热点工作台，同时展示 CPU、内存、磁盘读、磁盘写 Top 进程；按 `v` 在进程自身与完整服务子树之间切换，并可直接跳回进程树
@@ -42,6 +44,10 @@
 - `p` 打开进程操作中心，可发送 TERM、KILL、STOP、CONT；选择操作后必须另按 `y` 确认，执行前会重新校验 PID 与启动时间，避免把信号发给复用该 PID 的新进程
 - PID 0、PID 1 和 `psmore` 自身受强制保护；每次已发送、被安全策略拒绝或被操作系统拒绝的结果都会进入活动审计
 - `o` 将当前诊断上下文导出为带版本号的 JSON 报告，包括完整进程清单、资源聚合、当前查询及命中数、关注事项、最近事件和进程操作审计；已经打开的端口扫描、深度检查及已捕获基线会一并写入，但导出本身不会触发额外扫描
+- 支持无交互快照模式：`--table` 输出适合 SSH 现场查看的稳定表格，`--json` 输出带版本号的机器可读快照；两者复用 TUI 的完整查询语法与子树资源聚合
+- 无交互模式执行两次采样，默认间隔 500 ms，使 CPU 与磁盘 I/O 速率具有实际意义；可用 `--sample-ms` 在 100–60000 ms 之间调整
+- `psmore diff BEFORE.json AFTER.json` 将两份持久快照对比为启动/退出、PID 复用、父进程变化，以及 CPU、内存、I/O 和子树进程数增量；默认输出透明的分类榜单，增加 `--json` 可获得完整机器可读差异
+- `psmore check QUERY` 将任意结构化查询变成 CI/运维健康门禁：默认期望零命中，`--expect any` 可反向要求服务存在；支持表格、`psmore.check-result` JSON 和完全静默的 `--quiet`
 - 深度检查仅在打开或手动刷新面板时启动后台采样：macOS 调用一次 `lsof`，Linux 直接读取目标进程的 `/proc`，不会加入两秒一次的全局刷新
 - 每 2 秒从系统进程数据刷新一次
 
@@ -69,6 +75,63 @@
 ```bash
 cargo run --release
 ```
+
+也可以直接在 SSH、Shell 管道或巡检脚本中采集一次快照：
+
+```bash
+# 人工快速查看：PID 顺序稳定，保留自身与完整子树资源
+cargo run --release -- --table --query 'user:deploy cpu>5'
+
+# 自动化采集：JSON 只包含匹配项，并记录查询、平台、主机和采样间隔
+cargo run --release -- --json --query 'tree.mem>1g !state:zombie' > snapshot.json
+
+# 以指定筛选条件直接进入交互界面
+cargo run --release -- --query 'name:python children>=1'
+```
+
+安装后的二进制可将上述 `cargo run --release --` 简写为 `psmore`。`--table` 表头中的 `TCPU%`、`TMEM`、`TPROCS` 分别表示当前进程及全部后代的聚合 CPU、内存和进程数。`--json` 使用 `psmore.process-snapshot` schema v1，进程按 PID 稳定排序，并同时提供自身指标、直接子进程数和 `subtree` 聚合指标。命令行、路径、用户名和主机名可能包含敏感信息，分享前应检查。
+
+无交互模式的退出码约定：成功为 `0`，采集/输出错误为 `1`，参数或查询错误为 `2`，`check` 策略违反为 `3`。若输出管道的读取端提前关闭（例如 `psmore --table | head`），不会打印 Broken pipe 错误；`check` 仍保留原本的策略退出码。
+
+### 查询健康门禁
+
+`check` 使用与 TUI 完全相同的字段、单位、否定条件和子树聚合，不需要维护第二套监控表达式：
+
+```bash
+# 发现任意僵尸进程即失败，命中时退出 3
+psmore check 'state:zombie'
+
+# 要求部署用户的 API 至少存在一个，否则退出 3
+psmore check 'name:api user:deploy' --expect any
+
+# 限制完整服务树内存，并输出适合 CI 归档的单一 JSON 文档
+psmore check 'tree.mem>2g' --json > memory-gate.json
+
+# cron/探针只关心退出码，不产生标准输出
+psmore check 'cpu>90 age>5m' --quiet
+```
+
+默认 expectation 是 `none`，即零命中才通过；`--expect any` 表示至少一个命中才通过。命令仍执行两次采样，默认间隔 500 ms，可用 `--sample-ms` 调整。表格首行明确显示 `CHECK PASS` 或 `CHECK FAIL`，随后仅在有命中时列出相关进程；JSON 包含策略、查询、命中数、通过状态以及完整的过滤快照。
+
+### 持久快照对比
+
+TUI 的 `b`/`d` 适合现场即时观察；需要跨命令、跨发布步骤或保留审计证据时，可以保存两份无交互快照再比较：
+
+```bash
+psmore --json > before.json
+# 执行发布、压测或故障复现
+psmore --json > after.json
+
+# 人读结果：生命周期变化，以及子树 CPU/内存/I/O 增长榜单
+psmore diff before.json after.json
+
+# 完整结果：适合 CI 规则、归档或后续分析
+psmore diff before.json after.json --json > diff.json
+```
+
+diff 只接受 `psmore.process-snapshot` schema v1，并要求两份快照的平台、主机名和查询字符串完全一致，且 AFTER 的时间不早于 BEFORE。它还会拒绝重复 PID、行数元数据不一致和虚拟 PID 0 等损坏输入，避免跨主机或不同筛选范围产生看似合理但错误的结论。
+
+未使用 `--query` 的完整快照中，“出现/消失”代表进程启动/退出。若两份快照使用了相同查询，diff 仍可比较，但会明确写成“进入/离开筛选结果”，因为 `cpu>20` 之类的动态条件变化不能证明进程生命周期。PID 复用继续以启动时间识别；启动时间两侧都不可用时，才回退到进程名和命令行。
 
 快捷键：
 
@@ -105,10 +168,12 @@ cargo run --release
 - Linux：支持 systemd 用户态进程和内核线程；不会把普通进程的线程任务混入进程树。无可执行文件路径的内核线程会显示其原生命令名，例如 `[kthreadd]`。
 - macOS 与 Linux 的进程读写字节增量由同一采样周期换算为每秒速率；新出现或 PID 被复用的进程首个样本固定为零，避免把进程累计 I/O 误报成瞬时尖峰。
 - Linux 深度检查按 PID 读取 `/proc/<pid>/fd`、`fdinfo` 与该进程网络命名空间下的 TCP、UDP、Unix socket 表，避免 `lsof` 扫描 Docker/overlay 挂载造成界面卡顿。
+- Linux 热点线程读取 `/proc/<pid>/task/*/stat` 两次，并按内核 `CLK_TCK` 与真实采样耗时换算单线程 CPU；采样期间新建或退出的线程不会被错误继承 CPU 数据。
+- macOS 热点线程直接使用系统 `libproc`，不依赖调试器、`sample` 或格式不稳定且缺少 TID 的 `ps -M` 输出。
 - Linux 运行上下文来自目标进程自己的 `/proc/<pid>/status`、`cgroup`、`ns` 和 `limits`；容器与 systemd 信息是基于内核暴露路径的诊断线索，不依赖 Docker、Podman 或 systemctl 命令。
 - 全局网络扫描仅在按 `n` 或面板内按 `r` 时执行。Linux 按网络命名空间读取 `/proc/<pid>/net` 并通过 socket inode 反查 FD/PID；macOS 使用一次性 `lsof`。权限不足的所有者会明确标记，不会被误报成没有连接。
 - 因权限或采集竞态无法读取路径时明确显示 `[path unavailable]`，不会把普通进程误标为系统根。
 - 深度检查遵循当前用户权限；看不到其他用户进程的文件或端口时会显示警告，不会伪装成“没有连接”。
 - 两个平台都建议使用与目标进程相同的用户运行；更高权限能够看到更多进程参数，但 `psmore` 本身不要求 root。
 - 进程操作遵循当前用户权限，不会提权。确认时如果目标已退出、启动时间不可用或 PID 已被复用，操作会拒绝并留下原因；信号只发送给选中 PID，不会隐式发送给整个子树或进程组。
-- 诊断报告 schema v2 先写临时文件再原子改名，并在 Unix 平台使用 `0600` 权限。报告可能包含完整命令行、文件路径、用户名、主机名、socket 端点和人工操作审计，分享前应先检查敏感信息。
+- 诊断报告 schema v3 先写临时文件再原子改名，并在 Unix 平台使用 `0600` 权限。报告可能包含完整命令行、文件路径、用户名、主机名、线程名、socket 端点和人工操作审计，分享前应先检查敏感信息。

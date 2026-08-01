@@ -16,15 +16,15 @@ use crate::{
     actions::{ProcessActionOutcome, ProcessActionRecord},
     model::{
         AttentionFinding, InspectionField, OpenFileInfo, ProcessChange, ProcessEvent, ProcessInfo,
-        ProcessInspection, ResourceAggregate, SocketInfo, SortMode, process_command_line,
-        process_path,
+        ProcessInspection, ResourceAggregate, SocketInfo, SortMode, ThreadInfo,
+        process_command_line, process_path,
     },
     network::{NetworkEndpoint, NetworkScan, NetworkScope},
     snapshot::{BaselineSnapshot, ProcessSnapshotEntry, SnapshotResourceDelta},
 };
 
 const REPORT_SCHEMA: &str = "psmore.diagnostic-report";
-const REPORT_SCHEMA_VERSION: u32 = 2;
+const REPORT_SCHEMA_VERSION: u32 = 3;
 
 pub(crate) struct ReportInput<'a> {
     pub(crate) platform: &'static str,
@@ -214,9 +214,39 @@ struct InspectionReport {
     security: Vec<FieldReport>,
     namespaces: Vec<FieldReport>,
     resource_limits: Vec<FieldReport>,
+    thread_count: usize,
+    thread_sample_interval_ms: u64,
+    thread_rows_truncated: bool,
+    thread_warning: Option<String>,
+    threads: Vec<ThreadReport>,
     sockets: Vec<SocketReport>,
     open_files: Vec<OpenFileReport>,
     warning: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ThreadReport {
+    id: u64,
+    name: String,
+    state: String,
+    cpu_percent: f32,
+    priority: i32,
+    nice: Option<i32>,
+    processor: Option<i32>,
+}
+
+impl From<&ThreadInfo> for ThreadReport {
+    fn from(value: &ThreadInfo) -> Self {
+        Self {
+            id: value.id,
+            name: value.name.clone(),
+            state: value.state.clone(),
+            cpu_percent: finite(value.cpu_percent),
+            priority: value.priority,
+            nice: value.nice,
+            processor: value.processor,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -434,6 +464,11 @@ fn inspection_report(value: &ProcessInspection) -> InspectionReport {
         security: value.security.iter().map(FieldReport::from).collect(),
         namespaces: value.namespaces.iter().map(FieldReport::from).collect(),
         resource_limits: value.limits.iter().map(FieldReport::from).collect(),
+        thread_count: value.thread_count,
+        thread_sample_interval_ms: value.thread_sample_ms,
+        thread_rows_truncated: value.thread_truncated,
+        thread_warning: value.thread_warning.clone(),
+        threads: value.threads.iter().map(ThreadReport::from).collect(),
         sockets: value.sockets.iter().map(SocketReport::from).collect(),
         open_files: value.files.iter().map(OpenFileReport::from).collect(),
         warning: value.warning.clone(),
@@ -543,7 +578,7 @@ fn build_report(input: ReportInput<'_>, generated_at: u64) -> DiagnosticReport {
     DiagnosticReport {
         schema: REPORT_SCHEMA,
         schema_version: REPORT_SCHEMA_VERSION,
-        privacy_notice: "May contain command lines, paths, user names, host names, and socket endpoints; review before sharing.",
+        privacy_notice: "May contain command lines, paths, user names, host names, thread names, and socket endpoints; review before sharing.",
         tool: ToolReport {
             name: env!("CARGO_PKG_NAME"),
             version: env!("CARGO_PKG_VERSION"),

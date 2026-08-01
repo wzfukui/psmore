@@ -1,5 +1,8 @@
 mod actions;
 mod app;
+mod cli;
+mod headless;
+mod headless_diff;
 mod history;
 mod inspection;
 mod model;
@@ -10,7 +13,13 @@ mod report;
 mod snapshot;
 mod ui;
 
-use std::{io, time::Duration};
+use std::{
+    env,
+    error::Error,
+    io::{self, IsTerminal, Write},
+    process::ExitCode,
+    time::Duration,
+};
 
 use crossterm::{
     event::{self, Event},
@@ -19,7 +28,16 @@ use crossterm::{
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 
-use crate::{app::App, ui::draw};
+use crate::{
+    app::App,
+    cli::{Cli, LaunchMode, help_text},
+    headless::{
+        capture_snapshot, matching_process_count, render_check_json, render_check_table,
+        render_json, render_table, validate_query,
+    },
+    headless_diff::{load_comparison, render_diff_json, render_diff_table},
+    ui::draw,
+};
 
 fn handle_pending_input(app: &mut App) -> io::Result<bool> {
     if !event::poll(Duration::from_millis(250))? {
@@ -31,27 +49,175 @@ fn handle_pending_input(app: &mut App) -> io::Result<bool> {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn run_tui(initial_query: String) -> Result<(), Box<dyn Error>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    if let Err(error) = execute!(stdout, EnterAlternateScreen) {
+        let _ = disable_raw_mode();
+        return Err(error.into());
+    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let mut app = App::new();
-    let result = loop {
-        app.poll_background_jobs();
-        terminal.draw(|frame| draw(frame, &mut app))?;
-        if handle_pending_input(&mut app)? {
-            break Ok(());
-        }
-        if !app.paused && app.last_refresh.elapsed() >= Duration::from_secs(2) {
-            app.refresh();
-        }
+    let mut app = if initial_query.is_empty() {
+        App::new()
+    } else {
+        App::new_with_query(initial_query)
     };
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    result
+    let result: io::Result<()> = (|| {
+        loop {
+            app.poll_background_jobs();
+            terminal.draw(|frame| draw(frame, &mut app))?;
+            if handle_pending_input(&mut app)? {
+                break Ok(());
+            }
+            if !app.paused && app.last_refresh.elapsed() >= Duration::from_secs(2) {
+                app.refresh();
+            }
+        }
+    })();
+    // Attempt every cleanup step even when an earlier one fails, so a runtime
+    // error is less likely to leave the caller's terminal in an unusable state.
+    let raw_mode_result = disable_raw_mode();
+    let alternate_screen_result = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let cursor_result = terminal.show_cursor();
+    result?;
+    raw_mode_result?;
+    alternate_screen_result?;
+    cursor_result?;
+    Ok(())
+}
+
+fn write_stdout(output: &str) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    stdout.write_all(output.as_bytes())?;
+    if !output.ends_with('\n') {
+        stdout.write_all(b"\n")?;
+    }
+    stdout.flush()
+}
+
+fn runtime_result(result: Result<(), Box<dyn Error>>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error)
+            if error
+                .downcast_ref::<io::Error>()
+                .map(|error| error.kind() == io::ErrorKind::BrokenPipe)
+                .unwrap_or(false) =>
+        {
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("psmore: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn usage_error(message: &str) -> ExitCode {
+    eprintln!("psmore: {message}\nTry 'psmore --help' for more information.");
+    ExitCode::from(2)
+}
+
+fn main() -> ExitCode {
+    let cli = match Cli::parse(env::args().skip(1)) {
+        Ok(cli) => cli,
+        Err(error) => return usage_error(&error),
+    };
+    match cli.mode {
+        LaunchMode::Help => runtime_result(write_stdout(help_text()).map_err(Into::into)),
+        LaunchMode::Version => runtime_result(
+            write_stdout(&format!("psmore {}", env!("CARGO_PKG_VERSION"))).map_err(Into::into),
+        ),
+        LaunchMode::Tui => {
+            if let Err(error) = validate_query(&cli.query) {
+                return usage_error(&format!("invalid query: {error}"));
+            }
+            if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+                return usage_error("interactive mode requires a terminal; use --table or --json");
+            }
+            runtime_result(run_tui(cli.query))
+        }
+        LaunchMode::Table | LaunchMode::Json => {
+            if let Err(error) = validate_query(&cli.query) {
+                return usage_error(&format!("invalid query: {error}"));
+            }
+            let result = (|| -> Result<(), Box<dyn Error>> {
+                let snapshot = capture_snapshot(cli.sample_ms);
+                let output = match cli.mode {
+                    LaunchMode::Table => render_table(&snapshot, &cli.query),
+                    LaunchMode::Json => render_json(&snapshot, &cli.query),
+                    _ => unreachable!(),
+                }
+                .map_err(io::Error::other)?;
+                write_stdout(&output)?;
+                Ok(())
+            })();
+            runtime_result(result)
+        }
+        LaunchMode::CheckTable | LaunchMode::CheckJson => {
+            if let Err(error) = validate_query(&cli.query) {
+                return usage_error(&format!("invalid query: {error}"));
+            }
+            let result = (|| -> Result<bool, Box<dyn Error>> {
+                let snapshot = capture_snapshot(cli.sample_ms);
+                let matched =
+                    matching_process_count(&snapshot, &cli.query).map_err(io::Error::other)?;
+                let passed = cli.check_expectation.passes(matched);
+                if !cli.quiet {
+                    let output = match cli.mode {
+                        LaunchMode::CheckTable => render_check_table(
+                            &snapshot,
+                            &cli.query,
+                            cli.check_expectation.label(),
+                            matched,
+                            passed,
+                        ),
+                        LaunchMode::CheckJson => render_check_json(
+                            &snapshot,
+                            &cli.query,
+                            cli.check_expectation.label(),
+                            matched,
+                            passed,
+                        ),
+                        _ => unreachable!(),
+                    }
+                    .map_err(io::Error::other)?;
+                    if let Err(error) = write_stdout(&output)
+                        && error.kind() != io::ErrorKind::BrokenPipe
+                    {
+                        return Err(error.into());
+                    }
+                }
+                Ok(passed)
+            })();
+            match result {
+                Ok(true) => ExitCode::SUCCESS,
+                Ok(false) => ExitCode::from(3),
+                Err(error) => runtime_result(Err(error)),
+            }
+        }
+        LaunchMode::DiffTable | LaunchMode::DiffJson => {
+            let Some((before_path, after_path)) = cli.diff_paths else {
+                return usage_error("diff requires BEFORE.json and AFTER.json");
+            };
+            let result = (|| -> Result<(), Box<dyn Error>> {
+                let comparison = load_comparison(before_path.as_ref(), after_path.as_ref())
+                    .map_err(io::Error::other)?;
+                let output = match cli.mode {
+                    LaunchMode::DiffTable => render_diff_table(&comparison),
+                    LaunchMode::DiffJson => {
+                        render_diff_json(&comparison).map_err(io::Error::other)?
+                    }
+                    _ => unreachable!(),
+                };
+                write_stdout(&output)?;
+                Ok(())
+            })();
+            runtime_result(result)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -88,7 +254,8 @@ mod tests {
         history::ResourceHistory,
         model::{
             AttentionFinding, AttentionSeverity, HotspotMetric, HotspotScope, ProcessChange,
-            ProcessEvent, ProcessInfo, ResourceAggregate, SortMode, diff_processes, process_path,
+            ProcessEvent, ProcessInfo, ProcessInspection, ResourceAggregate, SortMode, ThreadInfo,
+            diff_processes, process_path,
         },
         network::{NetworkEndpoint, NetworkScan, NetworkScope},
         provider::{bytes_per_second, is_sampler_process, parse_ps_snapshot, platform_name},
@@ -1059,6 +1226,24 @@ Max address space         unlimited            unlimited            bytes\n";
             action: ProcessActionKind::Terminate,
             outcome: ProcessActionOutcome::Sent,
         }];
+        let inspection = ProcessInspection {
+            pid: Pid::from_u32(42),
+            name: "worker".into(),
+            user: "tester".into(),
+            cwd: "/tmp".into(),
+            threads: vec![ThreadInfo {
+                id: 4_242,
+                name: "worker-hot-loop".into(),
+                state: "Running".into(),
+                cpu_percent: 87.5,
+                priority: 20,
+                nice: Some(0),
+                processor: Some(3),
+            }],
+            thread_count: 1,
+            thread_sample_ms: 250,
+            ..ProcessInspection::default()
+        };
 
         let path = export_report(
             ReportInput {
@@ -1077,7 +1262,7 @@ Max address space         unlimited            unlimited            bytes\n";
                 network: Some(&network_scan),
                 network_scope: NetworkScope::All,
                 network_scan_in_progress: false,
-                inspection: None,
+                inspection: Some(&inspection),
                 inspection_in_progress: false,
                 action_history: &action_history,
                 baseline: None,
@@ -1090,7 +1275,7 @@ Max address space         unlimited            unlimited            bytes\n";
                 .expect("parse exported report");
 
         assert_eq!(report["schema"], "psmore.diagnostic-report");
-        assert_eq!(report["schema_version"], 2);
+        assert_eq!(report["schema_version"], 3);
         assert_eq!(report["tool"]["name"], "psmore");
         assert_eq!(report["platform"], platform_name());
         assert_eq!(report["selected_pid"], 42);
@@ -1121,7 +1306,20 @@ Max address space         unlimited            unlimited            bytes\n";
         assert_eq!(report["process_actions"][0]["pid"], 42);
         assert_eq!(report["process_actions"][0]["action"], "TERM");
         assert_eq!(report["process_actions"][0]["outcome"], "sent");
-        assert!(report["selected_inspection"].is_null());
+        assert_eq!(report["selected_inspection"]["thread_count"], 1);
+        assert_eq!(
+            report["selected_inspection"]["thread_sample_interval_ms"],
+            250
+        );
+        assert_eq!(
+            report["selected_inspection"]["thread_rows_truncated"],
+            false
+        );
+        assert_eq!(report["selected_inspection"]["threads"][0]["id"], 4_242);
+        assert_eq!(
+            report["selected_inspection"]["threads"][0]["cpu_percent"],
+            87.5
+        );
         assert!(report["baseline"].is_null());
         #[cfg(unix)]
         assert_eq!(
