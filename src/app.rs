@@ -10,6 +10,10 @@ use sysinfo::Pid;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
+    actions::{
+        ProcessActionDialog, ProcessActionKind, ProcessActionRecord, ProcessActionTarget,
+        execute_process_action,
+    },
     history::ResourceHistory,
     inspection::inspect_process,
     model::{
@@ -20,6 +24,7 @@ use crate::{
     },
     network::{NetworkScan, NetworkScope, scan_network},
     provider::{NativeProcessProvider, ProcessProvider, platform_name},
+    query::ProcessQuery,
     report::{ReportInput, export_report},
     snapshot::BaselineSnapshot,
 };
@@ -476,6 +481,8 @@ pub(crate) struct App {
     pub(crate) collapsed: HashSet<Pid>,
     pub(crate) search: String,
     pub(crate) searching: bool,
+    pub(crate) search_error: Option<String>,
+    pub(crate) search_matches: usize,
     pub(crate) focus: Option<Pid>,
     pub(crate) last_refresh: Instant,
     pub(crate) marquee_offset: usize,
@@ -492,6 +499,8 @@ pub(crate) struct App {
     pub(crate) inspection: Option<ProcessInspection>,
     inspection_task: Option<InspectionTask>,
     pub(crate) inspection_scroll: u16,
+    pub(crate) process_action: Option<ProcessActionDialog>,
+    pub(crate) action_history: Vec<ProcessActionRecord>,
 }
 
 impl App {
@@ -527,6 +536,8 @@ impl App {
             collapsed: HashSet::new(),
             search: String::new(),
             searching: false,
+            search_error: None,
+            search_matches: 0,
             focus: None,
             last_refresh: Instant::now(),
             marquee_offset: 0,
@@ -543,6 +554,8 @@ impl App {
             inspection: None,
             inspection_task: None,
             inspection_scroll: 0,
+            process_action: None,
+            action_history: Vec::new(),
         };
         app.refresh();
         app
@@ -808,17 +821,38 @@ impl App {
     fn rebuild_visible(&mut self) {
         let old_pid = self.visible.get(self.selected).map(|row| row.pid);
         self.visible.clear();
-        let matched: HashSet<Pid> = self
-            .processes
-            .values()
-            .filter(|p| {
-                self.search.is_empty()
-                    || format!("{} {} {}", p.name, p.command, p.pid)
-                        .to_lowercase()
-                        .contains(&self.search.to_lowercase())
-            })
-            .map(|p| p.pid)
-            .collect();
+        let query = ProcessQuery::parse(&self.search);
+        let matched: HashSet<Pid> = match query {
+            Ok(query) => {
+                self.search_error = None;
+                self.processes
+                    .values()
+                    .filter(|process| {
+                        let subtree = self
+                            .resources
+                            .get(&process.pid)
+                            .copied()
+                            .unwrap_or_default();
+                        let direct_children = self
+                            .children
+                            .get(&Some(process.pid))
+                            .map(Vec::len)
+                            .unwrap_or(0);
+                        query.matches(process, subtree, direct_children)
+                    })
+                    .map(|process| process.pid)
+                    .collect()
+            }
+            Err(error) => {
+                self.search_error = Some(error);
+                HashSet::new()
+            }
+        };
+        self.search_matches = if self.search.is_empty() {
+            0
+        } else {
+            matched.iter().filter(|pid| pid.as_u32() != 0).count()
+        };
 
         if let Some(focus) = self.focus {
             let mut chain = Vec::new();
@@ -1019,14 +1053,24 @@ impl App {
         if self.search.is_empty() {
             return;
         }
-        let query = self.search.to_lowercase();
+        let Ok(query) = ProcessQuery::parse(&self.search) else {
+            return;
+        };
         if let Some(index) = self.visible.iter().position(|row| {
             self.processes
                 .get(&row.pid)
-                .map(|p| {
-                    format!("{} {} {}", p.name, p.command, p.pid)
-                        .to_lowercase()
-                        .contains(&query)
+                .map(|process| {
+                    let subtree = self
+                        .resources
+                        .get(&process.pid)
+                        .copied()
+                        .unwrap_or_default();
+                    let direct_children = self
+                        .children
+                        .get(&Some(process.pid))
+                        .map(Vec::len)
+                        .unwrap_or(0);
+                    query.matches(process, subtree, direct_children)
                 })
                 .unwrap_or(false)
         }) {
@@ -1138,6 +1182,10 @@ impl App {
                 ReportInput {
                     platform: platform_name(),
                     selected_pid: self.selected_pid(),
+                    query: &self.search,
+                    query_editing: self.searching,
+                    query_error: self.search_error.as_deref(),
+                    query_matches: self.search_matches,
                     paused: self.paused,
                     sort_mode: self.sort_mode,
                     processes: &self.processes,
@@ -1149,6 +1197,7 @@ impl App {
                     network_scan_in_progress: self.network_is_scanning(),
                     inspection: self.inspection.as_ref(),
                     inspection_in_progress: self.inspection_is_scanning(),
+                    action_history: &self.action_history,
                     baseline: self.baseline.as_ref(),
                 },
                 &directory,
@@ -1397,6 +1446,112 @@ impl App {
         }
     }
 
+    fn open_process_action_for(&mut self, pid: Pid) {
+        let Some(process) = self.processes.get(&pid) else {
+            self.notice = Some(StatusNotice {
+                message: format!("cannot control PID {pid}: process is no longer visible"),
+                is_error: true,
+                observed_at: Instant::now(),
+            });
+            return;
+        };
+        if pid.as_u32() <= 1 || pid.as_u32() == std::process::id() {
+            self.notice = Some(StatusNotice {
+                message: format!(
+                    "cannot control {} [{}]: protected process",
+                    process.name, pid
+                ),
+                is_error: true,
+                observed_at: Instant::now(),
+            });
+            return;
+        }
+        if process.start_time == 0 {
+            self.notice = Some(StatusNotice {
+                message: format!(
+                    "cannot control {} [{}]: process instance identity is unavailable",
+                    process.name, pid
+                ),
+                is_error: true,
+                observed_at: Instant::now(),
+            });
+            return;
+        }
+        self.process_action = Some(ProcessActionDialog {
+            target: ProcessActionTarget::from(process),
+            selected: 0,
+            confirming: false,
+        });
+    }
+
+    fn open_selected_process_action(&mut self) {
+        if let Some(pid) = self.selected_pid() {
+            self.open_process_action_for(pid);
+        }
+    }
+
+    fn move_process_action_selection(&mut self, delta: isize) {
+        let Some(dialog) = &mut self.process_action else {
+            return;
+        };
+        dialog.selected = (dialog.selected as isize + delta)
+            .clamp(0, ProcessActionKind::ALL.len().saturating_sub(1) as isize)
+            as usize;
+        dialog.confirming = false;
+    }
+
+    fn choose_process_action(&mut self, action: ProcessActionKind) {
+        let Some(dialog) = &mut self.process_action else {
+            return;
+        };
+        if let Some(index) = ProcessActionKind::ALL
+            .iter()
+            .position(|candidate| *candidate == action)
+        {
+            dialog.selected = index;
+            dialog.confirming = true;
+        }
+    }
+
+    fn execute_confirmed_process_action(&mut self) {
+        let Some(dialog) = self.process_action.take() else {
+            return;
+        };
+        let action = dialog.selected_action();
+        let target = dialog.target;
+        let outcome = execute_process_action(&target, action);
+        let detail = outcome
+            .detail()
+            .map(|detail| format!(": {detail}"))
+            .unwrap_or_default();
+        self.notice = Some(StatusNotice {
+            message: format!(
+                "{} {} to {} [{}]{}",
+                outcome.label(),
+                action.label(),
+                target.name,
+                target.pid,
+                detail
+            ),
+            is_error: outcome.is_error(),
+            observed_at: Instant::now(),
+        });
+        self.action_history.push(ProcessActionRecord {
+            observed_at: Instant::now(),
+            target,
+            action,
+            outcome,
+        });
+        const MAX_ACTION_HISTORY: usize = 100;
+        if self.action_history.len() > MAX_ACTION_HISTORY {
+            self.action_history
+                .drain(..self.action_history.len() - MAX_ACTION_HISTORY);
+        }
+        if !self.paused {
+            self.refresh();
+        }
+    }
+
     pub(crate) fn on_key(&mut self, key: KeyEvent) -> bool {
         if key.kind != KeyEventKind::Press {
             return false;
@@ -1407,6 +1562,55 @@ impl App {
             && key.code == KeyCode::Char('o')
         {
             self.export_diagnostic_report();
+            return false;
+        }
+        if self.process_action.is_some() {
+            let confirming = self
+                .process_action
+                .as_ref()
+                .map(|dialog| dialog.confirming)
+                .unwrap_or(false);
+            if confirming {
+                match key.code {
+                    KeyCode::Char('q') => return true,
+                    KeyCode::Esc => {
+                        if let Some(dialog) = &mut self.process_action {
+                            dialog.confirming = false;
+                        }
+                    }
+                    KeyCode::Char('y') => self.execute_confirmed_process_action(),
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return true;
+                    }
+                    _ => {}
+                }
+            } else {
+                match key.code {
+                    KeyCode::Char('q') => return true,
+                    KeyCode::Esc | KeyCode::Char('p') => self.process_action = None,
+                    KeyCode::Down | KeyCode::Tab => {
+                        self.move_process_action_selection(1);
+                    }
+                    KeyCode::Up => self.move_process_action_selection(-1),
+                    KeyCode::Enter => {
+                        if let Some(dialog) = &mut self.process_action {
+                            dialog.confirming = true;
+                        }
+                    }
+                    KeyCode::Char('t') => {
+                        self.choose_process_action(ProcessActionKind::Terminate);
+                    }
+                    KeyCode::Char('k') => self.choose_process_action(ProcessActionKind::Kill),
+                    KeyCode::Char('s') => self.choose_process_action(ProcessActionKind::Stop),
+                    KeyCode::Char('c') if key.modifiers.is_empty() => {
+                        self.choose_process_action(ProcessActionKind::Continue);
+                    }
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
             return false;
         }
         if self.show_attention {
@@ -1429,6 +1633,11 @@ impl App {
                 }
                 KeyCode::Char('t') => self.open_attention_trend(),
                 KeyCode::Char('i') => self.inspect_attention_process(),
+                KeyCode::Char('p') => {
+                    if let Some(pid) = self.attention_selected {
+                        self.open_process_action_for(pid);
+                    }
+                }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
                 _ => {}
             }
@@ -1712,6 +1921,7 @@ impl App {
             KeyCode::Char('n') => self.open_network(),
             KeyCode::Char('h') => self.open_hotspots(),
             KeyCode::Char('a') => self.open_attention(),
+            KeyCode::Char('p') => self.open_selected_process_action(),
             KeyCode::Enter => self.open_inspection(),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
             _ => {}

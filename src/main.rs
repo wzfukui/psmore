@@ -1,9 +1,11 @@
+mod actions;
 mod app;
 mod history;
 mod inspection;
 mod model;
 mod network;
 mod provider;
+mod query;
 mod report;
 mod snapshot;
 mod ui;
@@ -79,6 +81,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     use crate::network::{parse_linux_inet_sockets, parse_linux_unix_sockets};
     use crate::{
+        actions::{
+            ProcessActionKind, ProcessActionOutcome, ProcessActionRecord, ProcessActionTarget,
+        },
         app::{aggregate_resources, rank_attention_findings, rank_hotspots, sort_processes},
         history::ResourceHistory,
         model::{
@@ -1043,11 +1048,26 @@ Max address space         unlimited            unlimited            bytes\n";
             }],
             warning: None,
         };
+        let action_history = vec![ProcessActionRecord {
+            observed_at: Instant::now(),
+            target: ProcessActionTarget {
+                pid: Pid::from_u32(42),
+                name: "worker".into(),
+                command: "/usr/bin/worker".into(),
+                start_time: 42,
+            },
+            action: ProcessActionKind::Terminate,
+            outcome: ProcessActionOutcome::Sent,
+        }];
 
         let path = export_report(
             ReportInput {
                 platform: platform_name(),
                 selected_pid: Some(Pid::from_u32(42)),
+                query: "mem>1k !name:service",
+                query_editing: true,
+                query_error: None,
+                query_matches: 1,
                 paused: true,
                 sort_mode: SortMode::Stable,
                 processes: &processes,
@@ -1059,6 +1079,7 @@ Max address space         unlimited            unlimited            bytes\n";
                 network_scan_in_progress: false,
                 inspection: None,
                 inspection_in_progress: false,
+                action_history: &action_history,
                 baseline: None,
             },
             &directory,
@@ -1069,10 +1090,13 @@ Max address space         unlimited            unlimited            bytes\n";
                 .expect("parse exported report");
 
         assert_eq!(report["schema"], "psmore.diagnostic-report");
-        assert_eq!(report["schema_version"], 1);
+        assert_eq!(report["schema_version"], 2);
         assert_eq!(report["tool"]["name"], "psmore");
         assert_eq!(report["platform"], platform_name());
         assert_eq!(report["selected_pid"], 42);
+        assert_eq!(report["active_query"]["input"], "mem>1k !name:service");
+        assert_eq!(report["active_query"]["valid"], true);
+        assert_eq!(report["active_query"]["matched_process_count"], 1);
         assert_eq!(report["paused"], true);
         assert_eq!(
             report["collection_status"]["network_scan_in_progress"],
@@ -1094,6 +1118,9 @@ Max address space         unlimited            unlimited            bytes\n";
             "10.0.0.8:443"
         );
         assert_eq!(report["network_scan"]["endpoints"][0]["listener"], false);
+        assert_eq!(report["process_actions"][0]["pid"], 42);
+        assert_eq!(report["process_actions"][0]["action"], "TERM");
+        assert_eq!(report["process_actions"][0]["outcome"], "sent");
         assert!(report["selected_inspection"].is_null());
         assert!(report["baseline"].is_null());
         #[cfg(unix)]

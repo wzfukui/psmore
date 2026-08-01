@@ -12,6 +12,7 @@ use sysinfo::Pid;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
+    actions::{ProcessActionKind, ProcessActionOutcome, ProcessActionRecord},
     app::App,
     model::{
         AttentionSeverity, HotspotMetric, HotspotScope, InspectionField, ProcessChange,
@@ -193,6 +194,32 @@ fn event_line(event: &ProcessEvent) -> Line<'static> {
     Line::from(Span::styled(text, Style::default().fg(color)))
 }
 
+fn action_line(record: &ProcessActionRecord) -> Line<'static> {
+    let age = record.observed_at.elapsed().as_secs();
+    let (color, marker) = match &record.outcome {
+        ProcessActionOutcome::Sent => (Color::LightGreen, "✓"),
+        ProcessActionOutcome::Refused(_) => (Color::LightYellow, "!"),
+        ProcessActionOutcome::Failed(_) => (Color::LightRed, "×"),
+    };
+    let detail = record
+        .outcome
+        .detail()
+        .map(|detail| format!("  {detail}"))
+        .unwrap_or_default();
+    Line::from(Span::styled(
+        format!(
+            "{:>4}s  {marker} {} {} [{}]  {}{}",
+            age,
+            record.action.label(),
+            record.target.name,
+            record.target.pid,
+            record.outcome.label(),
+            detail
+        ),
+        Style::default().fg(color),
+    ))
+}
+
 fn draw_event_overlay(frame: &mut Frame, app: &App, area: Rect) {
     let width = area.width.saturating_sub(2).clamp(1, 100);
     let height = area.height.saturating_sub(2).clamp(1, 18);
@@ -203,17 +230,155 @@ fn draw_event_overlay(frame: &mut Frame, app: &App, area: Rect) {
         height,
     );
     let line_limit = height.saturating_sub(2) as usize;
-    let lines = if app.events.is_empty() {
-        vec![Line::from(" No process changes captured yet ")]
-    } else {
-        app.events
-            .iter()
-            .rev()
-            .take(line_limit)
-            .map(event_line)
-            .collect()
+    let mut lines = Vec::with_capacity(line_limit);
+    if !app.action_history.is_empty() && line_limit > 0 {
+        lines.push(Line::from(Span::styled(
+            " ACTIONS",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        let action_limit = line_limit.saturating_sub(1).min(5);
+        lines.extend(
+            app.action_history
+                .iter()
+                .rev()
+                .take(action_limit)
+                .map(action_line),
+        );
+    }
+    if !app.events.is_empty() && lines.len() < line_limit {
+        lines.push(Line::from(Span::styled(
+            " PROCESS CHANGES",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        let remaining = line_limit.saturating_sub(lines.len());
+        lines.extend(app.events.iter().rev().take(remaining).map(event_line));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(" No process changes or actions captured yet "));
+    }
+    let title = format!(
+        " activity  changes {} / actions {}  Esc/e close ",
+        app.events.len(),
+        app.action_history.len()
+    );
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
+fn process_action_color(action: ProcessActionKind) -> Color {
+    match action {
+        ProcessActionKind::Terminate => Color::LightYellow,
+        ProcessActionKind::Kill => Color::LightRed,
+        ProcessActionKind::Stop => Color::LightMagenta,
+        ProcessActionKind::Continue => Color::LightGreen,
+    }
+}
+
+fn draw_process_action_overlay(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(dialog) = &app.process_action else {
+        return;
     };
-    let title = format!(" process changes ({})  Esc/e close ", app.events.len());
+    let width = area.width.saturating_sub(2).clamp(1, 92);
+    let height = area.height.saturating_sub(2).clamp(1, 17);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let target = &dialog.target;
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("{} [{}]", target.name, target.pid),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!("  started {}", target.start_time)),
+        ]),
+        Line::from(Span::styled(
+            marquee(&target.command, 0, width.saturating_sub(4).max(1) as usize),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+    ];
+    let title;
+    if dialog.confirming {
+        let action = dialog.selected_action();
+        title = format!(" confirm {}  Esc back ", action.label());
+        lines.extend([
+            Line::from(vec![
+                Span::styled(
+                    format!("{}  ", action.label()),
+                    Style::default()
+                        .fg(process_action_color(action))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(action.description()),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                if action == ProcessActionKind::Kill {
+                    "KILL cannot be handled or cleaned up by the target process."
+                } else {
+                    "This changes the live process and may affect its complete service tree."
+                },
+                Style::default().fg(Color::LightRed),
+            )),
+            Line::from(
+                "Before sending, psmore will re-check the PID start time and refuse PID reuse.",
+            ),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(
+                    "Press y to send the signal",
+                    Style::default()
+                        .fg(Color::LightYellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  ·  Esc returns without changing the process"),
+            ]),
+        ]);
+    } else {
+        title = " process actions  ↑↓/Tab choose  Enter confirm  Esc/p close ".into();
+        for (index, action) in ProcessActionKind::ALL.iter().copied().enumerate() {
+            let marker = if index == dialog.selected { "▸" } else { " " };
+            let style = if index == dialog.selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(process_action_color(action))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(process_action_color(action))
+            };
+            lines.push(Line::from(Span::styled(
+                format!(
+                    " {marker} [{}] {:<5}  {}",
+                    action.shortcut(),
+                    action.label(),
+                    action.description()
+                ),
+                style,
+            )));
+        }
+        lines.extend([
+            Line::from(""),
+            Line::from(Span::styled(
+                "Every action requires a separate y confirmation and is recorded in activity/report.",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]);
+    }
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines)
@@ -1224,7 +1389,7 @@ fn draw_attention_overlay(frame: &mut Frame, app: &App, area: Rect) {
                 Span::raw(" — explainable signals from state, lifecycle, resource history"),
             ]),
             Line::from(
-                " ↑↓/jk move | Enter jump | t trend | i inspect | r sample | Space pause | a/Esc close",
+                " ↑↓/jk move | Enter jump | t trend | i inspect | p actions | r sample | Space pause | a/Esc close",
             ),
         ]),
         sections[0],
@@ -1467,6 +1632,13 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         (None, false) if !app.search.is_empty() => format!(" psmore  filter: {}", app.search),
         (None, false) => format!(" psmore  {} process relationships ", platform_name()),
     };
+    if app.searching && !app.search.is_empty() {
+        if let Some(error) = &app.search_error {
+            title.push_str(&format!("  query error: {error} "));
+        } else {
+            title.push_str(&format!("  {} hits ", app.search_matches));
+        }
+    }
     if app.paused {
         title.push_str(" PAUSED ");
     }
@@ -1625,6 +1797,15 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         .as_ref()
         .map(|baseline| format!("base {}s", baseline.captured_at.elapsed().as_secs()))
         .unwrap_or_else(|| "no base".into());
+    let shortcut_line = if app.searching {
+        if let Some(error) = &app.search_error {
+            format!(" query error: {error} | Backspace edit | Enter finish | Esc clear ")
+        } else {
+            " query: words | name:/user:/state: | cpu>20 | mem>500m | tree.mem>2g | !negate | Enter finish | Esc clear ".into()
+        }
+    } else {
+        " ↑↓/jk move | ←/→ tree | / find | a attention | h hot | s sort | p actions | t trend | n network | b base | d diff | o report ".into()
+    };
     let footer = Paragraph::new(vec![
         Line::from(format!(
             " {} proc | page {}/{} | {} | {} | sort {} | +{} -{} ↪{} | q quit ",
@@ -1638,9 +1819,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
             app.last_changes.exited,
             app.last_changes.reparented,
         )),
-        Line::from(
-            " ↑↓/jk move | ←/→ tree | / find | a attention | h hot | s sort | t trend | n ports | b base | d diff | o report ",
-        ),
+        Line::from(shortcut_line),
     ])
     .style(Style::default().fg(if app.paused {
         Color::Yellow
@@ -1663,6 +1842,9 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         draw_inspection_overlay(frame, app, area);
     } else if app.show_events {
         draw_event_overlay(frame, app, area);
+    }
+    if app.process_action.is_some() {
+        draw_process_action_overlay(frame, app, area);
     }
     draw_notice(frame, app, area);
 }

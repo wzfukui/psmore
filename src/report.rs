@@ -13,6 +13,7 @@ use serde::Serialize;
 use sysinfo::{Pid, System};
 
 use crate::{
+    actions::{ProcessActionOutcome, ProcessActionRecord},
     model::{
         AttentionFinding, InspectionField, OpenFileInfo, ProcessChange, ProcessEvent, ProcessInfo,
         ProcessInspection, ResourceAggregate, SocketInfo, SortMode, process_command_line,
@@ -23,11 +24,15 @@ use crate::{
 };
 
 const REPORT_SCHEMA: &str = "psmore.diagnostic-report";
-const REPORT_SCHEMA_VERSION: u32 = 1;
+const REPORT_SCHEMA_VERSION: u32 = 2;
 
 pub(crate) struct ReportInput<'a> {
     pub(crate) platform: &'static str,
     pub(crate) selected_pid: Option<Pid>,
+    pub(crate) query: &'a str,
+    pub(crate) query_editing: bool,
+    pub(crate) query_error: Option<&'a str>,
+    pub(crate) query_matches: usize,
     pub(crate) paused: bool,
     pub(crate) sort_mode: SortMode,
     pub(crate) processes: &'a HashMap<Pid, ProcessInfo>,
@@ -39,6 +44,7 @@ pub(crate) struct ReportInput<'a> {
     pub(crate) network_scan_in_progress: bool,
     pub(crate) inspection: Option<&'a ProcessInspection>,
     pub(crate) inspection_in_progress: bool,
+    pub(crate) action_history: &'a [ProcessActionRecord],
     pub(crate) baseline: Option<&'a BaselineSnapshot>,
 }
 
@@ -52,6 +58,7 @@ struct DiagnosticReport {
     platform: &'static str,
     hostname: Option<String>,
     selected_pid: Option<u32>,
+    active_query: Option<QueryReport>,
     paused: bool,
     collection_status: CollectionStatusReport,
     sort_mode: &'static str,
@@ -59,6 +66,7 @@ struct DiagnosticReport {
     system: AggregateReport,
     processes: Vec<ProcessReport>,
     recent_events: Vec<EventReport>,
+    process_actions: Vec<ProcessActionReport>,
     attention_findings: Vec<AttentionReport>,
     network_scan: Option<NetworkReport>,
     selected_inspection: Option<InspectionReport>,
@@ -75,6 +83,15 @@ struct ToolReport {
 struct CollectionStatusReport {
     network_scan_in_progress: bool,
     inspection_in_progress: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct QueryReport {
+    input: String,
+    editing: bool,
+    valid: bool,
+    error: Option<String>,
+    matched_process_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -137,6 +154,18 @@ struct AttentionReport {
     severity: &'static str,
     score: u16,
     reasons: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProcessActionReport {
+    observed_at_unix_ms: u64,
+    pid: u32,
+    name: String,
+    command: String,
+    start_time_unix_seconds: u64,
+    action: &'static str,
+    outcome: &'static str,
+    detail: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -411,6 +440,26 @@ fn inspection_report(value: &ProcessInspection) -> InspectionReport {
     }
 }
 
+fn process_action_report(record: &ProcessActionRecord, generated_at: u64) -> ProcessActionReport {
+    let detail = match &record.outcome {
+        ProcessActionOutcome::Sent => None,
+        ProcessActionOutcome::Refused(detail) | ProcessActionOutcome::Failed(detail) => {
+            Some(detail.clone())
+        }
+    };
+    ProcessActionReport {
+        observed_at_unix_ms: generated_at
+            .saturating_sub(elapsed_millis(record.observed_at.elapsed())),
+        pid: record.target.pid.as_u32(),
+        name: record.target.name.clone(),
+        command: record.target.command.clone(),
+        start_time_unix_seconds: record.target.start_time,
+        action: record.action.label(),
+        outcome: record.outcome.label(),
+        detail,
+    }
+}
+
 fn baseline_report(input: &ReportInput<'_>, baseline: &BaselineSnapshot) -> BaselineReport {
     let diff = baseline.diff(input.processes, input.resources);
     BaselineReport {
@@ -503,6 +552,13 @@ fn build_report(input: ReportInput<'_>, generated_at: u64) -> DiagnosticReport {
         platform: input.platform,
         hostname: System::host_name(),
         selected_pid: input.selected_pid.map(Pid::as_u32),
+        active_query: (!input.query.is_empty()).then(|| QueryReport {
+            input: input.query.to_string(),
+            editing: input.query_editing,
+            valid: input.query_error.is_none(),
+            error: input.query_error.map(str::to_string),
+            matched_process_count: input.query_matches,
+        }),
         paused: input.paused,
         collection_status: CollectionStatusReport {
             network_scan_in_progress: input.network_scan_in_progress,
@@ -516,6 +572,11 @@ fn build_report(input: ReportInput<'_>, generated_at: u64) -> DiagnosticReport {
             .events
             .iter()
             .map(|event| event_report(event, generated_at))
+            .collect(),
+        process_actions: input
+            .action_history
+            .iter()
+            .map(|record| process_action_report(record, generated_at))
             .collect(),
         attention_findings: input
             .attention_findings
