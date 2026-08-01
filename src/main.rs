@@ -1,11 +1,15 @@
 mod actions;
 mod app;
 mod cli;
+mod completion;
 mod headless;
 mod headless_deleted;
 mod headless_diff;
+mod headless_fd;
 mod headless_inspect;
+mod headless_listen;
 mod headless_port;
+mod headless_trace;
 mod headless_tree;
 mod headless_watch;
 mod history;
@@ -36,6 +40,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use crate::{
     app::App,
     cli::{Cli, LaunchMode, help_text},
+    completion::completion_script,
     headless::{
         capture_snapshot, matching_process_count, render_check_json, render_check_table,
         render_json, render_table, validate_query,
@@ -44,8 +49,13 @@ use crate::{
         DeletedPolicyStatus, capture_deleted_files, render_deleted_json, render_deleted_table,
     },
     headless_diff::{load_comparison, render_diff_json, render_diff_table},
+    headless_fd::{FdPolicyStatus, capture_fd_usage, render_fd_json, render_fd_table},
     headless_inspect::{capture_inspection, render_inspection_json, render_inspection_table},
-    headless_port::{capture_port, render_port_json, render_port_table},
+    headless_listen::{
+        ListenPolicyStatus, capture_listeners, render_listeners_json, render_listeners_table,
+    },
+    headless_port::{PortPolicyStatus, capture_port, render_port_json, render_port_table},
+    headless_trace::{TraceOutput, TraceRunStatus, run_trace},
     headless_tree::{build_tree, render_tree_json, render_tree_table},
     headless_watch::{WatchOutput, run_watch},
     ui::draw,
@@ -138,7 +148,15 @@ fn main() -> ExitCode {
         Err(error) => return usage_error(&error),
     };
     match cli.mode {
-        LaunchMode::Help => runtime_result(write_stdout(help_text()).map_err(Into::into)),
+        LaunchMode::Help => {
+            runtime_result(write_stdout(help_text(cli.help_topic)).map_err(Into::into))
+        }
+        LaunchMode::Completion => {
+            let Some(shell) = cli.completion_shell else {
+                return usage_error("completion requires bash, zsh, or fish");
+            };
+            runtime_result(write_stdout(completion_script(shell)).map_err(Into::into))
+        }
         LaunchMode::Version => runtime_result(
             write_stdout(&format!("psmore {}", env!("CARGO_PKG_VERSION"))).map_err(Into::into),
         ),
@@ -233,22 +251,19 @@ fn main() -> ExitCode {
             let Some(port) = cli.port else {
                 return usage_error("port requires exactly one local port number");
             };
-            let result = (|| -> Result<bool, Box<dyn Error>> {
+            let result = (|| -> Result<Option<PortPolicyStatus>, Box<dyn Error>> {
                 let captured = capture_port(port, cli.port_protocol, cli.port_all);
-                let matched = captured.matched_endpoint_count();
-                let passed = cli
+                let policy_status = cli
                     .port_expectation
-                    .map(|expectation| expectation.passes(matched))
-                    .unwrap_or(true);
+                    .map(|expectation| captured.evaluate_policy(expectation));
                 if !cli.quiet {
                     let expectation = cli.port_expectation.map(|value| value.label());
-                    let policy_result = cli.port_expectation.map(|_| passed);
                     let output = match cli.mode {
                         LaunchMode::PortTable => {
-                            render_port_table(&captured, expectation, policy_result)
+                            render_port_table(&captured, expectation, policy_status)
                         }
                         LaunchMode::PortJson => {
-                            render_port_json(&captured, expectation, policy_result)
+                            render_port_json(&captured, expectation, policy_status)
                                 .map_err(io::Error::other)?
                         }
                         _ => unreachable!(),
@@ -259,11 +274,50 @@ fn main() -> ExitCode {
                         }
                     }
                 }
-                Ok(passed)
+                Ok(policy_status)
             })();
             match result {
-                Ok(true) => ExitCode::SUCCESS,
-                Ok(false) => ExitCode::from(3),
+                Ok(None | Some(PortPolicyStatus::Passed)) => ExitCode::SUCCESS,
+                Ok(Some(PortPolicyStatus::Violated)) => ExitCode::from(3),
+                Ok(Some(PortPolicyStatus::Inconclusive)) => ExitCode::FAILURE,
+                Err(error) => runtime_result(Err(error)),
+            }
+        }
+        LaunchMode::ListenTable | LaunchMode::ListenJson => {
+            let result = (|| -> Result<Option<ListenPolicyStatus>, Box<dyn Error>> {
+                let captured = capture_listeners(
+                    &cli.query,
+                    cli.listen_protocol,
+                    cli.listen_exposed,
+                    cli.listen_limit,
+                );
+                let policy_status = cli
+                    .listen_expectation
+                    .map(|expectation| captured.evaluate_policy(expectation));
+                if !cli.quiet {
+                    let expectation = cli.listen_expectation.map(|value| value.label());
+                    let output = match cli.mode {
+                        LaunchMode::ListenTable => {
+                            render_listeners_table(&captured, expectation, policy_status)
+                        }
+                        LaunchMode::ListenJson => {
+                            render_listeners_json(&captured, expectation, policy_status)
+                                .map_err(io::Error::other)?
+                        }
+                        _ => unreachable!(),
+                    };
+                    if let Err(error) = write_stdout(&output) {
+                        if error.kind() != io::ErrorKind::BrokenPipe {
+                            return Err(error.into());
+                        }
+                    }
+                }
+                Ok(policy_status)
+            })();
+            match result {
+                Ok(None | Some(ListenPolicyStatus::Passed)) => ExitCode::SUCCESS,
+                Ok(Some(ListenPolicyStatus::Violated)) => ExitCode::from(3),
+                Ok(Some(ListenPolicyStatus::Inconclusive)) => ExitCode::FAILURE,
                 Err(error) => runtime_result(Err(error)),
             }
         }
@@ -307,6 +361,33 @@ fn main() -> ExitCode {
             })();
             runtime_result(result)
         }
+        LaunchMode::TraceTable | LaunchMode::TraceJsonl => {
+            let Some(pid) = cli.trace_pid else {
+                return usage_error("trace requires exactly one PID");
+            };
+            let result = (|| -> Result<TraceRunStatus, Box<dyn Error>> {
+                let stdout = io::stdout();
+                let mut stdout = stdout.lock();
+                let output = if cli.mode == LaunchMode::TraceJsonl {
+                    TraceOutput::Jsonl
+                } else {
+                    TraceOutput::Table
+                };
+                let status = run_trace(
+                    &mut stdout,
+                    pid,
+                    cli.trace_interval_ms,
+                    cli.trace_count,
+                    output,
+                )?;
+                Ok(status)
+            })();
+            match result {
+                Ok(TraceRunStatus::Complete) => ExitCode::SUCCESS,
+                Ok(TraceRunStatus::Inconclusive) => ExitCode::FAILURE,
+                Err(error) => runtime_result(Err(error)),
+            }
+        }
         LaunchMode::DeletedTable | LaunchMode::DeletedJson => {
             let result = (|| -> Result<bool, Box<dyn Error>> {
                 let captured = capture_deleted_files(cli.deleted_min_size);
@@ -343,6 +424,37 @@ fn main() -> ExitCode {
             match result {
                 Ok(true) => ExitCode::SUCCESS,
                 Ok(false) => ExitCode::from(3),
+                Err(error) => runtime_result(Err(error)),
+            }
+        }
+        LaunchMode::FdTable | LaunchMode::FdJson => {
+            let result = (|| -> Result<Option<FdPolicyStatus>, Box<dyn Error>> {
+                let captured = capture_fd_usage(cli.fd_min_count, cli.fd_min_percent, cli.fd_limit);
+                let policy_status = cli
+                    .fd_expectation
+                    .map(|expectation| captured.evaluate_policy(expectation));
+                if !cli.quiet {
+                    let expectation = cli.fd_expectation.map(|value| value.label());
+                    let output = match cli.mode {
+                        LaunchMode::FdTable => {
+                            render_fd_table(&captured, expectation, policy_status)
+                        }
+                        LaunchMode::FdJson => render_fd_json(&captured, expectation, policy_status)
+                            .map_err(io::Error::other)?,
+                        _ => unreachable!(),
+                    };
+                    if let Err(error) = write_stdout(&output) {
+                        if error.kind() != io::ErrorKind::BrokenPipe {
+                            return Err(error.into());
+                        }
+                    }
+                }
+                Ok(policy_status)
+            })();
+            match result {
+                Ok(None | Some(FdPolicyStatus::Passed)) => ExitCode::SUCCESS,
+                Ok(Some(FdPolicyStatus::Violated)) => ExitCode::from(3),
+                Ok(Some(FdPolicyStatus::Inconclusive)) => ExitCode::FAILURE,
                 Err(error) => runtime_result(Err(error)),
             }
         }

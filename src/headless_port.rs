@@ -7,7 +7,7 @@ use serde::Serialize;
 use sysinfo::{Pid, System};
 
 use crate::{
-    cli::PortProtocol,
+    cli::{CheckExpectation, PortProtocol},
     model::{ProcessInfo, process_command_line, process_path, sanitize_terminal_text},
     network::{NetworkEndpoint, NetworkScope, scan_network},
     provider::{NativeProcessProvider, ProcessProvider, platform_name},
@@ -28,8 +28,45 @@ pub(crate) struct CapturedPort {
 }
 
 impl CapturedPort {
-    pub(crate) fn matched_endpoint_count(&self) -> usize {
-        self.endpoints.len()
+    pub(crate) fn evaluate_policy(&self, expectation: CheckExpectation) -> PortPolicyStatus {
+        if !self.endpoints.is_empty() {
+            if expectation.passes(self.endpoints.len()) {
+                PortPolicyStatus::Passed
+            } else {
+                PortPolicyStatus::Violated
+            }
+        } else if self.warning.is_some() {
+            PortPolicyStatus::Inconclusive
+        } else if expectation.passes(0) {
+            PortPolicyStatus::Passed
+        } else {
+            PortPolicyStatus::Violated
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PortPolicyStatus {
+    Passed,
+    Violated,
+    Inconclusive,
+}
+
+impl PortPolicyStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Passed => "pass",
+            Self::Violated => "fail",
+            Self::Inconclusive => "inconclusive",
+        }
+    }
+
+    fn passed(self) -> Option<bool> {
+        match self {
+            Self::Passed => Some(true),
+            Self::Violated => Some(false),
+            Self::Inconclusive => None,
+        }
     }
 }
 
@@ -125,7 +162,9 @@ struct JsonTool {
 #[derive(Debug, Serialize)]
 struct JsonPolicy<'a> {
     expectation: &'a str,
-    passed: bool,
+    status: &'static str,
+    passed: Option<bool>,
+    detail: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -181,13 +220,17 @@ fn scope_key(scope: NetworkScope) -> &'static str {
 pub(crate) fn render_port_json(
     captured: &CapturedPort,
     expectation: Option<&str>,
-    passed: Option<bool>,
+    policy_status: Option<PortPolicyStatus>,
 ) -> Result<String, String> {
     let policy = expectation
-        .zip(passed)
-        .map(|(expectation, passed)| JsonPolicy {
+        .zip(policy_status)
+        .map(|(expectation, status)| JsonPolicy {
             expectation,
-            passed,
+            status: status.label(),
+            passed: status.passed(),
+            detail: (status == PortPolicyStatus::Inconclusive).then_some(
+                "zero visible endpoints cannot prove absence because network collection was incomplete",
+            ),
         });
     serde_json::to_string_pretty(&JsonPortInspection {
         schema: PORT_SCHEMA,
@@ -225,13 +268,17 @@ pub(crate) fn render_port_json(
 pub(crate) fn render_port_table(
     captured: &CapturedPort,
     expectation: Option<&str>,
-    passed: Option<bool>,
+    policy_status: Option<PortPolicyStatus>,
 ) -> String {
     let mut output = String::new();
-    if let Some((expectation, passed)) = expectation.zip(passed) {
+    if let Some((expectation, status)) = expectation.zip(policy_status) {
         output.push_str(&format!(
             "PORT CHECK {}  expected {}; matched {} endpoint(s)\n",
-            if passed { "PASS" } else { "FAIL" },
+            match status {
+                PortPolicyStatus::Passed => "PASS",
+                PortPolicyStatus::Violated => "FAIL",
+                PortPolicyStatus::Inconclusive => "INCONCLUSIVE",
+            },
             expectation,
             captured.endpoints.len()
         ));
@@ -371,13 +418,22 @@ mod tests {
     #[test]
     fn port_outputs_link_owners_and_expose_policy() {
         let captured = captured();
-        let table = render_port_table(&captured, Some("at least one match"), Some(true));
+        let table = render_port_table(
+            &captured,
+            Some("at least one match"),
+            Some(PortPolicyStatus::Passed),
+        );
         assert!(table.starts_with("PORT CHECK PASS"));
         assert!(table.contains("/srv/api --port 8080"));
         assert!(!table.contains("/srv/api\n--port"));
 
         let json: Value = serde_json::from_str(
-            &render_port_json(&captured, Some("at least one match"), Some(true)).unwrap(),
+            &render_port_json(
+                &captured,
+                Some("at least one match"),
+                Some(PortPolicyStatus::Passed),
+            )
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(json["schema"], PORT_SCHEMA);
@@ -385,8 +441,31 @@ mod tests {
         assert_eq!(json["local_port"], 8_080);
         assert_eq!(json["scope"], "listeners");
         assert_eq!(json["policy"]["passed"], true);
+        assert_eq!(json["policy"]["status"], "pass");
         assert_eq!(json["known_owner_count"], 1);
         assert_eq!(json["endpoints"][0]["pid"], 42);
         assert_eq!(json["endpoints"][0]["path"], "/srv/api");
+    }
+
+    #[test]
+    fn zero_matches_with_incomplete_network_scan_is_inconclusive() {
+        let mut captured = captured();
+        captured.endpoints.clear();
+        captured.warning = Some("protected processes".into());
+        assert_eq!(
+            captured.evaluate_policy(CheckExpectation::None),
+            PortPolicyStatus::Inconclusive
+        );
+        let json: Value = serde_json::from_str(
+            &render_port_json(
+                &captured,
+                Some("no matches"),
+                Some(PortPolicyStatus::Inconclusive),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json["policy"]["status"], "inconclusive");
+        assert_eq!(json["policy"]["passed"], Value::Null);
     }
 }

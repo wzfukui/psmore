@@ -50,9 +50,12 @@
 - `psmore check QUERY` 将任意结构化查询变成 CI/运维健康门禁：默认期望零命中，`--expect any` 可反向要求服务存在；支持表格、`psmore.check-result` JSON 和完全静默的 `--quiet`
 - `psmore inspect PID` 将 TUI 深度检查直接带到 SSH、脚本和事故工单：一次输出进程身份、完整命令、热点线程、socket、打开文件及平台运行上下文，也可导出 `psmore.process-inspection` JSON
 - `psmore port PORT` 直接回答“谁占用了这个端口”：将 TCP/UDP 本地端点关联到 PID、用户、完整命令、FD 和 Linux 网络 namespace，并可作为端口存在/释放健康门禁
+- `psmore listen` 从全局监听面反查进程和启动上下文，并将 wildcard、非回环网络、loopback 与 Unix socket 分类；`--exposed` 可直接聚焦需要安全复核的主机暴露面
 - `psmore tree PID` 在非交互环境输出目标的完整父链和后代树，保留目录连接线、稳定同级排序、进程自身/完整子树资源及显式深度截断，也可导出嵌套 JSON
 - `psmore watch [QUERY]` 建立进程基线后持续输出启动、退出、PID 复用、父进程变化及动态查询进入/离开事件；支持实时刷新的表格和每行一个文档的版本化 JSONL
+- `psmore trace PID` 连续记录单个进程及完整服务子树的 CPU、内存和 I/O，给出相对基线/上一采样的增长、实际采样间隔和峰值汇总；进程退出或 PID 复用时安全终止
 - `psmore deleted` 定位“文件已删除但进程仍占用”的磁盘空间泄漏：展示 PID、FD、用户、完整命令、文件身份与大小，并按 device+inode 去重估算真正可释放空间
+- `psmore fd` 对全系统打开的文件描述符做风险排名：展示 PID、用户、完整命令、FD 数量以及 Linux 软/硬限制和使用率，可直接作为 FD 泄漏或耗尽的巡检门禁
 - 深度检查仅在打开或手动刷新面板时启动后台采样：macOS 调用一次 `lsof`，Linux 直接读取目标进程的 `/proc`，不会加入两秒一次的全局刷新
 - 每 2 秒从系统进程数据刷新一次
 
@@ -80,6 +83,33 @@
 ```bash
 cargo run --release
 ```
+
+从当前源码安装到 Cargo 的用户二进制目录：
+
+```bash
+cargo install --path .
+psmore --version
+psmore --help
+```
+
+默认目标通常是 `~/.cargo/bin/psmore`；请确保 `~/.cargo/bin` 已加入 `PATH`。开发中的本地覆盖安装可使用 `cargo install --path . --force`。psmore 不要求 root；以更高权限运行只会扩大受操作系统权限控制的进程、FD 和网络可见范围。
+
+安装后可以启用命令、选项和枚举值补全：
+
+```bash
+# zsh：持久安装；确保 ~/.zfunc 在 fpath 中并已执行 compinit
+mkdir -p ~/.zfunc
+psmore completion zsh > ~/.zfunc/_psmore
+
+# bash：当前会话，或写入系统所用的 bash-completion 目录
+eval "$(psmore completion bash)"
+
+# fish：持久安装
+mkdir -p ~/.config/fish/completions
+psmore completion fish > ~/.config/fish/completions/psmore.fish
+```
+
+`psmore COMMAND --help` 显示对应命令的精简用法、参数、退出码和示例，不再重复整页全局帮助。`psmore completion --help` 给出各 shell 的安装入口；生成脚本只输出到标准输出，不会自行修改 shell 配置。
 
 也可以直接在 SSH、Shell 管道或巡检脚本中采集一次快照：
 
@@ -157,7 +187,35 @@ psmore port 8080 --expect any --quiet
 psmore port 8080 --expect none
 ```
 
-不指定 `--expect` 时，端口不存在也属于成功诊断，表格会明确显示零命中。指定 `--expect any|none` 后，策略不满足时退出 `3`；`--quiet` 必须与 expectation 一起使用。JSON 使用 `psmore.port-inspection` schema v1，包含匹配端点数、已知所有者数、无法关联所有者的端点数和采集警告。Linux 会扫描各网络 namespace 并通过 socket inode 反查 PID/FD；macOS 使用一次性 `lsof`。权限不足时不会把未知所有者误标成“端口空闲”。
+不指定 `--expect` 时，端口不存在也属于成功诊断，表格会明确显示零命中。指定 `--expect any|none` 后，策略不满足时退出 `3`；如果零命中但权限或采集错误使结果无法证明，策略状态为 `inconclusive`、`passed` 为 `null` 并退出 `1`。`--quiet` 必须与 expectation 一起使用且完全静默。JSON 使用 `psmore.port-inspection` schema v1，包含匹配端点数、已知所有者数、无法关联所有者的端点数和采集警告。Linux 会扫描各网络 namespace 并通过 socket inode 反查 PID/FD；macOS 使用一次性 `lsof`。权限不足时不会把未知所有者误标成“端口空闲”。
+
+### 全局监听与暴露面
+
+不知道端口号，或者需要核对一台主机在发布后究竟开放了什么时，直接扫描全部监听：
+
+```bash
+# TCP、UDP 和 Unix socket 全部监听，默认最多展示 100 条引用
+psmore listen
+
+# 只看 wildcard 与非回环 TCP 绑定，即需要进一步复核的网络暴露面
+psmore listen --exposed --protocol tcp
+
+# FILTER 同时搜索地址、端口、PID、用户、进程名、路径、完整命令和 namespace
+psmore listen nginx
+psmore listen 'tri-boost' --exposed
+
+# 返回全部匹配引用及版本化 JSON
+psmore listen --exposed --limit all --json
+
+# 安全基线：不允许任何匹配筛选条件的暴露监听
+psmore listen debug --exposed --expect none --quiet
+```
+
+psmore 将 `0.0.0.0`、`::` 和 `*` 标为 `WILDCARD`，将绑定在任意非回环 IP 的监听标为 `NETWORK`，回环地址标为 `loopback`，Unix socket 标为 `local`。`--exposed` 只保留前两类。这里的“暴露”表示进程绑定允许来自回环之外的流量，并不等于已经可以从公网访问；主机防火墙、安全组、路由、容器端口映射和应用鉴权仍决定实际可达性。
+
+一个 bind 可能因多个 FD、进程或 `SO_REUSEPORT` 产生多条证据。汇总中的 `unique_bind_count` 按协议、地址和 Linux 网络 namespace 去重，`socket_reference_count` 保留每条 PID/FD 证据。JSON 使用 `psmore.listeners` schema v1，并明确记录暴露分类、筛选条件、已知所有者、无法关联的 socket、截断状态和采集完整性。
+
+指定 `--expect any|none` 后，确认违反策略时退出 `3`；零命中但权限或采集错误导致扫描不完整时返回 `inconclusive` 并退出 `1`，不会将不可见监听误判为不存在。`--quiet` 必须和 expectation 一起使用且完全静默。Linux 会跨可见网络 namespace 读取 `/proc` socket 表并按 inode 反查 PID/FD；macOS 使用系统 `lsof`。建议以与目标服务相同的用户运行，必要时再通过经过授权的提权方式扩大可见范围。
 
 ### 无交互进程关系树
 
@@ -205,6 +263,55 @@ psmore watch name:api --jsonl --interval-ms 100 --count 20
 watch 启动后立即输出 `baseline`，随后按间隔采样。事件类型包括 `started`、`exited`、`reparented`、`matched` 和 `unmatched`；PID 复用会明确产生旧实例退出和新实例启动两条事件，不会合并。watch 自身会从查询匹配中排除，避免观察器成为自己的告警噪声。结构化查询与 TUI、snapshot、check 完全一致，因此支持子树 CPU/内存、运行时间、用户和否定条件；建议优先使用 `name:`、`cmd:` 等字段，避免普通文本同时匹配无关字段。
 
 `--count N` 表示基线之后执行 N 次刷新，默认无限；有限 watch 最后输出 `complete` 及实际进程事件数。JSONL 每行均为独立的 `psmore.process-watch-event` schema v1 文档，包含序号、采样序号、相对/绝对时间、主机、查询、当前匹配数、进程实例、父子关系和自身/子树资源。采样只能发现两次刷新之间至少存在于一个快照中的进程；排查极短命进程时应降低 `--interval-ms`，最小 100ms。
+
+### 进程与服务子树连续追踪
+
+`watch` 适合离散生命周期事件；如果进程一直存在但内存、CPU 或 I/O 逐步恶化，使用 `trace` 保存连续证据：
+
+```bash
+# 每秒持续追踪，目标退出、PID 被复用或 Ctrl-C 时停止
+psmore trace 1234
+
+# 基线之后采样 40 次，每次目标间隔 250ms
+psmore trace 1234 --interval-ms 250 --count 40
+
+# JSONL 可直接保存、送入日志系统或流式分析
+psmore trace 1234 --interval-ms 500 --count 120 --jsonl > trace-1234.jsonl
+jq 'select(.kind == "sample") | [.elapsed_ms, .process.own.memory_bytes, .process.subtree.memory_bytes]' trace-1234.jsonl
+```
+
+表格每行同时展示进程自身/完整后代树的 CPU、内存、读写速率和子树进程数，`ΔBASE/TREE` 显示自身及子树相对初始基线的内存变化。JSONL 使用 `psmore.process-trace-record` schema v1，记录 `baseline`、连续 `sample`、可选的 `exited`/`pid_reused`/`identity_unverifiable` 终止事件以及最终 `complete`；每个 sample 同时包含相对基线和上一采样的内存、子树进程数变化。complete 汇总实际刷新数、有效样本数、最终增长及 CPU、内存、I/O 峰值。
+
+`--interval-ms` 是目标间隔，实际间隔还包含系统进程采集耗时，因此 JSON 同时给出 `configured_interval_ms` 和 `actual_interval_ms`，不会把重主机上的延迟伪装成精确周期。`--count N` 不包含立即生成的 baseline；默认无限。
+
+trace 在开始时固定 PID、启动时间、进程名和命令。目标正常退出或该 PID 被新进程复用时，会先输出明确终止事件，再输出 complete，且不会继续采样新实例；这是成功完成的观察，退出码为 `0`。目标一开始不可见，或采样过程中身份从可验证变为不可验证时退出 `1`。当平台从始至终都拿不到启动时间时，会明确标为 `unverified_fallback`，仅在名称和命令保持一致时继续。JSONL 含完整命令、路径、用户和主机信息，分享前应检查敏感内容。
+
+### 文件描述符压力
+
+出现 `Too many open files`、连接建立失败或怀疑服务存在 FD 泄漏时，可以先从全系统风险排名切入：
+
+```bash
+# 默认列出 FD 数至少为 1 的风险前 20 名
+psmore fd
+
+# 找出打开至少 1000 个 FD 的进程，返回全部匹配项
+psmore fd --min-count 1000 --limit all
+
+# 找出已使用至少 80% 软限制的进程；绝对数量与使用率条件同时生效
+psmore fd --min-count 1 --min-percent 80
+
+# 版本化 JSON，适合巡检归档、jq 或监控采集
+psmore fd --min-count 500 --json | jq '.processes[]'
+
+# 要求不存在使用率达到 85% 的进程；违反策略退出 3
+psmore fd --min-percent 85 --expect none --quiet
+```
+
+Linux 直接统计 `/proc/<pid>/fd`，并从 `/proc/<pid>/limits` 读取 `Max open files`。表格按实际风险优先：软限制使用率达到 90% 为 `CRITICAL`、75% 为 `WARNING`、50% 为 `ELEVATED`，同一风险级别再按 FD 数排序。`--min-count` 与 `--min-percent` 同时指定时采用 AND 语义。macOS 通过一次全局 `lsof` 统计 FD；系统没有稳定接口供普通进程读取其他进程的 `rlimit`，因此限制和使用率会明确显示为未知，排名退化为 FD 数量排序，不会伪造使用率。使用率筛选在限制未知的平台或进程上不会暗中匹配；若这使零命中无法被证明，策略结果会是 `inconclusive`。psmore 自身从排名和计数中排除，避免采集过程临时打开的 `/proc` 或系统诊断句柄污染结果。
+
+JSON 使用 `psmore.fd-pressure` schema v1，区分系统进程数、成功检查数、匹配数、返回数、限制覆盖数和结果是否截断。`--limit` 默认 20，仅影响展示，不影响 `--expect` 对全部匹配项的判断；使用 `--limit all` 可返回全部结果。指定 `--expect any|none` 后，已确认违反策略退出 `3`。如果零命中但权限限制或进程竞态导致采集不完整，策略为 `inconclusive`、`passed` 为 `null`，退出 `1`，不会把“看不见”当成“没有”。`--quiet` 必须与 expectation 一起使用，并保持完全静默。
+
+FD 数高不等于泄漏：数据库、代理和浏览器可能合理持有大量连接。应结合使用率、持续增长趋势和业务流量确认根因，再关闭泄漏描述符、滚动重启服务或调整限制；psmore 不会替你关闭 FD 或修改资源限制。
 
 ### 已删除但仍占用的文件
 

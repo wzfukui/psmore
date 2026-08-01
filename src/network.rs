@@ -198,7 +198,13 @@ fn scan_network_native(_processes: &HashMap<Pid, ProcessInfo>) -> NetworkScan {
         ["-nP", "-U", "-FpcfPnT"].as_slice(),
     ] {
         match Command::new("lsof").args(args).output() {
-            Ok(output) => endpoints.extend(parse_lsof_network_output(&output.stdout)),
+            Ok(output) => {
+                endpoints.extend(parse_lsof_network_output(&output.stdout));
+                let detail = String::from_utf8_lossy(&output.stderr);
+                if !output.status.success() && !detail.trim().is_empty() {
+                    errors.push(detail.trim().to_string());
+                }
+            }
             Err(error) => errors.push(error.to_string()),
         }
     }
@@ -336,6 +342,7 @@ fn scan_network_native(processes: &HashMap<Pid, ProcessInfo>) -> NetworkScan {
     let mut owners: HashMap<String, Vec<LinuxSocketOwner>> = HashMap::new();
     let mut namespace_representatives: HashMap<String, Pid> = HashMap::new();
     let mut protected_processes = 0_usize;
+    let mut unknown_namespaces = 0_usize;
     for process in processes
         .values()
         .filter(|process| process.pid.as_u32() != 0)
@@ -348,6 +355,8 @@ fn scan_network_native(processes: &HashMap<Pid, ProcessInfo>) -> NetworkScan {
             namespace_representatives
                 .entry(namespace.clone())
                 .or_insert(process.pid);
+        } else {
+            unknown_namespaces += 1;
         }
         let Ok(entries) = fs::read_dir(format!("{proc_root}/fd")) else {
             protected_processes += 1;
@@ -377,6 +386,7 @@ fn scan_network_native(processes: &HashMap<Pid, ProcessInfo>) -> NetworkScan {
     }
 
     let mut raw = HashSet::new();
+    let mut unreadable_tables = 0_usize;
     for (namespace, pid) in namespace_representatives {
         let net_root = format!("/proc/{pid}/net");
         for (file, protocol, ipv6) in [
@@ -385,14 +395,16 @@ fn scan_network_native(processes: &HashMap<Pid, ProcessInfo>) -> NetworkScan {
             ("udp", "UDP", false),
             ("udp6", "UDP", true),
         ] {
-            if let Ok(content) = fs::read_to_string(format!("{net_root}/{file}")) {
-                raw.extend(parse_linux_inet_sockets(
+            match fs::read_to_string(format!("{net_root}/{file}")) {
+                Ok(content) => raw.extend(parse_linux_inet_sockets(
                     &content, protocol, ipv6, &namespace,
-                ));
+                )),
+                Err(_) => unreadable_tables += 1,
             }
         }
-        if let Ok(content) = fs::read_to_string(format!("{net_root}/unix")) {
-            raw.extend(parse_linux_unix_sockets(&content, &namespace));
+        match fs::read_to_string(format!("{net_root}/unix")) {
+            Ok(content) => raw.extend(parse_linux_unix_sockets(&content, &namespace)),
+            Err(_) => unreadable_tables += 1,
         }
     }
 
@@ -434,11 +446,31 @@ fn scan_network_native(processes: &HashMap<Pid, ProcessInfo>) -> NetworkScan {
         }
     }
     sort_endpoints(&mut endpoints);
+    let mut warnings = Vec::new();
+    if protected_processes > 0 && protected_processes == unknown_namespaces {
+        warnings.push(format!(
+            "socket ownership and network namespace were hidden or disappeared for {protected_processes} processes"
+        ));
+    } else {
+        if protected_processes > 0 {
+            warnings.push(format!(
+                "socket ownership hidden for {protected_processes} protected processes"
+            ));
+        }
+        if unknown_namespaces > 0 {
+            warnings.push(format!(
+                "network namespace was unreadable or disappeared for {unknown_namespaces} processes"
+            ));
+        }
+    }
+    if unreadable_tables > 0 {
+        warnings.push(format!(
+            "{unreadable_tables} network namespace socket table(s) were unreadable"
+        ));
+    }
     NetworkScan {
         endpoints,
-        warning: (protected_processes > 0).then(|| {
-            format!("socket ownership hidden for {protected_processes} protected processes")
-        }),
+        warning: (!warnings.is_empty()).then(|| warnings.join("; ")),
     }
 }
 

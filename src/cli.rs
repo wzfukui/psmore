@@ -9,16 +9,56 @@ pub(crate) enum LaunchMode {
     InspectJson,
     PortTable,
     PortJson,
+    ListenTable,
+    ListenJson,
     TreeTable,
     TreeJson,
     WatchTable,
     WatchJsonl,
+    TraceTable,
+    TraceJsonl,
     DeletedTable,
     DeletedJson,
+    FdTable,
+    FdJson,
     DiffTable,
     DiffJson,
+    Completion,
     Help,
     Version,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HelpTopic {
+    Check,
+    Inspect,
+    Port,
+    Listen,
+    Tree,
+    Watch,
+    Trace,
+    Deleted,
+    Fd,
+    Diff,
+    Completion,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
+}
+
+#[cfg(test)]
+impl CompletionShell {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Bash => "bash",
+            Self::Zsh => "zsh",
+            Self::Fish => "fish",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -27,6 +67,26 @@ pub(crate) enum PortProtocol {
     Any,
     Tcp,
     Udp,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ListenProtocol {
+    #[default]
+    Any,
+    Tcp,
+    Udp,
+    Unix,
+}
+
+impl ListenProtocol {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Any => "any",
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+            Self::Unix => "unix",
+        }
+    }
 }
 
 impl PortProtocol {
@@ -65,6 +125,8 @@ impl CheckExpectation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Cli {
     pub(crate) mode: LaunchMode,
+    pub(crate) help_topic: Option<HelpTopic>,
+    pub(crate) completion_shell: Option<CompletionShell>,
     pub(crate) query: String,
     pub(crate) sample_ms: u64,
     pub(crate) diff_paths: Option<(String, String)>,
@@ -73,12 +135,23 @@ pub(crate) struct Cli {
     pub(crate) port_protocol: PortProtocol,
     pub(crate) port_all: bool,
     pub(crate) port_expectation: Option<CheckExpectation>,
+    pub(crate) listen_protocol: ListenProtocol,
+    pub(crate) listen_exposed: bool,
+    pub(crate) listen_limit: Option<usize>,
+    pub(crate) listen_expectation: Option<CheckExpectation>,
     pub(crate) tree_pid: Option<u32>,
     pub(crate) tree_depth: Option<usize>,
     pub(crate) watch_interval_ms: u64,
     pub(crate) watch_count: Option<usize>,
+    pub(crate) trace_pid: Option<u32>,
+    pub(crate) trace_interval_ms: u64,
+    pub(crate) trace_count: Option<usize>,
     pub(crate) deleted_min_size: u64,
     pub(crate) deleted_expectation: Option<CheckExpectation>,
+    pub(crate) fd_min_count: usize,
+    pub(crate) fd_min_percent: Option<u16>,
+    pub(crate) fd_limit: Option<usize>,
+    pub(crate) fd_expectation: Option<CheckExpectation>,
     pub(crate) check_expectation: CheckExpectation,
     pub(crate) quiet: bool,
 }
@@ -87,6 +160,8 @@ impl Default for Cli {
     fn default() -> Self {
         Self {
             mode: LaunchMode::Tui,
+            help_topic: None,
+            completion_shell: None,
             query: String::new(),
             sample_ms: 500,
             diff_paths: None,
@@ -95,12 +170,23 @@ impl Default for Cli {
             port_protocol: PortProtocol::Any,
             port_all: false,
             port_expectation: None,
+            listen_protocol: ListenProtocol::Any,
+            listen_exposed: false,
+            listen_limit: Some(100),
+            listen_expectation: None,
             tree_pid: None,
             tree_depth: None,
             watch_interval_ms: 1_000,
             watch_count: None,
+            trace_pid: None,
+            trace_interval_ms: 1_000,
+            trace_count: None,
             deleted_min_size: 0,
             deleted_expectation: None,
+            fd_min_count: 1,
+            fd_min_percent: None,
+            fd_limit: Some(20),
+            fd_expectation: None,
             check_expectation: CheckExpectation::None,
             quiet: false,
         }
@@ -114,26 +200,24 @@ impl Cli {
         S: Into<String>,
     {
         let arguments: Vec<String> = args.into_iter().map(Into::into).collect();
-        if arguments.first().map(String::as_str) == Some("watch") {
-            return parse_watch(&arguments[1..]);
-        }
-        if arguments.first().map(String::as_str) == Some("deleted") {
-            return parse_deleted(&arguments[1..]);
-        }
-        if arguments.first().map(String::as_str) == Some("check") {
-            return parse_check(&arguments[1..]);
-        }
-        if arguments.first().map(String::as_str) == Some("inspect") {
-            return parse_inspect(&arguments[1..]);
-        }
-        if arguments.first().map(String::as_str) == Some("port") {
-            return parse_port(&arguments[1..]);
-        }
-        if arguments.first().map(String::as_str) == Some("tree") {
-            return parse_tree(&arguments[1..]);
-        }
-        if arguments.first().map(String::as_str) == Some("diff") {
-            return parse_diff(&arguments[1..]);
+        if let Some(command) = arguments.first().map(String::as_str) {
+            let parsed = match command {
+                "watch" => Some((parse_watch(&arguments[1..]), HelpTopic::Watch)),
+                "trace" => Some((parse_trace(&arguments[1..]), HelpTopic::Trace)),
+                "deleted" => Some((parse_deleted(&arguments[1..]), HelpTopic::Deleted)),
+                "fd" => Some((parse_fd(&arguments[1..]), HelpTopic::Fd)),
+                "check" => Some((parse_check(&arguments[1..]), HelpTopic::Check)),
+                "listen" => Some((parse_listen(&arguments[1..]), HelpTopic::Listen)),
+                "inspect" => Some((parse_inspect(&arguments[1..]), HelpTopic::Inspect)),
+                "port" => Some((parse_port(&arguments[1..]), HelpTopic::Port)),
+                "tree" => Some((parse_tree(&arguments[1..]), HelpTopic::Tree)),
+                "diff" => Some((parse_diff(&arguments[1..]), HelpTopic::Diff)),
+                "completion" => Some((parse_completion(&arguments[1..]), HelpTopic::Completion)),
+                _ => None,
+            };
+            if let Some((parsed, topic)) = parsed {
+                return with_help_topic(parsed, topic);
+            }
         }
         let mut cli = Self::default();
         let mut args = arguments.into_iter().peekable();
@@ -182,6 +266,203 @@ impl Cli {
         }
         Ok(cli)
     }
+}
+
+fn with_help_topic(result: Result<Cli, String>, topic: HelpTopic) -> Result<Cli, String> {
+    result.map(|mut cli| {
+        if cli.mode == LaunchMode::Help {
+            cli.help_topic = Some(topic);
+        }
+        cli
+    })
+}
+
+fn parse_completion(arguments: &[String]) -> Result<Cli, String> {
+    let mut mode = LaunchMode::Completion;
+    let mut shells = Vec::new();
+    for argument in arguments {
+        match argument.as_str() {
+            "-h" | "--help" => mode = LaunchMode::Help,
+            "-V" | "--version" => mode = LaunchMode::Version,
+            _ if argument.starts_with('-') => {
+                return Err(format!("unknown completion option: {argument}"));
+            }
+            _ => shells.push(argument),
+        }
+    }
+    if matches!(mode, LaunchMode::Help | LaunchMode::Version) {
+        return Ok(Cli {
+            mode,
+            ..Cli::default()
+        });
+    }
+    if shells.len() != 1 {
+        return Err(format!(
+            "completion requires exactly one shell: bash, zsh, or fish; received {}",
+            shells.len()
+        ));
+    }
+    let completion_shell = match shells[0].to_ascii_lowercase().as_str() {
+        "bash" => CompletionShell::Bash,
+        "zsh" => CompletionShell::Zsh,
+        "fish" => CompletionShell::Fish,
+        value => {
+            return Err(format!(
+                "unsupported completion shell: {value}; use bash, zsh, or fish"
+            ));
+        }
+    };
+    Ok(Cli {
+        mode,
+        completion_shell: Some(completion_shell),
+        ..Cli::default()
+    })
+}
+
+fn parse_fd(arguments: &[String]) -> Result<Cli, String> {
+    let mut cli = Cli {
+        mode: LaunchMode::FdTable,
+        ..Cli::default()
+    };
+    let mut output_mode = None;
+    let mut min_count_set = false;
+    let mut min_percent_set = false;
+    let mut limit_set = false;
+    let mut expectation_set = false;
+    let mut arguments = arguments.iter().cloned().peekable();
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "-h" | "--help" => cli.mode = LaunchMode::Help,
+            "-V" | "--version" => cli.mode = LaunchMode::Version,
+            "--table" => set_fd_output_mode(&mut cli.mode, &mut output_mode, LaunchMode::FdTable)?,
+            "--json" => set_fd_output_mode(&mut cli.mode, &mut output_mode, LaunchMode::FdJson)?,
+            "--quiet" => cli.quiet = true,
+            "--min-count" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--min-count requires a non-negative integer".to_string())?;
+                set_fd_min_count(&mut cli, &mut min_count_set, &value)?;
+            }
+            "--limit" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--limit requires a positive integer or all".to_string())?;
+                set_fd_limit(&mut cli, &mut limit_set, &value)?;
+            }
+            "--min-percent" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--min-percent requires an integer from 1 to 100".to_string())?;
+                set_fd_min_percent(&mut cli, &mut min_percent_set, &value)?;
+            }
+            "--expect" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--expect requires none or any".to_string())?;
+                set_fd_expectation(&mut cli, &mut expectation_set, &value)?;
+            }
+            _ if argument.starts_with("--min-count=") => {
+                let value = argument.trim_start_matches("--min-count=");
+                set_fd_min_count(&mut cli, &mut min_count_set, value)?;
+            }
+            _ if argument.starts_with("--limit=") => {
+                let value = argument.trim_start_matches("--limit=");
+                set_fd_limit(&mut cli, &mut limit_set, value)?;
+            }
+            _ if argument.starts_with("--min-percent=") => {
+                let value = argument.trim_start_matches("--min-percent=");
+                set_fd_min_percent(&mut cli, &mut min_percent_set, value)?;
+            }
+            _ if argument.starts_with("--expect=") => {
+                let value = argument.trim_start_matches("--expect=");
+                set_fd_expectation(&mut cli, &mut expectation_set, value)?;
+            }
+            _ if argument.starts_with('-') => {
+                return Err(format!("unknown fd option: {argument}"));
+            }
+            _ => return Err(format!("unexpected fd argument: {argument}")),
+        }
+    }
+    if matches!(cli.mode, LaunchMode::Help | LaunchMode::Version) {
+        return Ok(cli);
+    }
+    if cli.quiet && cli.fd_expectation.is_none() {
+        return Err("fd --quiet requires --expect any or --expect none".into());
+    }
+    Ok(cli)
+}
+
+fn set_fd_output_mode(
+    mode: &mut LaunchMode,
+    output_mode: &mut Option<LaunchMode>,
+    requested: LaunchMode,
+) -> Result<(), String> {
+    if output_mode.is_some_and(|existing| existing != requested) {
+        return Err("fd --table and --json cannot be used together".into());
+    }
+    *output_mode = Some(requested);
+    if !matches!(mode, LaunchMode::Help | LaunchMode::Version) {
+        *mode = requested;
+    }
+    Ok(())
+}
+
+fn set_fd_min_count(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+    if *value_set {
+        return Err("--min-count may only be specified once".into());
+    }
+    cli.fd_min_count = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid --min-count value: {value}"))?;
+    *value_set = true;
+    Ok(())
+}
+
+fn set_fd_min_percent(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+    if *value_set {
+        return Err("--min-percent may only be specified once".into());
+    }
+    let percent = value
+        .parse::<u16>()
+        .map_err(|_| format!("invalid --min-percent value: {value}; use 1-100"))?;
+    if !(1..=100).contains(&percent) {
+        return Err("--min-percent must be between 1 and 100".into());
+    }
+    cli.fd_min_percent = Some(percent);
+    *value_set = true;
+    Ok(())
+}
+
+fn set_fd_limit(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+    if *value_set {
+        return Err("--limit may only be specified once".into());
+    }
+    cli.fd_limit = if value == "all" {
+        None
+    } else {
+        let limit = value
+            .parse::<usize>()
+            .map_err(|_| format!("invalid --limit value: {value}; use 1-10000 or all"))?;
+        if !(1..=10_000).contains(&limit) {
+            return Err("--limit must be between 1 and 10000, or all".into());
+        }
+        Some(limit)
+    };
+    *value_set = true;
+    Ok(())
+}
+
+fn set_fd_expectation(
+    cli: &mut Cli,
+    expectation_set: &mut bool,
+    value: &str,
+) -> Result<(), String> {
+    if *expectation_set {
+        return Err("--expect may only be specified once".into());
+    }
+    cli.fd_expectation = Some(parse_expectation(value)?);
+    *expectation_set = true;
+    Ok(())
 }
 
 fn parse_deleted(arguments: &[String]) -> Result<Cli, String> {
@@ -309,6 +590,119 @@ fn parse_byte_size(value: &str) -> Result<u64, String> {
         return Err(format!("invalid byte size: {value}"));
     }
     Ok(bytes.round() as u64)
+}
+
+fn parse_trace(arguments: &[String]) -> Result<Cli, String> {
+    let mut cli = Cli {
+        mode: LaunchMode::TraceTable,
+        ..Cli::default()
+    };
+    let mut output_mode = None;
+    let mut interval_set = false;
+    let mut count_set = false;
+    let mut pids = Vec::new();
+    let mut arguments = arguments.iter().cloned().peekable();
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "-h" | "--help" => cli.mode = LaunchMode::Help,
+            "-V" | "--version" => cli.mode = LaunchMode::Version,
+            "--table" => {
+                set_trace_output_mode(&mut cli.mode, &mut output_mode, LaunchMode::TraceTable)?
+            }
+            "--jsonl" => {
+                set_trace_output_mode(&mut cli.mode, &mut output_mode, LaunchMode::TraceJsonl)?
+            }
+            "--interval-ms" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--interval-ms requires a value".to_string())?;
+                set_trace_interval(&mut cli, &mut interval_set, &value)?;
+            }
+            "--count" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--count requires a value".to_string())?;
+                set_trace_count(&mut cli, &mut count_set, &value)?;
+            }
+            _ if argument.starts_with("--interval-ms=") => {
+                let value = argument.trim_start_matches("--interval-ms=");
+                set_trace_interval(&mut cli, &mut interval_set, value)?;
+            }
+            _ if argument.starts_with("--count=") => {
+                let value = argument.trim_start_matches("--count=");
+                set_trace_count(&mut cli, &mut count_set, value)?;
+            }
+            _ if argument.starts_with('-') => {
+                return Err(format!("unknown trace option: {argument}"));
+            }
+            _ => pids.push(argument),
+        }
+    }
+    if matches!(cli.mode, LaunchMode::Help | LaunchMode::Version) {
+        return Ok(cli);
+    }
+    if pids.len() != 1 {
+        return Err(format!(
+            "trace requires exactly one PID; received {}",
+            pids.len()
+        ));
+    }
+    let pid = pids[0]
+        .parse::<u32>()
+        .map_err(|_| format!("invalid PID: {}", pids[0]))?;
+    if pid == 0 {
+        return Err("trace requires a real process PID greater than zero".into());
+    }
+    if pid > i32::MAX as u32 {
+        return Err(format!("PID {pid} exceeds the supported system PID range"));
+    }
+    cli.trace_pid = Some(pid);
+    Ok(cli)
+}
+
+fn set_trace_output_mode(
+    mode: &mut LaunchMode,
+    output_mode: &mut Option<LaunchMode>,
+    requested: LaunchMode,
+) -> Result<(), String> {
+    if output_mode.is_some_and(|existing| existing != requested) {
+        return Err("trace --table and --jsonl cannot be used together".into());
+    }
+    *output_mode = Some(requested);
+    if !matches!(mode, LaunchMode::Help | LaunchMode::Version) {
+        *mode = requested;
+    }
+    Ok(())
+}
+
+fn set_trace_interval(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+    if *value_set {
+        return Err("--interval-ms may only be specified once".into());
+    }
+    let interval = value
+        .parse::<u64>()
+        .map_err(|_| format!("invalid --interval-ms value: {value}"))?;
+    if !(100..=60_000).contains(&interval) {
+        return Err("--interval-ms must be between 100 and 60000".into());
+    }
+    cli.trace_interval_ms = interval;
+    *value_set = true;
+    Ok(())
+}
+
+fn set_trace_count(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+    if *value_set {
+        return Err("--count may only be specified once".into());
+    }
+    let count = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid --count value: {value}"))?;
+    if !(1..=1_000_000).contains(&count) {
+        return Err("--count must be between 1 and 1000000".into());
+    }
+    cli.trace_count = Some(count);
+    *value_set = true;
+    Ok(())
 }
 
 fn parse_watch(arguments: &[String]) -> Result<Cli, String> {
@@ -521,6 +915,157 @@ fn set_tree_depth(cli: &mut Cli, depth_set: &mut bool, value: &str) -> Result<()
         Some(depth)
     };
     *depth_set = true;
+    Ok(())
+}
+
+fn parse_listen(arguments: &[String]) -> Result<Cli, String> {
+    let mut cli = Cli {
+        mode: LaunchMode::ListenTable,
+        ..Cli::default()
+    };
+    let mut output_mode = None;
+    let mut query_set = false;
+    let mut protocol_set = false;
+    let mut limit_set = false;
+    let mut expectation_set = false;
+    let mut positional_query = Vec::new();
+    let mut arguments = arguments.iter().cloned().peekable();
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "-h" | "--help" => cli.mode = LaunchMode::Help,
+            "-V" | "--version" => cli.mode = LaunchMode::Version,
+            "--table" => {
+                set_listen_output_mode(&mut cli.mode, &mut output_mode, LaunchMode::ListenTable)?
+            }
+            "--json" => {
+                set_listen_output_mode(&mut cli.mode, &mut output_mode, LaunchMode::ListenJson)?
+            }
+            "--exposed" => cli.listen_exposed = true,
+            "--quiet" => cli.quiet = true,
+            "-q" | "--query" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| format!("{argument} requires a value"))?;
+                set_query(&mut cli, &mut query_set, value)?;
+            }
+            "--protocol" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--protocol requires tcp, udp, unix, or any".to_string())?;
+                set_listen_protocol(&mut cli, &mut protocol_set, &value)?;
+            }
+            "--limit" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--limit requires a positive integer or all".to_string())?;
+                set_listen_limit(&mut cli, &mut limit_set, &value)?;
+            }
+            "--expect" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--expect requires none or any".to_string())?;
+                set_listen_expectation(&mut cli, &mut expectation_set, &value)?;
+            }
+            _ if argument.starts_with("--query=") => {
+                let value = argument.trim_start_matches("--query=").to_string();
+                set_query(&mut cli, &mut query_set, value)?;
+            }
+            _ if argument.starts_with("--protocol=") => {
+                let value = argument.trim_start_matches("--protocol=");
+                set_listen_protocol(&mut cli, &mut protocol_set, value)?;
+            }
+            _ if argument.starts_with("--limit=") => {
+                let value = argument.trim_start_matches("--limit=");
+                set_listen_limit(&mut cli, &mut limit_set, value)?;
+            }
+            _ if argument.starts_with("--expect=") => {
+                let value = argument.trim_start_matches("--expect=");
+                set_listen_expectation(&mut cli, &mut expectation_set, value)?;
+            }
+            _ if argument.starts_with('-') => {
+                return Err(format!("unknown listen option: {argument}"));
+            }
+            _ => positional_query.push(argument),
+        }
+    }
+    if matches!(cli.mode, LaunchMode::Help | LaunchMode::Version) {
+        return Ok(cli);
+    }
+    if query_set && !positional_query.is_empty() {
+        return Err("listen filter must be positional or passed with --query, not both".into());
+    }
+    if !query_set && !positional_query.is_empty() {
+        set_query(&mut cli, &mut query_set, positional_query.join(" "))?;
+    }
+    if cli.quiet && cli.listen_expectation.is_none() {
+        return Err("listen --quiet requires --expect any or --expect none".into());
+    }
+    Ok(cli)
+}
+
+fn set_listen_output_mode(
+    mode: &mut LaunchMode,
+    output_mode: &mut Option<LaunchMode>,
+    requested: LaunchMode,
+) -> Result<(), String> {
+    if output_mode.is_some_and(|existing| existing != requested) {
+        return Err("listen --table and --json cannot be used together".into());
+    }
+    *output_mode = Some(requested);
+    if !matches!(mode, LaunchMode::Help | LaunchMode::Version) {
+        *mode = requested;
+    }
+    Ok(())
+}
+
+fn set_listen_protocol(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+    if *value_set {
+        return Err("--protocol may only be specified once".into());
+    }
+    cli.listen_protocol = match value.to_ascii_lowercase().as_str() {
+        "any" => ListenProtocol::Any,
+        "tcp" => ListenProtocol::Tcp,
+        "udp" => ListenProtocol::Udp,
+        "unix" => ListenProtocol::Unix,
+        _ => {
+            return Err(format!(
+                "invalid listen protocol: {value}; use tcp, udp, unix, or any"
+            ));
+        }
+    };
+    *value_set = true;
+    Ok(())
+}
+
+fn set_listen_limit(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+    if *value_set {
+        return Err("--limit may only be specified once".into());
+    }
+    cli.listen_limit = if value == "all" {
+        None
+    } else {
+        let limit = value
+            .parse::<usize>()
+            .map_err(|_| format!("invalid --limit value: {value}; use 1-10000 or all"))?;
+        if !(1..=10_000).contains(&limit) {
+            return Err("--limit must be between 1 and 10000, or all".into());
+        }
+        Some(limit)
+    };
+    *value_set = true;
+    Ok(())
+}
+
+fn set_listen_expectation(
+    cli: &mut Cli,
+    expectation_set: &mut bool,
+    value: &str,
+) -> Result<(), String> {
+    if *expectation_set {
+        return Err("--expect may only be specified once".into());
+    }
+    cli.listen_expectation = Some(parse_expectation(value)?);
+    *expectation_set = true;
     Ok(())
 }
 
@@ -907,48 +1452,245 @@ fn set_sample_ms(cli: &mut Cli, sample_set: &mut bool, value: &str) -> Result<()
     Ok(())
 }
 
-pub(crate) fn help_text() -> &'static str {
-    "psmore - cross-platform process relationship diagnostics
+pub(crate) fn help_text(topic: Option<HelpTopic>) -> &'static str {
+    match topic {
+        None => {
+            "psmore - cross-platform process relationship diagnostics
 
 USAGE:
   psmore [--query QUERY]
-  psmore --table [--query QUERY] [--sample-ms MS]
-  psmore --json  [--query QUERY] [--sample-ms MS]
-  psmore check QUERY [--expect none|any] [--table|--json|--quiet]
-  psmore inspect PID [--table|--json] [--sample-ms MS]
-  psmore port PORT [--protocol tcp|udp|any] [--all] [--table|--json]
-  psmore tree PID [--depth 0-128|all] [--table|--json] [--sample-ms MS]
-  psmore watch [QUERY] [--table|--jsonl] [--interval-ms MS] [--count N]
-  psmore deleted [--min-size SIZE] [--table|--json] [--expect none|any]
-  psmore diff BEFORE.json AFTER.json [--table|--json]
+  psmore --table|--json [--query QUERY] [--sample-ms MS]
+  psmore COMMAND [OPTIONS]
 
-OPTIONS:
+COMMANDS:
+  check       Evaluate a process query as an operations health gate
+  inspect     Inspect one process, threads, sockets, files, and context
+  port        Find the process and socket using a local port
+  listen      Inventory listeners and classify non-loopback exposure
+  tree        Print one PID's complete ancestor and descendant context
+  watch       Stream process lifecycle and query transition events
+  trace       Record process and complete-subtree resource time series
+  deleted     Find deleted files that processes still hold open
+  fd          Rank processes by open file-descriptor pressure
+  diff        Compare two psmore process snapshot JSON files
+  completion  Generate shell completion for bash, zsh, or fish
+
+GLOBAL OPTIONS:
   -q, --query QUERY   Start the TUI filtered, or filter snapshot rows
       --table         Print a human-readable process snapshot and exit
       --json          Print a versioned JSON process snapshot and exit
-      --sample-ms MS  Sampling interval for CPU and I/O rates [default: 500]
-      check QUERY     Evaluate a query as a CI/operations health gate
-      --expect MODE   Check/port expectation: none or any
-      --quiet         Check/port policy only: suppress output, use exit code
-      inspect PID     Inspect one process: threads, sockets, files, and context
-      port PORT       Find the process and sockets using a local port
-      --protocol P    Port only: tcp, udp, or any [default: any]
-      --all           Port only: include non-listening local connections
-      tree PID        Print the PID's ancestor chain and descendant tree
-      --depth N       Tree descendant depth, 0-128 or all [default: all]
-      watch [QUERY]   Stream lifecycle and query-match changes
-      --jsonl         Watch only: emit one JSON document per event
-      --interval-ms   Watch refresh interval, 100-60000 [default: 1000]
-      --count N       Watch only: stop after N refreshes [default: unlimited]
-      deleted         Find deleted files still held open by processes
-      --min-size SIZE Deleted only: filter estimated reclaimable bytes
-      diff            Compare two psmore.process-snapshot v1 files
+      --sample-ms MS  CPU and I/O sampling interval, 100-60000 [default: 500]
   -h, --help          Print help
   -V, --version       Print version
 
-QUERY EXAMPLES:
-  'name:python cpu>20'  'user:deploy mem>500m'  'tree.procs>=10'
+Run 'psmore COMMAND --help' for command-specific options and examples.
+Query examples: 'name:python cpu>20'  'user:deploy mem>500m'  'tree.procs>=10'
 "
+        }
+        Some(HelpTopic::Check) => {
+            "psmore check - evaluate a process query as a health gate
+
+USAGE:
+  psmore check QUERY [--expect none|any] [--table|--json|--quiet] [--sample-ms MS]
+
+OPTIONS:
+      --expect MODE   none: require zero matches; any: require >=1 [default: none]
+      --table         Human-readable result [default]
+      --json          psmore.check-result JSON
+      --quiet         Suppress output and use only the exit code
+      --sample-ms MS  Sampling interval, 100-60000 [default: 500]
+
+EXIT: 0 policy passed, 1 runtime error, 2 usage/query error, 3 policy violated
+EXAMPLES:
+  psmore check 'state:zombie'
+  psmore check 'name:api user:deploy' --expect any --quiet
+"
+        }
+        Some(HelpTopic::Inspect) => {
+            "psmore inspect - deep inspection for one process instance
+
+USAGE:
+  psmore inspect PID [--table|--json] [--sample-ms MS]
+
+OPTIONS:
+      --table         Human-readable process, thread, socket, file, and context report [default]
+      --json          psmore.process-inspection JSON
+      --sample-ms MS  Process resource sampling interval, 100-60000 [default: 500]
+
+The PID identity is revalidated after collection; confirmed PID reuse is refused.
+EXAMPLES:
+  psmore inspect 1234
+  psmore inspect 1234 --json > process-1234.json
+"
+        }
+        Some(HelpTopic::Port) => {
+            "psmore port - inspect one exact local TCP/UDP port
+
+USAGE:
+  psmore port PORT [--protocol tcp|udp|any] [--all] [--table|--json]
+                   [--expect none|any] [--quiet]
+
+OPTIONS:
+      --protocol P   tcp, udp, or any [default: any]
+      --all          Include non-listening local connections
+      --expect MODE  Apply none/any health-gate policy
+      --quiet        Suppress output; requires --expect
+
+EXIT: 0 success/pass, 1 error or inconclusive absence, 2 usage, 3 violation
+EXAMPLES:
+  psmore port 8080
+  psmore port 53 --protocol udp --json
+  psmore port 8080 --expect any --quiet
+"
+        }
+        Some(HelpTopic::Listen) => {
+            "psmore listen - inventory listeners and host exposure
+
+USAGE:
+  psmore listen [FILTER] [--protocol tcp|udp|unix|any] [--exposed]
+                 [--limit N|all] [--table|--json] [--expect none|any] [--quiet]
+
+OPTIONS:
+  -q, --query TEXT   FILTER alternative; searches owner, command, address, and namespace
+      --protocol P   tcp, udp, unix, or any [default: any]
+      --exposed      Keep wildcard and non-loopback network binds only
+      --limit N|all  Maximum returned socket references [default: 100]
+      --expect MODE  Apply none/any health-gate policy
+      --quiet        Suppress output; requires --expect
+
+EXAMPLES:
+  psmore listen --exposed --protocol tcp
+  psmore listen nginx --limit all --json
+  psmore listen debug --exposed --expect none --quiet
+"
+        }
+        Some(HelpTopic::Tree) => {
+            "psmore tree - print one process relationship context
+
+USAGE:
+  psmore tree PID [--depth 0-128|all] [--table|--json] [--sample-ms MS]
+
+OPTIONS:
+      --depth N      Descendant depth; ancestors remain complete [default: all]
+      --table        Directory-style tree with own/subtree resources [default]
+      --json         Nested psmore.process-tree JSON
+      --sample-ms MS Sampling interval, 100-60000 [default: 500]
+
+EXAMPLES:
+  psmore tree 1234 --depth 2
+  psmore tree 0 --depth 3 --json
+"
+        }
+        Some(HelpTopic::Watch) => {
+            "psmore watch - stream lifecycle and query transition events
+
+USAGE:
+  psmore watch [QUERY] [--table|--jsonl] [--interval-ms MS] [--count N]
+
+OPTIONS:
+  -q, --query QUERY  Positional QUERY alternative
+      --table        Human-readable event stream [default]
+      --jsonl        One psmore.process-watch-event document per record
+      --interval-ms  Refresh interval, 100-60000 [default: 1000]
+      --count N      Stop after N post-baseline refreshes [default: unlimited]
+
+EXAMPLES:
+  psmore watch 'cpu>80 age>5s' --interval-ms 250
+  psmore watch name:api --jsonl --count 20
+"
+        }
+        Some(HelpTopic::Trace) => {
+            "psmore trace - record one process and service-subtree time series
+
+USAGE:
+  psmore trace PID [--table|--jsonl] [--interval-ms MS] [--count N]
+
+OPTIONS:
+      --table        Live own/subtree CPU, memory, growth, and I/O rows [default]
+      --jsonl        Baseline, sample, lifecycle, and complete JSON records
+      --interval-ms  Target refresh interval, 100-60000 [default: 1000]
+      --count N      Stop after N post-baseline samples [default: unlimited]
+
+Trace never follows a reused PID into a new process instance.
+EXAMPLES:
+  psmore trace 1234 --interval-ms 250 --count 40
+  psmore trace 1234 --jsonl > trace-1234.jsonl
+"
+        }
+        Some(HelpTopic::Deleted) => {
+            "psmore deleted - find deleted files still held open
+
+USAGE:
+  psmore deleted [--min-size SIZE] [--table|--json] [--expect none|any] [--quiet]
+
+OPTIONS:
+      --min-size SIZE Filter estimated reclaimable bytes; accepts k/m/g/t units
+      --table         Human-readable owner and file evidence [default]
+      --json          psmore.deleted-open-files JSON
+      --expect MODE   Apply none/any policy to unique matching files
+      --quiet         Suppress output; requires --expect
+
+EXIT: 0 success/pass, 1 error or inconclusive absence, 2 usage, 3 violation
+EXAMPLES:
+  psmore deleted --min-size 100m
+  psmore deleted --min-size 1g --expect none --quiet
+"
+        }
+        Some(HelpTopic::Fd) => {
+            "psmore fd - rank open file-descriptor pressure
+
+USAGE:
+  psmore fd [--min-count N] [--min-percent P] [--limit N|all]
+            [--table|--json] [--expect none|any] [--quiet]
+
+OPTIONS:
+      --min-count N    Require at least N open descriptors [default: 1]
+      --min-percent P  Require 1-100% soft-limit utilization
+      --limit N|all    Maximum returned process rows [default: 20]
+      --expect MODE    Apply none/any policy to all matches
+      --quiet          Suppress output; requires --expect
+
+Count and percent filters use AND semantics. Linux exposes per-process limits;
+macOS reports limit utilization as unknown rather than inventing a percentage.
+EXAMPLES:
+  psmore fd --min-percent 80
+  psmore fd --min-count 4096 --expect none --quiet
+"
+        }
+        Some(HelpTopic::Diff) => {
+            "psmore diff - compare two persistent process snapshots
+
+USAGE:
+  psmore diff BEFORE.json AFTER.json [--table|--json]
+
+OPTIONS:
+      --table  Human-readable lifecycle and resource delta report [default]
+      --json   Versioned machine-readable difference
+
+Inputs must be compatible psmore.process-snapshot v1 documents from the same
+host, platform, and query scope, with AFTER not older than BEFORE.
+EXAMPLE:
+  psmore --json > before.json
+  psmore --json > after.json
+  psmore diff before.json after.json
+"
+        }
+        Some(HelpTopic::Completion) => {
+            "psmore completion - generate shell completion
+
+USAGE:
+  psmore completion bash|zsh|fish
+
+EXAMPLES:
+  source <(psmore completion bash)
+  psmore completion zsh > ~/.zfunc/_psmore
+  psmore completion fish > ~/.config/fish/completions/psmore.fish
+
+Generated scripts include all commands, command-specific options, and enum
+values such as protocols, expectations, output formats, and 'all' limits.
+"
+        }
+    }
 }
 
 #[cfg(test)]
@@ -969,6 +1711,8 @@ mod tests {
             Cli::parse(["--json", "--query=user:deploy", "--sample-ms=1200"]).unwrap(),
             Cli {
                 mode: LaunchMode::Json,
+                help_topic: None,
+                completion_shell: None,
                 query: "user:deploy".into(),
                 sample_ms: 1_200,
                 diff_paths: None,
@@ -977,12 +1721,23 @@ mod tests {
                 port_protocol: PortProtocol::Any,
                 port_all: false,
                 port_expectation: None,
+                listen_protocol: ListenProtocol::Any,
+                listen_exposed: false,
+                listen_limit: Some(100),
+                listen_expectation: None,
                 tree_pid: None,
                 tree_depth: None,
                 watch_interval_ms: 1_000,
                 watch_count: None,
+                trace_pid: None,
+                trace_interval_ms: 1_000,
+                trace_count: None,
                 deleted_min_size: 0,
                 deleted_expectation: None,
+                fd_min_count: 1,
+                fd_min_percent: None,
+                fd_limit: Some(20),
+                fd_expectation: None,
                 check_expectation: CheckExpectation::None,
                 quiet: false,
             }
@@ -1012,6 +1767,27 @@ mod tests {
                 mode: LaunchMode::DeletedJson,
                 deleted_min_size: 1_610_612_736,
                 deleted_expectation: Some(CheckExpectation::None),
+                ..Cli::default()
+            }
+        );
+        assert_eq!(
+            Cli::parse([
+                "fd",
+                "--min-count=256",
+                "--min-percent=80",
+                "--limit",
+                "all",
+                "--json",
+                "--expect",
+                "none"
+            ])
+            .unwrap(),
+            Cli {
+                mode: LaunchMode::FdJson,
+                fd_min_count: 256,
+                fd_min_percent: Some(80),
+                fd_limit: None,
+                fd_expectation: Some(CheckExpectation::None),
                 ..Cli::default()
             }
         );
@@ -1047,6 +1823,24 @@ mod tests {
                 query: "name:worker cpu>20".into(),
                 watch_interval_ms: 250,
                 watch_count: Some(4),
+                ..Cli::default()
+            }
+        );
+        assert_eq!(
+            Cli::parse([
+                "trace",
+                "4242",
+                "--jsonl",
+                "--interval-ms=250",
+                "--count",
+                "4"
+            ])
+            .unwrap(),
+            Cli {
+                mode: LaunchMode::TraceJsonl,
+                trace_pid: Some(4_242),
+                trace_interval_ms: 250,
+                trace_count: Some(4),
                 ..Cli::default()
             }
         );
@@ -1087,6 +1881,52 @@ mod tests {
                 ..Cli::default()
             }
         );
+        assert_eq!(
+            Cli::parse([
+                "listen",
+                "api server",
+                "--protocol=tcp",
+                "--exposed",
+                "--limit=all",
+                "--json",
+                "--expect=any"
+            ])
+            .unwrap(),
+            Cli {
+                mode: LaunchMode::ListenJson,
+                query: "api server".into(),
+                listen_protocol: ListenProtocol::Tcp,
+                listen_exposed: true,
+                listen_limit: None,
+                listen_expectation: Some(CheckExpectation::Any),
+                ..Cli::default()
+            }
+        );
+        assert_eq!(
+            Cli::parse(["completion", "zsh"]).unwrap(),
+            Cli {
+                mode: LaunchMode::Completion,
+                completion_shell: Some(CompletionShell::Zsh),
+                ..Cli::default()
+            }
+        );
+        for (command, topic) in [
+            ("check", HelpTopic::Check),
+            ("inspect", HelpTopic::Inspect),
+            ("port", HelpTopic::Port),
+            ("listen", HelpTopic::Listen),
+            ("tree", HelpTopic::Tree),
+            ("watch", HelpTopic::Watch),
+            ("trace", HelpTopic::Trace),
+            ("deleted", HelpTopic::Deleted),
+            ("fd", HelpTopic::Fd),
+            ("diff", HelpTopic::Diff),
+            ("completion", HelpTopic::Completion),
+        ] {
+            let cli = Cli::parse([command, "--help"]).unwrap();
+            assert_eq!(cli.mode, LaunchMode::Help);
+            assert_eq!(cli.help_topic, Some(topic));
+        }
     }
 
     #[test]
@@ -1118,6 +1958,13 @@ mod tests {
         assert!(Cli::parse(["port", "80", "--protocol=sctp"]).is_err());
         assert!(Cli::parse(["port", "80", "--table", "--json"]).is_err());
         assert!(Cli::parse(["port", "80", "--quiet"]).is_err());
+        assert!(Cli::parse(["listen", "--protocol=sctp"]).is_err());
+        assert!(Cli::parse(["listen", "--table", "--json"]).is_err());
+        assert!(Cli::parse(["listen", "--limit=0"]).is_err());
+        assert!(Cli::parse(["listen", "--limit=10001"]).is_err());
+        assert!(Cli::parse(["listen", "api", "--query=worker"]).is_err());
+        assert!(Cli::parse(["listen", "--quiet"]).is_err());
+        assert!(Cli::parse(["listen", "--expect=all"]).is_err());
         assert!(Cli::parse(["tree"]).is_err());
         assert!(Cli::parse(["tree", "nope"]).is_err());
         assert!(Cli::parse(["tree", "1", "2"]).is_err());
@@ -1128,10 +1975,57 @@ mod tests {
         assert!(Cli::parse(["watch", "--interval-ms=99"]).is_err());
         assert!(Cli::parse(["watch", "--count=0"]).is_err());
         assert!(Cli::parse(["watch", "name:a", "--query", "name:b"]).is_err());
+        assert!(Cli::parse(["trace"]).is_err());
+        assert!(Cli::parse(["trace", "0"]).is_err());
+        assert!(Cli::parse(["trace", "nope"]).is_err());
+        assert!(Cli::parse(["trace", "1", "2"]).is_err());
+        assert!(Cli::parse(["trace", "1", "--table", "--jsonl"]).is_err());
+        assert!(Cli::parse(["trace", "1", "--interval-ms=99"]).is_err());
+        assert!(Cli::parse(["trace", "1", "--count=0"]).is_err());
         assert!(Cli::parse(["deleted", "extra"]).is_err());
         assert!(Cli::parse(["deleted", "--min-size=nope"]).is_err());
         assert!(Cli::parse(["deleted", "--table", "--json"]).is_err());
         assert!(Cli::parse(["deleted", "--quiet"]).is_err());
         assert!(Cli::parse(["deleted", "--expect=all"]).is_err());
+        assert!(Cli::parse(["fd", "extra"]).is_err());
+        assert!(Cli::parse(["fd", "--min-count=nope"]).is_err());
+        assert!(Cli::parse(["fd", "--min-percent=0"]).is_err());
+        assert!(Cli::parse(["fd", "--min-percent=101"]).is_err());
+        assert!(Cli::parse(["fd", "--min-percent=80", "--min-percent=90"]).is_err());
+        assert!(Cli::parse(["fd", "--limit=0"]).is_err());
+        assert!(Cli::parse(["fd", "--limit=10001"]).is_err());
+        assert!(Cli::parse(["fd", "--limit=all", "--limit=20"]).is_err());
+        assert!(Cli::parse(["fd", "--table", "--json"]).is_err());
+        assert!(Cli::parse(["fd", "--quiet"]).is_err());
+        assert!(Cli::parse(["fd", "--expect=all"]).is_err());
+        assert!(Cli::parse(["completion"]).is_err());
+        assert!(Cli::parse(["completion", "powershell"]).is_err());
+        assert!(Cli::parse(["completion", "bash", "zsh"]).is_err());
+        assert!(Cli::parse(["completion", "--unknown"]).is_err());
+    }
+
+    #[test]
+    fn contextual_help_is_command_specific_and_keeps_global_discovery() {
+        let global = help_text(None);
+        assert!(global.contains("psmore COMMAND [OPTIONS]"));
+        assert!(global.contains("psmore COMMAND --help"));
+        for (topic, command) in [
+            (HelpTopic::Check, "check"),
+            (HelpTopic::Inspect, "inspect"),
+            (HelpTopic::Port, "port"),
+            (HelpTopic::Listen, "listen"),
+            (HelpTopic::Tree, "tree"),
+            (HelpTopic::Watch, "watch"),
+            (HelpTopic::Trace, "trace"),
+            (HelpTopic::Deleted, "deleted"),
+            (HelpTopic::Fd, "fd"),
+            (HelpTopic::Diff, "diff"),
+            (HelpTopic::Completion, "completion"),
+        ] {
+            let help = help_text(Some(topic));
+            assert!(help.starts_with(&format!("psmore {command} ")));
+            assert!(help.contains("USAGE:"));
+            assert_ne!(help, global);
+        }
     }
 }
