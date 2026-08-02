@@ -25,7 +25,8 @@ _psmore_completion() {
         --by) words="cpu memory read write" ;;
         --scope) words="process tree" ;;
         --state) words="ESTABLISHED LISTEN TIME_WAIT CLOSE_WAIT SYN_SENT SYN_RECV CONNECTED CONNECTING BOUND OPEN" ;;
-        --fail-on) words="never warning critical" ;;
+        --fail-on)
+            if [[ "$cmd" == "diff" ]]; then words="never regression"; else words="never warning critical"; fi ;;
         --output) compopt -o default; return ;;
         completion) words="bash zsh fish" ;;
         *) words="" ;;
@@ -36,7 +37,7 @@ _psmore_completion() {
     fi
 
     if (( COMP_CWORD == 1 )); then
-        words="check inspect port listen net tree watch trace deleted fd top oom doctor diff completion --table --json --query --sample-ms --redact --help --version"
+        words="check inspect port listen net tree watch trace deleted fd top oom doctor diff completion --table --json --query --no-tips --sample-ms --redact --help --version"
         COMPREPLY=( $(compgen -W "$words" -- "$cur") )
         return
     fi
@@ -55,9 +56,9 @@ _psmore_completion() {
         oom) words="--query --min-score --limit --table --json --expect --quiet --sample-ms --help --version" ;;
         net) words="--query --protocol --connected --state --limit --table --json --expect --quiet --help --version" ;;
         doctor) words="--query --deep --limit --table --json --output --force --fail-on --quiet --sample-ms --help --version" ;;
-        diff) words="--table --json --help --version" ;;
+        diff) words="--table --json --output --force --fail-on --quiet --help --version" ;;
         completion) words="bash zsh fish --help --version" ;;
-        *) words="--query --table --json --sample-ms --help --version" ;;
+        *) words="--query --no-tips --table --json --sample-ms --help --version" ;;
     esac
     words="$words --redact"
     COMPREPLY=( $(compgen -W "$words" -- "$cur") )
@@ -84,11 +85,12 @@ _psmore() {
     'top:rank CPU memory and disk I/O hotspots'
     'oom:diagnose Linux memory pressure and OOM priority'
     'doctor:run conservative host and process triage'
-    'diff:compare process snapshot JSON files'
+    'diff:compare process snapshots or doctor reports'
     'completion:generate shell completion'
     '--table:print a table snapshot and exit'
     '--json:print a JSON snapshot and exit'
     '--query:filter the TUI or snapshot'
+    '--no-tips:skip the startup help or tip for this TUI run'
     '--sample-ms:set the snapshot sampling interval'
     '--redact:mask common secret values in command lines'
     '--help:print global help'
@@ -109,7 +111,10 @@ _psmore() {
       else _values 'protocol' any tcp udp; fi
       return ;;
     --depth|--limit) _values 'value' all; return ;;
-    --fail-on) _values 'severity' never warning critical; return ;;
+    --fail-on)
+      if [[ "$cmd" == diff ]]; then _values 'policy' never regression
+      else _values 'severity' never warning critical; fi
+      return ;;
   esac
   if [[ "$cmd" == completion && CURRENT == 3 ]]; then
     _values 'shell' bash zsh fish
@@ -130,9 +135,9 @@ _psmore() {
     top) options=( '--query[process query]:query:' '--by[ranking metric]:metric:(cpu memory read write)' '--scope[ranking scope]:scope:(process tree)' '--limit[maximum rows]:rows:(all)' '--table[table output]' '--json[JSON output]' '--sample-ms[sampling milliseconds]:milliseconds:' ) ;;
     oom) options=( '--query[process query]:query:' '--min-score[minimum kernel OOM score]:score:' '--limit[maximum candidates]:rows:(all)' '--table[table output]' '--json[JSON output]' '--expect[policy]:mode:(none any)' '--quiet[suppress output]' '--sample-ms[sampling milliseconds]:milliseconds:' ) ;;
     doctor) options=( '--query[scope quick process signals and hotspots]:query:' '--deep[scan exposure fd deleted files and Linux OOM]' '--limit[maximum rows per section]:rows:(all)' '--table[table output]' '--json[JSON output]' '--output[atomically write private JSON]:file:_files' '--force[replace an existing output file]' '--fail-on[exit threshold]:severity:(never warning critical)' '--quiet[suppress stdout]' '--sample-ms[sampling milliseconds]:milliseconds:' ) ;;
-    diff) options=( '--table[table output]' '--json[JSON output]' ) ;;
+    diff) options=( '--table[table output]' '--json[JSON output]' '--output[atomically write private JSON]:file:_files' '--force[replace an existing output file]' '--fail-on[exit for doctor regression]:policy:(never regression)' '--quiet[suppress stdout]' ) ;;
     completion) options=() ;;
-    *) options=( '--query[process query]:query:' '--table[table snapshot]' '--json[JSON snapshot]' '--sample-ms[sampling milliseconds]:milliseconds:' ) ;;
+    *) options=( '--query[process query]:query:' '--no-tips[skip startup guidance for this TUI run]' '--table[table snapshot]' '--json[JSON snapshot]' '--sample-ms[sampling milliseconds]:milliseconds:' ) ;;
   esac
   options+=( '--redact[mask common secret values in command lines]' '-h[print help]' '--help[print help]' '-V[print version]' '--version[print version]' )
   _arguments -s $options '*:argument:_files'
@@ -155,11 +160,12 @@ complete -c psmore -n '__fish_use_subcommand' -a fd -d 'Rank file-descriptor pre
 complete -c psmore -n '__fish_use_subcommand' -a top -d 'Rank CPU, memory, and disk I/O hotspots'
 complete -c psmore -n '__fish_use_subcommand' -a oom -d 'Diagnose Linux memory pressure and OOM priority'
 complete -c psmore -n '__fish_use_subcommand' -a doctor -d 'Run conservative host and process triage'
-complete -c psmore -n '__fish_use_subcommand' -a diff -d 'Compare process snapshot files'
+complete -c psmore -n '__fish_use_subcommand' -a diff -d 'Compare snapshots or doctor reports'
 complete -c psmore -n '__fish_use_subcommand' -a completion -d 'Generate shell completion'
 
 complete -c psmore -n '__fish_seen_subcommand_from completion' -a 'bash zsh fish'
 complete -c psmore -n 'not __fish_seen_subcommand_from check inspect port listen net tree watch trace deleted fd top oom doctor diff completion' -s q -l query -r -d 'Initial TUI or snapshot query'
+complete -c psmore -n 'not __fish_seen_subcommand_from check inspect port listen net tree watch trace deleted fd top oom doctor diff completion' -l no-tips -d 'Skip startup guidance for this TUI run'
 complete -c psmore -n 'not __fish_seen_subcommand_from check inspect port listen net tree watch trace deleted fd top oom doctor diff completion' -l table -d 'Print table snapshot'
 complete -c psmore -n 'not __fish_seen_subcommand_from check inspect port listen net tree watch trace deleted fd top oom doctor diff completion' -l json -d 'Print JSON snapshot'
 complete -c psmore -n 'not __fish_seen_subcommand_from check inspect port listen net tree watch trace deleted fd top oom doctor diff completion' -l sample-ms -r -d 'Sampling milliseconds'
@@ -180,6 +186,9 @@ complete -c psmore -n '__fish_seen_subcommand_from doctor' -l fail-on -xa 'never
 complete -c psmore -n '__fish_seen_subcommand_from doctor' -l deep -d 'Scan exposure, FD pressure, deleted files, and Linux OOM'
 complete -c psmore -n '__fish_seen_subcommand_from doctor' -l output -r -F -d 'Atomically write private JSON'
 complete -c psmore -n '__fish_seen_subcommand_from doctor' -l force -d 'Replace an existing output file'
+complete -c psmore -n '__fish_seen_subcommand_from diff' -l fail-on -xa 'never regression'
+complete -c psmore -n '__fish_seen_subcommand_from diff' -l output -r -F -d 'Atomically write private JSON'
+complete -c psmore -n '__fish_seen_subcommand_from diff' -l force -d 'Replace an existing output file'
 complete -c psmore -n '__fish_seen_subcommand_from tree' -l depth -xa all
 complete -c psmore -n '__fish_seen_subcommand_from port' -l all -d 'Include non-listening connections'
 complete -c psmore -n '__fish_seen_subcommand_from listen' -l exposed -d 'Wildcard and non-loopback binds only'
@@ -193,7 +202,7 @@ complete -c psmore -n '__fish_seen_subcommand_from listen net watch top oom doct
 complete -c psmore -n '__fish_seen_subcommand_from check inspect port listen net tree deleted fd top oom doctor diff' -l table
 complete -c psmore -n '__fish_seen_subcommand_from check inspect port listen net tree deleted fd top oom doctor diff' -l json
 complete -c psmore -n '__fish_seen_subcommand_from watch trace' -l jsonl
-complete -c psmore -n '__fish_seen_subcommand_from check port listen net deleted fd oom doctor' -l quiet
+complete -c psmore -n '__fish_seen_subcommand_from check port listen net deleted fd oom doctor diff' -l quiet
 complete -c psmore -l redact -d 'Mask common secret values in command lines'
 complete -c psmore -s h -l help -d 'Print help'
 complete -c psmore -s V -l version -d 'Print version'
@@ -256,7 +265,7 @@ mod tests {
                     shell.label()
                 );
             }
-            for value in ["never", "warning", "critical"] {
+            for value in ["never", "warning", "critical", "regression"] {
                 assert!(
                     script.contains(value),
                     "{} completion is missing {value}",
@@ -266,6 +275,12 @@ mod tests {
             assert!(
                 script.contains("--redact") || script.contains("-l redact"),
                 "{} completion is missing --redact",
+                shell.label()
+            );
+            assert!(
+                (script.contains("--output") || script.contains("-l output"))
+                    && (script.contains("--force") || script.contains("-l force")),
+                "{} completion is missing secure output options",
                 shell.label()
             );
             assert!(

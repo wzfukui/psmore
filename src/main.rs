@@ -6,6 +6,7 @@ mod headless;
 mod headless_deleted;
 mod headless_diff;
 mod headless_doctor;
+mod headless_doctor_diff;
 mod headless_fd;
 mod headless_inspect;
 mod headless_listen;
@@ -20,6 +21,7 @@ mod history;
 mod inspection;
 mod model;
 mod network;
+mod onboarding;
 mod provider;
 mod query;
 mod report;
@@ -30,8 +32,9 @@ mod ui;
 use std::{
     env,
     error::Error,
+    fs,
     io::{self, IsTerminal, Write},
-    path::Path,
+    path::{Path, PathBuf},
     process::ExitCode,
     time::Duration,
 };
@@ -45,7 +48,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::{
     app::App,
-    cli::{Cli, LaunchMode, help_text},
+    cli::{Cli, DiffPolicyStatus, LaunchMode, help_text},
     completion::completion_script,
     headless::{
         capture_snapshot, matching_process_count, render_check_json, render_check_table,
@@ -87,7 +90,7 @@ fn handle_pending_input(app: &mut App) -> io::Result<bool> {
     }
 }
 
-fn run_tui(initial_query: String) -> Result<(), Box<dyn Error>> {
+fn run_tui(initial_query: String, suppress_guidance: bool) -> Result<(), Box<dyn Error>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     if let Err(error) = execute!(stdout, EnterAlternateScreen) {
@@ -96,11 +99,7 @@ fn run_tui(initial_query: String) -> Result<(), Box<dyn Error>> {
     }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let mut app = if initial_query.is_empty() {
-        App::new()
-    } else {
-        App::new_with_query(initial_query)
-    };
+    let mut app = App::new_for_tui(initial_query, suppress_guidance);
     let result: io::Result<()> = (|| {
         loop {
             app.poll_background_jobs();
@@ -133,6 +132,36 @@ fn write_stdout(output: &str) -> io::Result<()> {
         stdout.write_all(b"\n")?;
     }
     stdout.flush()
+}
+
+fn normalized_output_target(path: &Path) -> io::Result<PathBuf> {
+    match fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let file_name = path.file_name().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "output path has no file name")
+            })?;
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            Ok(fs::canonicalize(parent)?.join(file_name))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn validate_diff_output_target(output: &Path, before: &Path, after: &Path) -> io::Result<()> {
+    let output = normalized_output_target(output)?;
+    for (label, input) in [("BEFORE", before), ("AFTER", after)] {
+        if output == fs::canonicalize(input)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("diff output must not replace the {label} input report"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn runtime_result(result: Result<(), Box<dyn Error>>) -> ExitCode {
@@ -184,7 +213,7 @@ fn main() -> ExitCode {
             if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
                 return usage_error("interactive mode requires a terminal; use --table or --json");
             }
-            runtime_result(run_tui(cli.query))
+            runtime_result(run_tui(cli.query, cli.tui_no_tips))
         }
         LaunchMode::Table | LaunchMode::Json => {
             if let Err(error) = validate_query(&cli.query) {
@@ -635,20 +664,68 @@ fn main() -> ExitCode {
             let Some((before_path, after_path)) = cli.diff_paths else {
                 return usage_error("diff requires BEFORE.json and AFTER.json");
             };
+            let comparison = match load_comparison(before_path.as_ref(), after_path.as_ref()) {
+                Ok(comparison) => comparison,
+                Err(error) => return runtime_result(Err(io::Error::other(error).into())),
+            };
+            let policy_status = match comparison.evaluate_policy(cli.diff_fail_on) {
+                Ok(policy_status) => policy_status,
+                Err(error) => return usage_error(&error),
+            };
+            if let Some(path) = cli.diff_output.as_deref() {
+                if let Err(error) = validate_diff_output_target(
+                    Path::new(path),
+                    Path::new(&before_path),
+                    Path::new(&after_path),
+                ) {
+                    return if error.kind() == io::ErrorKind::InvalidInput {
+                        usage_error(&error.to_string())
+                    } else {
+                        runtime_result(Err(error.into()))
+                    };
+                }
+            }
             let result = (|| -> Result<(), Box<dyn Error>> {
-                let comparison = load_comparison(before_path.as_ref(), after_path.as_ref())
-                    .map_err(io::Error::other)?;
-                let output = match cli.mode {
-                    LaunchMode::DiffTable => render_diff_table(&comparison),
-                    LaunchMode::DiffJson => {
-                        render_diff_json(&comparison).map_err(io::Error::other)?
+                if !cli.quiet || cli.diff_output.is_some() {
+                    let output = match cli.mode {
+                        LaunchMode::DiffTable => {
+                            render_diff_table(&comparison, cli.diff_fail_on, policy_status)
+                        }
+                        LaunchMode::DiffJson => {
+                            render_diff_json(&comparison, cli.diff_fail_on, policy_status)
+                                .map_err(io::Error::other)?
+                        }
+                        _ => unreachable!(),
+                    };
+                    if let Some(path) = cli.diff_output.as_deref() {
+                        write_secure_atomic(Path::new(path), output.as_bytes(), cli.diff_force)?;
+                        if !cli.quiet {
+                            let regressions = comparison
+                                .regression_count()
+                                .map(|count| count.to_string())
+                                .unwrap_or_else(|| "n/a".to_string());
+                            write_stdout(&format!(
+                                "PSMORE DIFF REPORT  {}  kind {}  regressions {}  {}",
+                                sanitize_terminal_text(path),
+                                comparison.report_kind(),
+                                regressions,
+                                comparison.summary_line(),
+                            ))?;
+                        }
+                    } else {
+                        write_stdout(&output)?;
                     }
-                    _ => unreachable!(),
-                };
-                write_stdout(&output)?;
+                }
                 Ok(())
             })();
-            runtime_result(result)
+            if let Err(error) = result {
+                runtime_result(Err(error))
+            } else {
+                match policy_status {
+                    None | Some(DiffPolicyStatus::Passed) => ExitCode::SUCCESS,
+                    Some(DiffPolicyStatus::Violated) => ExitCode::from(3),
+                }
+            }
         }
     }
 }
@@ -1773,5 +1850,42 @@ Max address space         unlimited            unlimited            bytes\n";
 
         fs::remove_file(path).expect("remove test report");
         fs::remove_dir(directory).expect("remove report test directory");
+    }
+
+    #[test]
+    fn diff_output_cannot_replace_either_input_report() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "psmore-diff-target-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).expect("create diff target test directory");
+        let before = directory.join("before.json");
+        let after = directory.join("after.json");
+        fs::write(&before, b"before").expect("write before");
+        fs::write(&after, b"after").expect("write after");
+
+        let output = directory.join("diff.json");
+        crate::validate_diff_output_target(&output, &before, &after)
+            .expect("separate output is valid");
+        assert!(
+            crate::validate_diff_output_target(&before, &before, &after)
+                .unwrap_err()
+                .to_string()
+                .contains("BEFORE")
+        );
+        assert!(
+            crate::validate_diff_output_target(&after, &before, &after)
+                .unwrap_err()
+                .to_string()
+                .contains("AFTER")
+        );
+
+        fs::remove_file(before).expect("remove before");
+        fs::remove_file(after).expect("remove after");
+        fs::remove_dir(directory).expect("remove diff target test directory");
     }
 }

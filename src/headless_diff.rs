@@ -7,7 +7,14 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{command_for_output, sanitize_terminal_text};
+use crate::{
+    cli::{DiffFailOn, DiffPolicyStatus},
+    headless_doctor_diff::{
+        DOCTOR_SCHEMA, DoctorComparison, compare_doctor_contents, render_doctor_diff_json,
+        render_doctor_diff_table,
+    },
+    model::{command_for_output, sanitize_terminal_text},
+};
 
 const SNAPSHOT_SCHEMA: &str = "psmore.process-snapshot";
 const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
@@ -424,17 +431,101 @@ fn compare_snapshots(
     })
 }
 
+#[derive(Debug, Deserialize)]
+struct StoredEnvelope {
+    schema: String,
+}
+
+pub(crate) enum PersistentComparison {
+    Snapshot(Box<SnapshotComparison>),
+    Doctor(Box<DoctorComparison>),
+}
+
+impl PersistentComparison {
+    pub(crate) fn evaluate_policy(
+        &self,
+        fail_on: DiffFailOn,
+    ) -> Result<Option<DiffPolicyStatus>, String> {
+        match fail_on {
+            DiffFailOn::Never => Ok(None),
+            DiffFailOn::Regression => match self {
+                Self::Doctor(comparison) => Ok(Some(if comparison.regression_detected() {
+                    DiffPolicyStatus::Violated
+                } else {
+                    DiffPolicyStatus::Passed
+                })),
+                Self::Snapshot(_) => Err(
+                    "diff --fail-on regression requires two psmore.host-doctor reports; process snapshot resource changes have no universal failure meaning"
+                        .into(),
+                ),
+            },
+        }
+    }
+
+    pub(crate) fn summary_line(&self) -> String {
+        match self {
+            Self::Snapshot(comparison) => format!(
+                "snapshot changes +{} -{} reused {} reparented {}",
+                comparison.summary.appeared,
+                comparison.summary.disappeared,
+                comparison.summary.pid_reused,
+                comparison.summary.reparented,
+            ),
+            Self::Doctor(comparison) => comparison.summary_line(),
+        }
+    }
+
+    pub(crate) fn report_kind(&self) -> &'static str {
+        match self {
+            Self::Snapshot(_) => "process_snapshot",
+            Self::Doctor(_) => "host_doctor",
+        }
+    }
+
+    pub(crate) fn regression_count(&self) -> Option<usize> {
+        match self {
+            Self::Snapshot(_) => None,
+            Self::Doctor(comparison) => Some(comparison.regression_count()),
+        }
+    }
+}
+
+fn parse_envelope(contents: &str, label: &str) -> Result<StoredEnvelope, String> {
+    serde_json::from_str(contents)
+        .map_err(|error| format!("cannot identify {label} report schema: {error}"))
+}
+
 pub(crate) fn load_comparison(
     before_path: &Path,
     after_path: &Path,
-) -> Result<SnapshotComparison, String> {
+) -> Result<PersistentComparison, String> {
     let before_contents = fs::read_to_string(before_path)
         .map_err(|error| format!("cannot read {}: {error}", before_path.display()))?;
     let after_contents = fs::read_to_string(after_path)
         .map_err(|error| format!("cannot read {}: {error}", after_path.display()))?;
-    let before = parse_snapshot(&before_contents, "BEFORE")?;
-    let after = parse_snapshot(&after_contents, "AFTER")?;
-    compare_snapshots(before, after)
+    let before_envelope = parse_envelope(&before_contents, "BEFORE")?;
+    let after_envelope = parse_envelope(&after_contents, "AFTER")?;
+    if before_envelope.schema != after_envelope.schema {
+        return Err(format!(
+            "schema mismatch: before is {}, after is {}; compare two reports of the same kind",
+            before_envelope.schema, after_envelope.schema
+        ));
+    }
+    match before_envelope.schema.as_str() {
+        SNAPSHOT_SCHEMA => {
+            let before = parse_snapshot(&before_contents, "BEFORE")?;
+            let after = parse_snapshot(&after_contents, "AFTER")?;
+            compare_snapshots(before, after)
+                .map(Box::new)
+                .map(PersistentComparison::Snapshot)
+        }
+        DOCTOR_SCHEMA => compare_doctor_contents(&before_contents, &after_contents)
+            .map(Box::new)
+            .map(PersistentComparison::Doctor),
+        schema => Err(format!(
+            "unsupported diff input schema {schema}; expected {SNAPSHOT_SCHEMA} or {DOCTOR_SCHEMA}"
+        )),
+    }
 }
 
 #[derive(Serialize)]
@@ -444,6 +535,7 @@ struct JsonDiff<'a> {
     privacy_notice: &'static str,
     tool: JsonTool,
     generated_at_unix_ms: u64,
+    policy: JsonPolicy,
     comparison: &'a SnapshotComparison,
 }
 
@@ -453,7 +545,19 @@ struct JsonTool {
     version: &'static str,
 }
 
-pub(crate) fn render_diff_json(comparison: &SnapshotComparison) -> Result<String, String> {
+#[derive(Serialize)]
+struct JsonPolicy {
+    fail_on: &'static str,
+    passed: Option<bool>,
+    status: Option<&'static str>,
+    rule: &'static str,
+}
+
+fn render_snapshot_diff_json(
+    comparison: &SnapshotComparison,
+    fail_on: DiffFailOn,
+    policy_status: Option<DiffPolicyStatus>,
+) -> Result<String, String> {
     let generated_at_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -480,6 +584,12 @@ pub(crate) fn render_diff_json(comparison: &SnapshotComparison) -> Result<String
             version: env!("CARGO_PKG_VERSION"),
         },
         generated_at_unix_ms,
+        policy: JsonPolicy {
+            fail_on: fail_on.label(),
+            passed: policy_status.map(DiffPolicyStatus::passed),
+            status: policy_status.map(DiffPolicyStatus::label),
+            rule: "process snapshot diffs do not define a universal regression policy",
+        },
         comparison: &output_comparison,
     })
     .map_err(|error| error.to_string())
@@ -638,7 +748,11 @@ fn append_io_growth(output: &mut String, deltas: &[ResourceDelta]) {
     }
 }
 
-pub(crate) fn render_diff_table(comparison: &SnapshotComparison) -> String {
+fn render_snapshot_diff_table(
+    comparison: &SnapshotComparison,
+    fail_on: DiffFailOn,
+    policy_status: Option<DiffPolicyStatus>,
+) -> String {
     let mut output = String::new();
     output.push_str("PSMORE SNAPSHOT DIFF\n");
     output.push_str(&format!(
@@ -654,6 +768,13 @@ pub(crate) fn render_diff_table(comparison: &SnapshotComparison) -> String {
         ));
     } else {
         output.push_str("scope all processes  (appearance means process start/exit)\n");
+    }
+    if let Some(policy_status) = policy_status {
+        output.push_str(&format!(
+            "policy {}  fail-on {}\n",
+            policy_status.label().to_ascii_uppercase(),
+            fail_on.label(),
+        ));
     }
     output.push_str(&format!(
         "system processes {} -> {} ({:+}); matched rows {} -> {} ({:+})\n",
@@ -727,6 +848,36 @@ pub(crate) fn render_diff_table(comparison: &SnapshotComparison) -> String {
     append_memory_growth(&mut output, &comparison.resource_deltas);
     append_io_growth(&mut output, &comparison.resource_deltas);
     output
+}
+
+pub(crate) fn render_diff_json(
+    comparison: &PersistentComparison,
+    fail_on: DiffFailOn,
+    policy_status: Option<DiffPolicyStatus>,
+) -> Result<String, String> {
+    match comparison {
+        PersistentComparison::Snapshot(comparison) => {
+            render_snapshot_diff_json(comparison, fail_on, policy_status)
+        }
+        PersistentComparison::Doctor(comparison) => {
+            render_doctor_diff_json(comparison, fail_on, policy_status)
+        }
+    }
+}
+
+pub(crate) fn render_diff_table(
+    comparison: &PersistentComparison,
+    fail_on: DiffFailOn,
+    policy_status: Option<DiffPolicyStatus>,
+) -> String {
+    match comparison {
+        PersistentComparison::Snapshot(comparison) => {
+            render_snapshot_diff_table(comparison, fail_on, policy_status)
+        }
+        PersistentComparison::Doctor(comparison) => {
+            render_doctor_diff_table(comparison, fail_on, policy_status)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -810,13 +961,23 @@ mod tests {
         assert_eq!(comparison.reparented[0].pid, 10);
         assert_eq!(comparison.resource_deltas[0].own_delta.memory_bytes, 60);
         assert_eq!(comparison.resource_deltas[0].own_delta.cpu_percent, 20.0);
-        let table = render_diff_table(&comparison);
+        let table = render_snapshot_diff_table(&comparison, DiffFailOn::Never, None);
         assert!(table.contains("STARTED (1)"));
         assert!(table.contains("PID REUSED (1)"));
         assert!(table.contains("TOP SUBTREE MEMORY GROWTH"));
-        let json: Value = serde_json::from_str(&render_diff_json(&comparison).unwrap()).unwrap();
+        let json: Value = serde_json::from_str(
+            &render_snapshot_diff_json(&comparison, DiffFailOn::Never, None).unwrap(),
+        )
+        .unwrap();
         assert_eq!(json["schema"], DIFF_SCHEMA);
         assert_eq!(json["comparison"]["summary"]["pid_reused"], 1);
+        let persistent = PersistentComparison::Snapshot(Box::new(comparison));
+        assert!(
+            persistent
+                .evaluate_policy(DiffFailOn::Regression)
+                .unwrap_err()
+                .contains("requires two psmore.host-doctor reports")
+        );
     }
 
     #[test]
@@ -872,7 +1033,7 @@ mod tests {
             parse_snapshot(&after, "AFTER").unwrap(),
         )
         .unwrap();
-        let table = render_diff_table(&comparison);
+        let table = render_snapshot_diff_table(&comparison, DiffFailOn::Never, None);
         assert!(table.contains("APPEARED IN QUERY"));
         assert!(!table.contains("STARTED"));
     }

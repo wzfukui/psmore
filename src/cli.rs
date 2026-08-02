@@ -138,6 +138,41 @@ impl DoctorFailOn {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum DiffFailOn {
+    #[default]
+    Never,
+    Regression,
+}
+
+impl DiffFailOn {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Never => "never",
+            Self::Regression => "regression",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DiffPolicyStatus {
+    Passed,
+    Violated,
+}
+
+impl DiffPolicyStatus {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Passed => "pass",
+            Self::Violated => "fail",
+        }
+    }
+
+    pub(crate) fn passed(self) -> bool {
+        self == Self::Passed
+    }
+}
+
 impl CheckExpectation {
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -160,8 +195,12 @@ pub(crate) struct Cli {
     pub(crate) help_topic: Option<HelpTopic>,
     pub(crate) completion_shell: Option<CompletionShell>,
     pub(crate) query: String,
+    pub(crate) tui_no_tips: bool,
     pub(crate) sample_ms: u64,
     pub(crate) diff_paths: Option<(String, String)>,
+    pub(crate) diff_fail_on: DiffFailOn,
+    pub(crate) diff_output: Option<String>,
+    pub(crate) diff_force: bool,
     pub(crate) inspect_pid: Option<u32>,
     pub(crate) port: Option<u16>,
     pub(crate) port_protocol: PortProtocol,
@@ -212,8 +251,12 @@ impl Default for Cli {
             help_topic: None,
             completion_shell: None,
             query: String::new(),
+            tui_no_tips: false,
             sample_ms: 500,
             diff_paths: None,
+            diff_fail_on: DiffFailOn::Never,
+            diff_output: None,
+            diff_force: false,
             inspect_pid: None,
             port: None,
             port_protocol: PortProtocol::Any,
@@ -302,6 +345,12 @@ impl Cli {
                 "-V" | "--version" => cli.mode = LaunchMode::Version,
                 "--table" => set_output_mode(&mut cli, LaunchMode::Table)?,
                 "--json" => set_output_mode(&mut cli, LaunchMode::Json)?,
+                "--no-tips" | "--no-onboarding" => {
+                    if cli.tui_no_tips {
+                        return Err("--no-tips may only be specified once".into());
+                    }
+                    cli.tui_no_tips = true;
+                }
                 "-q" | "--query" => {
                     let value = args
                         .next()
@@ -335,6 +384,14 @@ impl Cli {
 
         if sample_set && cli.mode == LaunchMode::Tui {
             return Err("--sample-ms requires --table or --json".into());
+        }
+        if cli.tui_no_tips
+            && !matches!(
+                cli.mode,
+                LaunchMode::Tui | LaunchMode::Help | LaunchMode::Version
+            )
+        {
+            return Err("--no-tips only applies to the interactive TUI".into());
         }
         apply_secret_redaction(cli, redact_secrets)
     }
@@ -2189,28 +2246,61 @@ fn parse_expectation(value: &str) -> Result<CheckExpectation, String> {
 }
 
 fn parse_diff(arguments: &[String]) -> Result<Cli, String> {
-    let mut mode = LaunchMode::DiffTable;
+    let mut cli = Cli {
+        mode: LaunchMode::DiffTable,
+        ..Cli::default()
+    };
     let mut output_mode = None;
+    let mut fail_on_set = false;
+    let mut output_path_set = false;
     let mut paths = Vec::new();
-    for argument in arguments {
+    let mut arguments = arguments.iter().cloned().peekable();
+    while let Some(argument) = arguments.next() {
         match argument.as_str() {
-            "-h" | "--help" => mode = LaunchMode::Help,
-            "-V" | "--version" => mode = LaunchMode::Version,
-            "--table" => set_diff_output_mode(&mut mode, &mut output_mode, LaunchMode::DiffTable)?,
+            "-h" | "--help" => cli.mode = LaunchMode::Help,
+            "-V" | "--version" => cli.mode = LaunchMode::Version,
+            "--table" => {
+                set_diff_output_mode(&mut cli.mode, &mut output_mode, LaunchMode::DiffTable)?
+            }
             "--json" => {
-                set_diff_output_mode(&mut mode, &mut output_mode, LaunchMode::DiffJson)?;
+                set_diff_output_mode(&mut cli.mode, &mut output_mode, LaunchMode::DiffJson)?;
+            }
+            "--quiet" => cli.quiet = true,
+            "--force" => cli.diff_force = true,
+            "--fail-on" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "diff --fail-on requires never or regression".to_string())?;
+                set_diff_fail_on(&mut cli, &mut fail_on_set, &value)?;
+            }
+            "--output" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "diff --output requires a file path".to_string())?;
+                set_diff_output_path(&mut cli, &mut output_path_set, value)?;
+            }
+            _ if argument.starts_with("--fail-on=") => {
+                set_diff_fail_on(
+                    &mut cli,
+                    &mut fail_on_set,
+                    argument.trim_start_matches("--fail-on="),
+                )?;
+            }
+            _ if argument.starts_with("--output=") => {
+                set_diff_output_path(
+                    &mut cli,
+                    &mut output_path_set,
+                    argument.trim_start_matches("--output=").to_string(),
+                )?;
             }
             _ if argument.starts_with('-') => {
                 return Err(format!("unknown diff option: {argument}"));
             }
-            _ => paths.push(argument.clone()),
+            _ => paths.push(argument),
         }
     }
-    if matches!(mode, LaunchMode::Help | LaunchMode::Version) {
-        return Ok(Cli {
-            mode,
-            ..Cli::default()
-        });
+    if matches!(cli.mode, LaunchMode::Help | LaunchMode::Version) {
+        return Ok(cli);
     }
     if paths.len() != 2 {
         return Err(format!(
@@ -2218,11 +2308,49 @@ fn parse_diff(arguments: &[String]) -> Result<Cli, String> {
             paths.len()
         ));
     }
-    Ok(Cli {
-        mode,
-        diff_paths: Some((paths.remove(0), paths.remove(0))),
-        ..Cli::default()
-    })
+    if cli.diff_output.is_some() {
+        if output_mode == Some(LaunchMode::DiffTable) {
+            return Err("diff --output writes JSON and cannot be combined with --table".into());
+        }
+        cli.mode = LaunchMode::DiffJson;
+    }
+    if cli.diff_force && cli.diff_output.is_none() {
+        return Err("diff --force requires --output FILE".into());
+    }
+    if cli.quiet && cli.diff_fail_on == DiffFailOn::Never && cli.diff_output.is_none() {
+        return Err("diff --quiet requires --fail-on regression or --output FILE".into());
+    }
+    cli.diff_paths = Some((paths.remove(0), paths.remove(0)));
+    Ok(cli)
+}
+
+fn set_diff_fail_on(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+    if *value_set {
+        return Err("diff --fail-on may only be specified once".into());
+    }
+    cli.diff_fail_on = match value.to_ascii_lowercase().as_str() {
+        "never" | "none" => DiffFailOn::Never,
+        "regression" | "regress" => DiffFailOn::Regression,
+        _ => {
+            return Err(format!(
+                "invalid diff --fail-on value: {value}; use never or regression"
+            ));
+        }
+    };
+    *value_set = true;
+    Ok(())
+}
+
+fn set_diff_output_path(cli: &mut Cli, value_set: &mut bool, value: String) -> Result<(), String> {
+    if *value_set {
+        return Err("diff --output may only be specified once".into());
+    }
+    if value.is_empty() || value == "-" {
+        return Err("diff --output requires a file path; use --json for stdout".into());
+    }
+    cli.diff_output = Some(value);
+    *value_set = true;
+    Ok(())
 }
 
 fn set_diff_output_mode(
@@ -2301,11 +2429,12 @@ COMMANDS:
   top         Rank current CPU, memory, and disk I/O hotspots
   oom         Diagnose Linux memory pressure and OOM kill priority
   doctor      Run conservative host and process triage in one command
-  diff        Compare two psmore process snapshot JSON files
+  diff        Compare two process snapshots or host-doctor reports
   completion  Generate shell completion for bash, zsh, or fish
 
 GLOBAL OPTIONS:
   -q, --query QUERY   Start the TUI filtered, or filter snapshot rows
+      --no-tips       Skip first-run help or the startup tip for this TUI run
       --table         Print a human-readable process snapshot and exit
       --json          Print a versioned JSON process snapshot and exit
       --sample-ms MS  CPU and I/O sampling interval, 100-60000 [default: 500]
@@ -2611,22 +2740,40 @@ EXAMPLES:
 "
         }
         Some(HelpTopic::Diff) => {
-            "psmore diff - compare two persistent process snapshots
+            "psmore diff - compare two persistent diagnostic reports
 
 USAGE:
   psmore diff BEFORE.json AFTER.json [--table|--json]
+              [--output FILE [--force]] [--fail-on never|regression] [--quiet]
 
 OPTIONS:
-      --table  Human-readable lifecycle and resource delta report [default]
-      --json   Versioned machine-readable difference
-      --redact Mask common secret values in emitted command lines
+      --table      Human-readable lifecycle or health-evidence delta [default]
+      --json       Versioned machine-readable difference
+      --output F   Atomically write private JSON instead of the report to stdout
+      --force      Atomically replace F; default refuses an existing path
+      --fail-on L  Exit 3 for a doctor regression [default: never]
+      --quiet      Suppress stdout; requires --fail-on regression or --output
+      --redact     Mask common secret values in emitted command lines
 
-Inputs must be compatible psmore.process-snapshot v1 documents from the same
-host, platform, and query scope, with AFTER not older than BEFORE.
-EXAMPLE:
+Inputs may be either two psmore.process-snapshot v1 documents or two
+psmore.host-doctor v1 documents. They must have the same host, platform, query
+scope, and report kind, with AFTER not older than BEFORE. Doctor reports must
+also both use --deep or both omit it.
+For doctor reports, regression means any newly observed finding or warning to
+critical escalation. A disappearance under incomplete deep evidence is marked
+unconfirmed and never claimed as a resolution. Snapshot diffs do not accept
+--fail-on regression because resource movement has no universal failure meaning.
+EXIT: 0 report/pass, 1 read/write error, 2 usage/input-policy error, 3 regression
+EXAMPLES:
   psmore --json > before.json
   psmore --json > after.json
   psmore diff before.json after.json
+  psmore doctor --deep --output doctor-before.json
+  psmore doctor --deep --output doctor-after.json
+  psmore diff doctor-before.json doctor-after.json
+  psmore diff doctor-before.json doctor-after.json --fail-on regression --quiet
+  psmore diff doctor-before.json doctor-after.json --fail-on regression \
+    --output doctor-regression.json
 "
         }
         Some(HelpTopic::Completion) => {
@@ -2668,8 +2815,12 @@ mod tests {
                 help_topic: None,
                 completion_shell: None,
                 query: "user:deploy".into(),
+                tui_no_tips: false,
                 sample_ms: 1_200,
                 diff_paths: None,
+                diff_fail_on: DiffFailOn::Never,
+                diff_output: None,
+                diff_force: false,
                 inspect_pid: None,
                 port: None,
                 port_protocol: PortProtocol::Any,
@@ -2824,6 +2975,28 @@ mod tests {
             }
         );
         assert_eq!(
+            Cli::parse([
+                "diff",
+                "before.json",
+                "after.json",
+                "--fail-on=regression",
+                "--output",
+                "diff.json",
+                "--force",
+                "--quiet"
+            ])
+            .unwrap(),
+            Cli {
+                mode: LaunchMode::DiffJson,
+                diff_paths: Some(("before.json".into(), "after.json".into())),
+                diff_fail_on: DiffFailOn::Regression,
+                diff_output: Some("diff.json".into()),
+                diff_force: true,
+                quiet: true,
+                ..Cli::default()
+            }
+        );
+        assert_eq!(
             Cli::parse(["inspect", "1234", "--json", "--sample-ms=300"]).unwrap(),
             Cli {
                 mode: LaunchMode::InspectJson,
@@ -2896,6 +3069,8 @@ mod tests {
                 .query,
             "--redact"
         );
+        assert!(Cli::parse(["--no-tips"]).unwrap().tui_no_tips);
+        assert!(Cli::parse(["--no-onboarding"]).unwrap().tui_no_tips);
         assert_eq!(
             Cli::parse([
                 "top",
@@ -3147,6 +3322,16 @@ mod tests {
         assert!(Cli::parse(["doctor", "--output=a", "--output=b"]).is_err());
         assert!(Cli::parse(["doctor", "--output=a", "--table"]).is_err());
         assert!(Cli::parse(["doctor", "--force"]).is_err());
+        assert!(Cli::parse(["diff", "a", "b", "--fail-on=warning"]).is_err());
+        assert!(Cli::parse(["diff", "a", "b", "--fail-on=never", "--fail-on=regression"]).is_err());
+        assert!(Cli::parse(["diff", "a", "b", "--quiet"]).is_err());
+        assert!(Cli::parse(["diff", "a", "b", "--force"]).is_err());
+        assert!(Cli::parse(["diff", "a", "b", "--output=-"]).is_err());
+        assert!(Cli::parse(["diff", "a", "b", "--output="]).is_err());
+        assert!(Cli::parse(["diff", "a", "b", "--output=x", "--table"]).is_err());
+        assert!(Cli::parse(["diff", "a", "b", "--output=x", "--output=y"]).is_err());
+        assert!(Cli::parse(["--no-tips", "--no-tips"]).is_err());
+        assert!(Cli::parse(["--no-tips", "--table"]).is_err());
         assert!(Cli::parse(["--redact"]).is_err());
         assert!(Cli::parse(["--redact", "--redact", "--table"]).is_err());
         assert!(Cli::parse(["completion"]).is_err());

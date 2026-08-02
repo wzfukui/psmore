@@ -19,6 +19,7 @@ use crate::{
         ProcessEvent, ProcessInspection, TreeRow, TrendView, process_command_line, process_path,
     },
     network::NetworkEndpoint,
+    onboarding::{GUIDANCE_PAGE_COUNT, GuidanceOverlay, TIPS},
     provider::platform_name,
     snapshot::{ProcessSnapshotEntry, SnapshotDiff},
 };
@@ -1703,6 +1704,226 @@ fn draw_notice(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+fn guidance_key(key: &'static str, description: &'static str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("  {key:<12}"),
+            Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(description, Style::default().fg(Color::White)),
+    ])
+}
+
+fn guidance_section(title: &'static str) -> Line<'static> {
+    Line::from(Span::styled(
+        format!(" {title}"),
+        Style::default()
+            .fg(Color::LightMagenta)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn guidance_page(page: usize) -> Vec<Line<'static>> {
+    match page % GUIDANCE_PAGE_COUNT {
+        0 => vec![
+            Line::from(""),
+            guidance_section("UNDERSTAND THE PROCESS TREE"),
+            Line::from(Span::styled(
+                " See who started it, what it owns, and the cost of the complete service.",
+                Style::default().fg(Color::Gray),
+            )),
+            Line::from(""),
+            guidance_key("↑↓ / j k", "move through stable process rows"),
+            guidance_key("← / →", "reveal parent; expand or collapse children"),
+            guidance_key(
+                "/",
+                "find by text or query CPU, memory, age, user, and subtree",
+            ),
+            guidance_key("f", "focus the selected parent chain and service subtree"),
+            guidance_key(
+                "Enter",
+                "inspect threads, sockets, files, and runtime context",
+            ),
+            Line::from(""),
+            Line::from(Span::styled(
+                " Query example:  user:deploy tree.mem>2g !state:zombie",
+                Style::default().fg(Color::Yellow),
+            )),
+        ],
+        1 => vec![
+            Line::from(""),
+            guidance_section("MOVE FROM SYMPTOM TO EVIDENCE"),
+            Line::from(Span::styled(
+                " Workspaces keep process ownership attached to every signal.",
+                Style::default().fg(Color::Gray),
+            )),
+            Line::from(""),
+            guidance_key(
+                "a",
+                "attention: unhealthy state, churn, pressure, and growth",
+            ),
+            guidance_key("h", "CPU, memory, read, and write hotspot workbench"),
+            guidance_key("t", "recent own and complete-subtree resource trend"),
+            guidance_key("n", "listeners, connections, peers, owners, and namespaces"),
+            guidance_key("b / d / x", "capture baseline, compare, and clear"),
+            guidance_key("Space / r", "freeze the scene; sample manually"),
+            Line::from(""),
+            Line::from(Span::styled(
+                " Tip: hotspot panels use v to switch process vs service-tree scope.",
+                Style::default().fg(Color::Yellow),
+            )),
+        ],
+        _ => vec![
+            Line::from(""),
+            guidance_section("OPERATE CAREFULLY · SHARE USEFULLY"),
+            Line::from(Span::styled(
+                " Actions are confirmed and identity-checked; reports preserve your context.",
+                Style::default().fg(Color::Gray),
+            )),
+            Line::from(""),
+            guidance_key("p", "TERM, KILL, STOP, or CONT with explicit confirmation"),
+            guidance_key("e", "recent process changes and action audit"),
+            guidance_key("o", "export a private, versioned diagnostic report"),
+            guidance_key("s", "cycle stable and service-tree hotspot sorting"),
+            guidance_key("?", "open this field guide at any time"),
+            guidance_key("q / Ctrl-C", "leave psmore"),
+            Line::from(""),
+            Line::from(Span::styled(
+                " CLI companions: doctor, inspect, tree, listen, net, trace, diff",
+                Style::default().fg(Color::Yellow),
+            )),
+        ],
+    }
+}
+
+fn draw_guidance_overlay(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(overlay) = app.guidance.overlay else {
+        return;
+    };
+    let is_tip = matches!(overlay, GuidanceOverlay::Tip(_));
+    let max_width = if is_tip { 72 } else { 100 };
+    let max_height = if is_tip { 11 } else { 24 };
+    let width = area.width.saturating_sub(2).min(max_width).max(1);
+    let height = area.height.saturating_sub(2).min(max_height).max(1);
+    let popup = if is_tip {
+        Rect::new(
+            area.x
+                .saturating_add(area.width.saturating_sub(width).saturating_sub(1)),
+            area.y
+                .saturating_add(area.height.saturating_sub(height).saturating_sub(2)),
+            width,
+            height,
+        )
+    } else {
+        Rect::new(
+            area.x + area.width.saturating_sub(width) / 2,
+            area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        )
+    };
+    let border_color = if is_tip {
+        Color::LightMagenta
+    } else {
+        Color::LightCyan
+    };
+    let title = match overlay {
+        GuidanceOverlay::Welcome => " WELCOME TO PSMORE · SEE THE SYSTEM THROUGH ITS PROCESSES ",
+        GuidanceOverlay::Help => " PSMORE FIELD GUIDE ",
+        GuidanceOverlay::Tip(index) => {
+            let title = format!(" PSMORE TIP {}/{} ", index + 1, TIPS.len());
+            frame.render_widget(Clear, popup);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border_color))
+                .title(Span::styled(
+                    title,
+                    Style::default()
+                        .fg(Color::LightMagenta)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            let Some(tip) = app.guidance.tip() else {
+                frame.render_widget(block, popup);
+                return;
+            };
+            let lines = vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!(" {}", tip.title),
+                    Style::default()
+                        .fg(Color::LightCyan)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(format!(" {}", tip.body)),
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!(" {}", tip.keys),
+                    Style::default().fg(Color::Yellow),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!(
+                        " Any other key continues · ? guide · T future tips {} · D disable",
+                        if app.guidance.tips_enabled() {
+                            "ON"
+                        } else {
+                            "OFF"
+                        }
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ];
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .block(block)
+                    .wrap(Wrap { trim: false }),
+                popup,
+            );
+            return;
+        }
+    };
+    let mut lines = guidance_page(app.guidance.page);
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!(
+            " ←/→ page {}/{} · Enter/Esc close · T tips {} · D never show startup cards{}",
+            app.guidance.page + 1,
+            GUIDANCE_PAGE_COUNT,
+            if app.guidance.tips_enabled() {
+                "ON"
+            } else {
+                "OFF"
+            },
+            if matches!(overlay, GuidanceOverlay::Help) {
+                " · ? close"
+            } else {
+                ""
+            },
+        ),
+        Style::default().fg(Color::DarkGray),
+    )));
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(border_color))
+                    .title(Span::styled(
+                        title,
+                        Style::default()
+                            .fg(Color::LightCyan)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+            )
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
 pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     let detail_height = detail_height(app, area);
@@ -1899,7 +2120,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     } else if !app.search.is_empty() {
         " filter active | / new search or clear | ↑↓/jk move | Enter inspect | q quit ".into()
     } else {
-        " ↑↓/jk move | ←/→ tree | / find | a attention | h hot | s sort | p actions | t trend | n network | b base | d diff | o report ".into()
+        " ↑↓/jk move | ←/→ tree | / find | a attention | h hot | s sort | p actions | t trend | n network | b base | d diff | o report | ? help ".into()
     };
     let footer = Paragraph::new(vec![
         Line::from(format!(
@@ -1942,4 +2163,81 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         draw_process_action_overlay(frame, app, area);
     }
     draw_notice(frame, app, area);
+    draw_guidance_overlay(frame, app, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    use super::*;
+    use crate::onboarding::Guidance;
+
+    fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        let mut output = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                if let Some(cell) = buffer.cell((x, y)) {
+                    output.push_str(cell.symbol());
+                }
+            }
+            output.push('\n');
+        }
+        output
+    }
+
+    #[test]
+    fn welcome_and_tip_overlays_render_and_handle_navigation() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        let backend = TestBackend::new(100, 28);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let first_page = buffer_text(&terminal);
+        assert!(first_page.contains("WELCOME TO PSMORE"));
+        assert!(first_page.contains("UNDERSTAND THE PROCESS TREE"));
+        assert!(first_page.contains("page 1/3"));
+
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let second_page = buffer_text(&terminal);
+        assert!(second_page.contains("MOVE FROM SYMPTOM TO EVIDENCE"));
+        assert!(second_page.contains("page 2/3"));
+
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.guidance.is_open());
+
+        app.guidance = Guidance::tip_for_test(0);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let tip = buffer_text(&terminal);
+        assert!(tip.contains("PSMORE TIP 1/10"));
+        assert!(tip.contains("Reveal the real parent chain"));
+        assert!(tip.contains("Any other key continues"));
+        let tip_row = tip
+            .lines()
+            .position(|line| line.contains("PSMORE TIP 1/10"))
+            .unwrap();
+        assert!(
+            tip_row >= 14,
+            "tip should stay near the bottom: row {tip_row}"
+        );
+
+        app.on_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(buffer_text(&terminal).contains("PSMORE FIELD GUIDE"));
+    }
+
+    #[test]
+    fn welcome_is_modal_but_a_tip_never_steals_the_first_working_key() {
+        let mut welcome = App::new_for_test(Guidance::welcome_for_test());
+        welcome.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(welcome.guidance.is_open());
+        assert!(!welcome.paused);
+
+        let mut tip = App::new_for_test(Guidance::tip_for_test(0));
+        tip.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(!tip.guidance.is_open());
+        assert!(tip.paused);
+    }
 }

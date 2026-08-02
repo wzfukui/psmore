@@ -23,6 +23,7 @@ use crate::{
         process_path,
     },
     network::{NetworkScan, NetworkScope, scan_network},
+    onboarding::{Guidance, GuidanceOverlay},
     provider::{NativeProcessProvider, ProcessProvider, platform_name},
     query::ProcessQuery,
     report::{ReportInput, export_report},
@@ -501,15 +502,22 @@ pub(crate) struct App {
     pub(crate) inspection_scroll: u16,
     pub(crate) process_action: Option<ProcessActionDialog>,
     pub(crate) action_history: Vec<ProcessActionRecord>,
+    pub(crate) guidance: Guidance,
 }
 
 impl App {
-    pub(crate) fn new() -> Self {
-        Self::new_with_query(String::new())
+    #[cfg(test)]
+    pub(crate) fn new_for_test(guidance: Guidance) -> Self {
+        Self::new_with_guidance(String::new(), guidance)
     }
 
-    pub(crate) fn new_with_query(query: String) -> Self {
+    pub(crate) fn new_for_tui(query: String, suppress_guidance: bool) -> Self {
+        Self::new_with_guidance(query, Guidance::load_default(suppress_guidance))
+    }
+
+    fn new_with_guidance(query: String, mut guidance: Guidance) -> Self {
         let has_initial_query = !query.is_empty();
+        let guidance_warning = guidance.take_warning();
         let mut app = Self {
             provider: NativeProcessProvider::new(),
             processes: HashMap::new(),
@@ -561,7 +569,15 @@ impl App {
             inspection_scroll: 0,
             process_action: None,
             action_history: Vec::new(),
+            guidance,
         };
+        if let Some(message) = guidance_warning {
+            app.notice = Some(StatusNotice {
+                message,
+                is_error: true,
+                observed_at: Instant::now(),
+            });
+        }
         app.refresh();
         if has_initial_query {
             app.select_first_match();
@@ -1560,9 +1576,98 @@ impl App {
         }
     }
 
+    fn guidance_error_notice(&mut self, action: &str, error: std::io::Error) {
+        self.notice = Some(StatusNotice {
+            message: format!("{action}, but the preference could not be saved: {error}"),
+            is_error: true,
+            observed_at: Instant::now(),
+        });
+    }
+
+    fn dismiss_guidance(&mut self) {
+        if let Err(error) = self.guidance.dismiss() {
+            self.guidance_error_notice("Guidance closed", error);
+        }
+    }
+
+    fn disable_startup_guidance(&mut self) {
+        if let Err(error) = self.guidance.disable_startup() {
+            self.guidance_error_notice("Startup cards disabled for this session", error);
+        } else {
+            self.notice = Some(StatusNotice {
+                message: "Startup help and tips disabled; press ? then T to enable tips again"
+                    .into(),
+                is_error: false,
+                observed_at: Instant::now(),
+            });
+        }
+    }
+
+    fn toggle_startup_tips(&mut self) {
+        match self.guidance.toggle_tips() {
+            Ok(enabled) => {
+                self.notice = Some(StatusNotice {
+                    message: format!(
+                        "Startup tips {}",
+                        if enabled { "enabled" } else { "disabled" }
+                    ),
+                    is_error: false,
+                    observed_at: Instant::now(),
+                });
+            }
+            Err(error) => {
+                self.guidance_error_notice("Tip preference changed for this session", error)
+            }
+        }
+    }
+
     pub(crate) fn on_key(&mut self, key: KeyEvent) -> bool {
         if key.kind != KeyEventKind::Press {
             return false;
+        }
+        if let Some(overlay) = self.guidance.overlay {
+            if matches!(overlay, GuidanceOverlay::Tip(_)) {
+                match key.code {
+                    KeyCode::Char('q') => return true,
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return true;
+                    }
+                    KeyCode::Esc | KeyCode::Enter => {
+                        self.dismiss_guidance();
+                        return false;
+                    }
+                    KeyCode::Char('d' | 'D') => {
+                        self.disable_startup_guidance();
+                        return false;
+                    }
+                    KeyCode::Char('t' | 'T') => {
+                        self.toggle_startup_tips();
+                        return false;
+                    }
+                    KeyCode::Char('?') => {
+                        self.guidance.open_help();
+                        return false;
+                    }
+                    _ => self.dismiss_guidance(),
+                }
+            } else {
+                match key.code {
+                    KeyCode::Char('q') => return true,
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return true;
+                    }
+                    KeyCode::Esc | KeyCode::Enter => self.dismiss_guidance(),
+                    KeyCode::Left | KeyCode::Up => self.guidance.previous_page(),
+                    KeyCode::Right | KeyCode::Down | KeyCode::Tab => self.guidance.next_page(),
+                    KeyCode::Char('d' | 'D') => self.disable_startup_guidance(),
+                    KeyCode::Char('t' | 'T') => self.toggle_startup_tips(),
+                    KeyCode::Char('?') if overlay == GuidanceOverlay::Help => {
+                        self.dismiss_guidance();
+                    }
+                    _ => {}
+                }
+                return false;
+            }
         }
         if !self.searching
             && !self.network_searching
@@ -1932,6 +2037,7 @@ impl App {
             KeyCode::Char('h') => self.open_hotspots(),
             KeyCode::Char('a') => self.open_attention(),
             KeyCode::Char('p') => self.open_selected_process_action(),
+            KeyCode::Char('?') => self.guidance.open_help(),
             KeyCode::Enter => self.open_inspection(),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
             _ => {}

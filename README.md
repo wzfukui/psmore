@@ -11,6 +11,7 @@
 - 上方以树展示进程父子关系，PID 0 是用于承接系统根、不可见父进程和采集期间消失进程的虚拟根节点
 - 下方显示当前节点的 PID、PPID、子进程数、状态、CPU、内存、磁盘读写速率、运行时间、路径和命令
 - 下方同时聚合当前进程与全部后代的进程数、CPU、内存和磁盘 I/O，便于判断一个完整服务树的真实资源占用
+- 首次进入 TUI 显示三页可翻阅的现场手册；随后 10 次启动各显示一条不阻塞键盘的高级 tip，完成一轮后自动停止，并可随时按 `?` 重新打开
 - 每一行在 PID 后显示命令行，若命令行不可用则显示可执行文件路径
 - 同级进程按名称、PID 确定性排序，刷新时不会因 HashMap 或同名进程导致顺序漂移
 - 键盘导航，实时搜索/过滤，聚焦当前进程的父链和子树
@@ -48,7 +49,7 @@
 - 无交互模式执行两次采样，默认间隔 500 ms，使 CPU 与磁盘 I/O 速率具有实际意义；可用 `--sample-ms` 在 100–60000 ms 之间调整
 - 所有无交互表格、JSON 和 JSONL 输出支持 `--redact`：在保留命令结构的同时遮盖常见密码、token、API key、认证 header、URL userinfo 和敏感查询参数
 - `psmore doctor` 提供一条命令的保守主机体检：快速模式结合有效内存、Swap、持续负载、异常进程状态和四类热点榜；显式 `--deep` 再并行扫描网络暴露、FD 压力、已删除仍占用文件及 Linux OOM/PSI 证据
-- `psmore diff BEFORE.json AFTER.json` 将两份持久快照对比为启动/退出、PID 复用、父进程变化，以及 CPU、内存、I/O 和子树进程数增量；默认输出透明的分类榜单，增加 `--json` 可获得完整机器可读差异
+- `psmore diff BEFORE.json AFTER.json` 自动识别进程快照或主机体检报告：前者对比启动/退出、PID 复用、父进程与资源增量，后者对比新观察到/恢复/持续信号、严重度以及主机和 deep 证据变化；支持 `--fail-on regression --quiet` 发布门禁和 `--output` 私有原子归档
 - `psmore check QUERY` 将任意结构化查询变成 CI/运维健康门禁：默认期望零命中，`--expect any` 可反向要求服务存在；支持表格、`psmore.check-result` JSON 和完全静默的 `--quiet`
 - `psmore inspect PID` 将 TUI 深度检查直接带到 SSH、脚本和事故工单：一次输出进程身份、完整命令、热点线程、socket、打开文件及平台运行上下文，也可导出 `psmore.process-inspection` JSON
 - `psmore port PORT` 直接回答“谁占用了这个端口”：将 TCP/UDP 本地端点关联到 PID、用户、完整命令、FD 和 Linux 网络 namespace，并可作为端口存在/释放健康门禁
@@ -63,6 +64,20 @@
 - `psmore fd` 对全系统打开的文件描述符做风险排名：展示 PID、用户、完整命令、FD 数量以及 Linux 软/硬限制和使用率，可直接作为 FD 泄漏或耗尽的巡检门禁
 - 深度检查仅在打开或手动刷新面板时启动后台采样：macOS 调用一次 `lsof`，Linux 直接读取目标进程的 `/proc`，不会加入两秒一次的全局刷新
 - 每 2 秒从系统进程数据刷新一次
+
+### 首次使用与渐进提示
+
+第一次进入交互界面时，psmore 会展示三页现场手册，将主要能力按“理解进程树 → 从症状找到证据 → 安全操作与分享”组织起来。使用 `←`/`→`、`↑`/`↓` 或 `Tab` 翻页，`Enter`/`Esc` 开始工作；`q` 和 `Ctrl-C` 始终可以直接退出。
+
+完成首次手册后，接下来的 10 次启动会依次在右下角展示一条高级 tip，覆盖子树查询、热点、基线、网络、趋势和安全操作。Tip 不会抢走工作键：除 `Enter`、`Esc`、`?`、`T`、`D` 外，按下任意键都会关闭 tip 并继续执行该键原本的操作，例如 `Space` 仍会立即暂停、`/` 仍会开始查询。十条完成后默认自动停止，不会永久循环打扰熟练用户。
+
+任何时候按 `?` 都能打开完整现场手册。引导内按 `T` 切换未来启动 tip，按 `D` 永久关闭启动卡片；只想本次跳过可运行：
+
+```bash
+psmore --no-tips
+```
+
+偏好以 schema 化 JSON 私有保存：macOS 位于 `~/Library/Application Support/psmore/ui-state.json`，Linux 位于 `${XDG_CONFIG_HOME:-~/.config}/psmore/ui-state.json`。目录新建时权限为 `0700`，状态文件通过同目录临时文件原子写入并使用 `0600`；测试、便携环境或受管部署可用 `PSMORE_CONFIG_DIR` 改变目录。状态损坏、版本不兼容或不可写时，TUI 仍会启动，并把问题显示为可见提示，不会因为教学功能阻断诊断工作。
 
 ## 实时查询
 
@@ -88,6 +103,18 @@
 ```bash
 cargo run --release
 ```
+
+首次进入交互界面会打开 `psmore field guide`，用三页说明进程树、诊断工作台和安全操作。按 `←`/`→` 翻页，`Enter` 或 `Esc` 开始使用；后续启动只显示一条轮换 tip，并持续循环直到用户主动关闭，不会每次遮住整个界面：
+
+```bash
+# 只跳过本次启动的欢迎页或 tip，不改变持久偏好
+psmore --no-tips
+
+# 也接受语义更完整的别名
+psmore --no-onboarding
+```
+
+在欢迎页、tip 或按 `?` 打开的帮助中，按 `T` 切换后续启动 tips，按 `D` 永久关闭所有启动卡片；关闭后仍可按 `?` 打开帮助并用 `T` 重新启用。偏好状态使用私有原子文件：macOS 默认位于 `~/Library/Application Support/psmore/ui-state.json`，Linux 默认位于 `${XDG_CONFIG_HOME:-~/.config}/psmore/ui-state.json`；测试、便携安装或受管环境可用 `PSMORE_CONFIG_DIR` 指定目录。状态文件不保存进程信息，Unix 权限为 `0600`。
 
 从当前源码安装到 Cargo 的用户二进制目录：
 
@@ -480,9 +507,9 @@ psmore deleted --min-size 500m --expect none --quiet
 
 JSON 使用 `psmore.deleted-open-files` schema v1，包含唯一文件数、FD 引用数、持有进程数、逻辑大小、预计可释放字节、PID/命令、路径及 inode 身份。指定 `--expect any|none` 后，已确认违反策略退出 `3`；如果零命中但权限或采集竞态使扫描不完整，策略状态为 `inconclusive`、`passed` 为 `null`，命令退出 `1`，不会把“看不见”误判成“没有”。`--quiet` 必须与 expectation 一起使用。psmore 只诊断，不会关闭 FD、截断 `/proc/<pid>/fd/*` 或向进程发送信号；确认业务影响后应优先正常重启或关闭持有进程。
 
-### 持久快照对比
+### 持久诊断报告对比
 
-TUI 的 `b`/`d` 适合现场即时观察；需要跨命令、跨发布步骤或保留审计证据时，可以保存两份无交互快照再比较：
+TUI 的 `b`/`d` 适合现场即时观察；需要跨命令、跨发布步骤或保留审计证据时，可以保存两份无交互报告再比较。`diff` 会根据顶层 schema 自动识别进程快照或主机体检：
 
 ```bash
 psmore --json > before.json
@@ -494,11 +521,35 @@ psmore diff before.json after.json
 
 # 完整结果：适合 CI 规则、归档或后续分析
 psmore diff before.json after.json --json > diff.json
+
+# 发布前后保存同口径的一键体检；--deep 必须两侧一致
+psmore doctor --deep --redact --output doctor-before.json
+# 执行发布或故障修复
+psmore doctor --deep --redact --output doctor-after.json
+
+# 直接查看哪些信号新增、恢复、持续或发生严重度变化
+psmore diff doctor-before.json doctor-after.json
+
+# JSON schema 为 psmore.host-doctor-diff v1
+psmore diff doctor-before.json doctor-after.json --json > doctor-diff.json
+
+# 发布门禁：新观察到任意 finding 或 warning 升级为 critical 时退出 3
+psmore diff doctor-before.json doctor-after.json --fail-on regression --quiet
+
+# 门禁结果仍可安全归档；文件为 0600，默认拒绝覆盖
+psmore diff doctor-before.json doctor-after.json --fail-on regression \
+  --output doctor-regression.json
 ```
 
-diff 只接受 `psmore.process-snapshot` schema v1，并要求两份快照的平台、主机名和查询字符串完全一致，且 AFTER 的时间不早于 BEFORE。它还会拒绝重复 PID、行数元数据不一致和虚拟 PID 0 等损坏输入，避免跨主机或不同筛选范围产生看似合理但错误的结论。
+两份输入必须是相同报告类型，并要求平台、主机名和查询字符串完全一致，且 AFTER 的时间不早于 BEFORE。doctor 报告还要求两侧都使用 `--deep` 或都不使用，避免把采集范围变化误判成健康变化。不同 schema、不同主机、不同查询、quick/deep 混比以及损坏元数据都会被明确拒绝。
 
 未使用 `--query` 的完整快照中，“出现/消失”代表进程启动/退出。若两份快照使用了相同查询，diff 仍可比较，但会明确写成“进入/离开筛选结果”，因为 `cpu>20` 之类的动态条件变化不能证明进程生命周期。PID 复用继续以启动时间识别；启动时间两侧都不可用时，才回退到进程名和命令行。
+
+doctor 对比使用稳定 finding code 识别同一类信号，分别列出新观察到、确认恢复、持续和 warning/critical 严重度变化；同时展示有效可用内存、Swap、归一化 15 分钟负载、进程数的前后值与增量。deep 报告还比较暴露监听、FD 压力、已删除文件预计可回收空间，以及 Linux OOM/PSI 计数，并保留采集完整性。若后一次 FD、deleted-open 或 PSI 证据不完整，对应 finding 消失只会归入 `NO LONGER OBSERVED`，不会宣称已经恢复。所有变化仍是两次采样之间的证据，不是已确认根因。
+
+`--fail-on regression` 只适用于 doctor 报告：任何新观察到的 finding，或同一 finding 从 warning 升级为 critical，都使策略失败并退出 `3`；finding 恢复、严重度降低和“因证据不完整而未再观察到”都不会失败。进程快照的 CPU、内存和生命周期变化没有通用的好坏含义，因此快照 diff 会明确拒绝该门禁，不制造武断阈值。`--quiet` 可让 CI 仅读取退出码。
+
+`diff --output FILE` 与 doctor 安全报告使用同一套写入保证：自动选择 JSON，同目录创建 `0600` 临时文件，完整写入并同步后原子发布；默认 no-replace，只有 `--force` 才替换已有文件。成功后标准输出只给出路径、报告类型和回归摘要，配合 `--quiet` 完全静默。JSON 的 `policy` 字段记录本次 `fail_on`、pass/fail 状态和精确定义，便于审计。
 
 快捷键：
 
@@ -522,6 +573,7 @@ diff 只接受 `psmore.process-snapshot` schema v1，并要求两份快照的平
 | `n` | 打开全局网络面板；`v` 切换监听/全部连接，`/` 过滤，`r` 重新扫描，`Enter` 跳到所有者进程，`Esc` 或 `n` 关闭 |
 | `p` | 打开选中进程的操作中心；选择 TERM/KILL/STOP/CONT 后，另按 `y` 才发送信号，`Esc` 取消 |
 | `o` | 将当前诊断上下文导出到工作目录中的 `psmore-report-*.json`；任意面板内均可使用 |
+| `?` | 打开三页现场帮助；帮助内 `T` 切换启动 tips，`D` 永久关闭启动卡片 |
 | `Enter` | 深度检查选中进程；面板内 `↑`/`↓` 滚动，`Enter`/`r` 重新采样，`Esc` 关闭 |
 | `q` / `Esc` | 退出 |
 
