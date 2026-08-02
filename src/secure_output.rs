@@ -28,9 +28,8 @@ fn sync_directory(directory: &Path) -> io::Result<()> {
     }
 }
 
-pub(crate) fn write_secure_atomic(path: &Path, contents: &[u8], force: bool) -> io::Result<()> {
-    let filename = path
-        .file_name()
+pub(crate) fn validate_secure_output_target(path: &Path, force: bool) -> io::Result<()> {
+    path.file_name()
         .filter(|name| !name.is_empty())
         .ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "output path must name a file")
@@ -45,6 +44,28 @@ pub(crate) fn write_secure_atomic(path: &Path, contents: &[u8], force: bool) -> 
             format!("output directory does not exist: {}", parent.display()),
         ));
     }
+    match fs::symlink_metadata(path) {
+        Ok(_) if !force => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("output already exists: {}", path.display()),
+        )),
+        Ok(metadata) if !metadata.file_type().is_file() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("--force only replaces a regular file: {}", path.display()),
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn write_secure_atomic(path: &Path, contents: &[u8], force: bool) -> io::Result<()> {
+    validate_secure_output_target(path, force)?;
+    let filename = path.file_name().expect("validated output file name");
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
 
     let mut temporary = None;
     for attempt in 0..1_000_u32 {
@@ -154,7 +175,10 @@ mod tests {
         let directory_error = write_secure_atomic(&directory, b"data", true).unwrap_err();
         assert!(matches!(
             directory_error.kind(),
-            io::ErrorKind::IsADirectory | io::ErrorKind::PermissionDenied | io::ErrorKind::Other
+            io::ErrorKind::IsADirectory
+                | io::ErrorKind::PermissionDenied
+                | io::ErrorKind::InvalidInput
+                | io::ErrorKind::Other
         ));
         let missing = directory.join("missing").join("doctor.json");
         let missing_error = write_secure_atomic(&missing, b"data", false).unwrap_err();

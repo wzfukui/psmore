@@ -3,6 +3,12 @@ name = "psmore"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
+authors = ["wzfukui <fukui@wuzhi-ai.com>"]
+description = "A relationship-first process diagnostics workbench for macOS and Linux"
+readme = "README.md"
+keywords = ["process", "diagnostics", "tui", "macos", "linux"]
+categories = ["command-line-utilities", "development-tools::debugging"]
+publish = false
 
 [dependencies]
 crossterm = "0.29"

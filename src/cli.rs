@@ -19,8 +19,12 @@ pub(crate) enum LaunchMode {
     WatchJsonl,
     TraceTable,
     TraceJsonl,
+    RunTable,
+    RunJson,
     DeletedTable,
     DeletedJson,
+    FileTable,
+    FileJson,
     FdTable,
     FdJson,
     TopTable,
@@ -47,7 +51,9 @@ pub(crate) enum HelpTopic {
     Tree,
     Watch,
     Trace,
+    Run,
     Deleted,
+    File,
     Fd,
     Top,
     Oom,
@@ -217,8 +223,17 @@ pub(crate) struct Cli {
     pub(crate) trace_pid: Option<u32>,
     pub(crate) trace_interval_ms: u64,
     pub(crate) trace_count: Option<usize>,
+    pub(crate) run_command: Vec<String>,
+    pub(crate) run_interval_ms: u64,
+    pub(crate) run_descendant_grace_ms: u64,
+    pub(crate) run_output: Option<String>,
+    pub(crate) run_force: bool,
     pub(crate) deleted_min_size: u64,
     pub(crate) deleted_expectation: Option<CheckExpectation>,
+    pub(crate) file_path: Option<String>,
+    pub(crate) file_recursive: bool,
+    pub(crate) file_limit: Option<usize>,
+    pub(crate) file_expectation: Option<CheckExpectation>,
     pub(crate) fd_min_count: usize,
     pub(crate) fd_min_percent: Option<u16>,
     pub(crate) fd_limit: Option<usize>,
@@ -241,6 +256,9 @@ pub(crate) struct Cli {
     pub(crate) doctor_force: bool,
     pub(crate) redact_secrets: bool,
     pub(crate) check_expectation: CheckExpectation,
+    pub(crate) check_wait_ms: Option<u64>,
+    pub(crate) check_interval_ms: u64,
+    pub(crate) check_stable_samples: usize,
     pub(crate) quiet: bool,
 }
 
@@ -273,8 +291,17 @@ impl Default for Cli {
             trace_pid: None,
             trace_interval_ms: 1_000,
             trace_count: None,
+            run_command: Vec::new(),
+            run_interval_ms: 100,
+            run_descendant_grace_ms: 1_000,
+            run_output: None,
+            run_force: false,
             deleted_min_size: 0,
             deleted_expectation: None,
+            file_path: None,
+            file_recursive: false,
+            file_limit: Some(100),
+            file_expectation: None,
             fd_min_count: 1,
             fd_min_percent: None,
             fd_limit: Some(20),
@@ -297,6 +324,9 @@ impl Default for Cli {
             doctor_force: false,
             redact_secrets: false,
             check_expectation: CheckExpectation::None,
+            check_wait_ms: None,
+            check_interval_ms: 1_000,
+            check_stable_samples: 1,
             quiet: false,
         }
     }
@@ -314,7 +344,9 @@ impl Cli {
             let parsed = match command {
                 "watch" => Some((parse_watch(&arguments[1..]), HelpTopic::Watch)),
                 "trace" => Some((parse_trace(&arguments[1..]), HelpTopic::Trace)),
+                "run" => Some((parse_run(&arguments[1..]), HelpTopic::Run)),
                 "deleted" => Some((parse_deleted(&arguments[1..]), HelpTopic::Deleted)),
+                "file" => Some((parse_file(&arguments[1..]), HelpTopic::File)),
                 "fd" => Some((parse_fd(&arguments[1..]), HelpTopic::Fd)),
                 "top" => Some((parse_top(&arguments[1..]), HelpTopic::Top)),
                 "oom" => Some((parse_oom(&arguments[1..]), HelpTopic::Oom)),
@@ -398,7 +430,7 @@ impl Cli {
 }
 
 fn extract_secret_redaction(arguments: &mut Vec<String>) -> Result<bool, String> {
-    const VALUE_OPTIONS: [&str; 18] = [
+    const VALUE_OPTIONS: [&str; 20] = [
         "-q",
         "--query",
         "--sample-ms",
@@ -417,12 +449,17 @@ fn extract_secret_redaction(arguments: &mut Vec<String>) -> Result<bool, String>
         "--state",
         "--output",
         "--fail-on",
+        "--wait",
+        "--stable",
     ];
     let mut enabled = false;
     let mut expects_value = false;
     let mut index = 0;
     while index < arguments.len() {
         let argument = arguments[index].as_str();
+        if argument == "--" {
+            break;
+        }
         if expects_value {
             expects_value = false;
             index += 1;
@@ -1201,6 +1238,125 @@ fn set_net_expectation(cli: &mut Cli, value_set: &mut bool, value: &str) -> Resu
     Ok(())
 }
 
+fn parse_file(arguments: &[String]) -> Result<Cli, String> {
+    let mut cli = Cli {
+        mode: LaunchMode::FileTable,
+        ..Cli::default()
+    };
+    let mut paths = Vec::new();
+    let mut output_mode = None;
+    let mut limit_set = false;
+    let mut expectation_set = false;
+    let mut arguments = arguments.iter().cloned().peekable();
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "-h" | "--help" => cli.mode = LaunchMode::Help,
+            "-V" | "--version" => cli.mode = LaunchMode::Version,
+            "--table" => {
+                set_file_output_mode(&mut cli.mode, &mut output_mode, LaunchMode::FileTable)?
+            }
+            "--json" => {
+                set_file_output_mode(&mut cli.mode, &mut output_mode, LaunchMode::FileJson)?
+            }
+            "--recursive" => cli.file_recursive = true,
+            "--quiet" => cli.quiet = true,
+            "--limit" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "file --limit requires a positive integer or all".to_string())?;
+                set_file_limit(&mut cli, &mut limit_set, &value)?;
+            }
+            "--expect" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "file --expect requires none or any".to_string())?;
+                set_file_expectation(&mut cli, &mut expectation_set, &value)?;
+            }
+            "--" => {
+                paths.extend(arguments);
+                break;
+            }
+            _ if argument.starts_with("--limit=") => {
+                set_file_limit(
+                    &mut cli,
+                    &mut limit_set,
+                    argument.trim_start_matches("--limit="),
+                )?;
+            }
+            _ if argument.starts_with("--expect=") => {
+                set_file_expectation(
+                    &mut cli,
+                    &mut expectation_set,
+                    argument.trim_start_matches("--expect="),
+                )?;
+            }
+            _ if argument.starts_with('-') => {
+                return Err(format!(
+                    "unknown file option: {argument}; use -- before a path beginning with -"
+                ));
+            }
+            _ => paths.push(argument),
+        }
+    }
+    if matches!(cli.mode, LaunchMode::Help | LaunchMode::Version) {
+        return Ok(cli);
+    }
+    if paths.len() != 1 || paths[0].is_empty() {
+        return Err(format!(
+            "file requires exactly one non-empty PATH; received {}",
+            paths.len()
+        ));
+    }
+    cli.file_path = paths.pop();
+    if cli.quiet && cli.file_expectation.is_none() {
+        return Err("file --quiet requires --expect any or --expect none".into());
+    }
+    Ok(cli)
+}
+
+fn set_file_output_mode(
+    mode: &mut LaunchMode,
+    output_mode: &mut Option<LaunchMode>,
+    requested: LaunchMode,
+) -> Result<(), String> {
+    if output_mode.is_some_and(|existing| existing != requested) {
+        return Err("file --table and --json cannot be used together".into());
+    }
+    *output_mode = Some(requested);
+    if !matches!(mode, LaunchMode::Help | LaunchMode::Version) {
+        *mode = requested;
+    }
+    Ok(())
+}
+
+fn set_file_limit(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+    if *value_set {
+        return Err("file --limit may only be specified once".into());
+    }
+    cli.file_limit = if value.eq_ignore_ascii_case("all") {
+        None
+    } else {
+        let limit = value
+            .parse::<usize>()
+            .map_err(|_| format!("invalid file --limit value: {value}; use 1-10000 or all"))?;
+        if !(1..=10_000).contains(&limit) {
+            return Err("file --limit must be between 1 and 10000, or all".into());
+        }
+        Some(limit)
+    };
+    *value_set = true;
+    Ok(())
+}
+
+fn set_file_expectation(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+    if *value_set {
+        return Err("file --expect may only be specified once".into());
+    }
+    cli.file_expectation = Some(parse_expectation(value)?);
+    *value_set = true;
+    Ok(())
+}
+
 fn parse_fd(arguments: &[String]) -> Result<Cli, String> {
     let mut cli = Cli {
         mode: LaunchMode::FdTable,
@@ -1583,6 +1739,160 @@ fn set_trace_count(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(
         return Err("--count must be between 1 and 1000000".into());
     }
     cli.trace_count = Some(count);
+    *value_set = true;
+    Ok(())
+}
+
+fn parse_run(arguments: &[String]) -> Result<Cli, String> {
+    let mut cli = Cli {
+        mode: LaunchMode::RunTable,
+        ..Cli::default()
+    };
+    let separator = arguments.iter().position(|argument| argument == "--");
+    let option_arguments = separator
+        .map(|index| &arguments[..index])
+        .unwrap_or(arguments);
+    let mut output_mode = None;
+    let mut interval_set = false;
+    let mut grace_set = false;
+    let mut report_path_set = false;
+    let mut options = option_arguments.iter().cloned().peekable();
+    while let Some(argument) = options.next() {
+        match argument.as_str() {
+            "-h" | "--help" => cli.mode = LaunchMode::Help,
+            "-V" | "--version" => cli.mode = LaunchMode::Version,
+            "--table" => {
+                set_run_output_mode(&mut cli.mode, &mut output_mode, LaunchMode::RunTable)?
+            }
+            "--json" => set_run_output_mode(&mut cli.mode, &mut output_mode, LaunchMode::RunJson)?,
+            "--interval-ms" => {
+                let value = options
+                    .next()
+                    .ok_or_else(|| "--interval-ms requires a value".to_string())?;
+                set_run_interval(&mut cli, &mut interval_set, &value)?;
+            }
+            "--linger-ms" => {
+                let value = options
+                    .next()
+                    .ok_or_else(|| "--linger-ms requires a value".to_string())?;
+                set_run_grace(&mut cli, &mut grace_set, &value)?;
+            }
+            "--output" => {
+                let value = options
+                    .next()
+                    .ok_or_else(|| "--output requires a value".to_string())?;
+                set_run_report_path(&mut cli, &mut output_mode, &mut report_path_set, value)?;
+            }
+            "--force" => {
+                if cli.run_force {
+                    return Err("--force may only be specified once".into());
+                }
+                cli.run_force = true;
+            }
+            _ if argument.starts_with("--interval-ms=") => {
+                set_run_interval(
+                    &mut cli,
+                    &mut interval_set,
+                    argument.trim_start_matches("--interval-ms="),
+                )?;
+            }
+            _ if argument.starts_with("--linger-ms=") => {
+                set_run_grace(
+                    &mut cli,
+                    &mut grace_set,
+                    argument.trim_start_matches("--linger-ms="),
+                )?;
+            }
+            _ if argument.starts_with("--output=") => {
+                set_run_report_path(
+                    &mut cli,
+                    &mut output_mode,
+                    &mut report_path_set,
+                    argument.trim_start_matches("--output=").to_string(),
+                )?;
+            }
+            _ => {
+                return Err(format!(
+                    "unknown run option: {argument}; place the command after --"
+                ));
+            }
+        }
+    }
+    if matches!(cli.mode, LaunchMode::Help | LaunchMode::Version) {
+        return Ok(cli);
+    }
+    if cli.run_force && cli.run_output.is_none() {
+        return Err("run --force requires --output FILE".into());
+    }
+    let Some(separator) = separator else {
+        return Err("run requires -- before COMMAND and its arguments".into());
+    };
+    cli.run_command = arguments[separator + 1..].to_vec();
+    if cli.run_command.is_empty() {
+        return Err("run requires COMMAND after --".into());
+    }
+    Ok(cli)
+}
+
+fn set_run_report_path(
+    cli: &mut Cli,
+    output_mode: &mut Option<LaunchMode>,
+    path_set: &mut bool,
+    path: String,
+) -> Result<(), String> {
+    if *path_set {
+        return Err("--output may only be specified once".into());
+    }
+    if path.is_empty() || path == "-" {
+        return Err("run --output requires a file path other than '-'".into());
+    }
+    set_run_output_mode(&mut cli.mode, output_mode, LaunchMode::RunJson)?;
+    cli.run_output = Some(path);
+    *path_set = true;
+    Ok(())
+}
+
+fn set_run_output_mode(
+    mode: &mut LaunchMode,
+    output_mode: &mut Option<LaunchMode>,
+    requested: LaunchMode,
+) -> Result<(), String> {
+    if output_mode.is_some_and(|existing| existing != requested) {
+        return Err("run --table and --json cannot be used together".into());
+    }
+    *output_mode = Some(requested);
+    if !matches!(mode, LaunchMode::Help | LaunchMode::Version) {
+        *mode = requested;
+    }
+    Ok(())
+}
+
+fn set_run_interval(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+    if *value_set {
+        return Err("--interval-ms may only be specified once".into());
+    }
+    let interval = value
+        .parse::<u64>()
+        .map_err(|_| format!("invalid --interval-ms value: {value}"))?;
+    if !(100..=60_000).contains(&interval) {
+        return Err("--interval-ms must be between 100 and 60000".into());
+    }
+    cli.run_interval_ms = interval;
+    *value_set = true;
+    Ok(())
+}
+
+fn set_run_grace(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+    if *value_set {
+        return Err("--linger-ms may only be specified once".into());
+    }
+    let grace = value
+        .parse::<u64>()
+        .map_err(|_| format!("invalid --linger-ms value: {value}"))?;
+    if grace > 60_000 {
+        return Err("--linger-ms must be between 0 and 60000".into());
+    }
+    cli.run_descendant_grace_ms = grace;
     *value_set = true;
     Ok(())
 }
@@ -2149,6 +2459,9 @@ fn parse_check(arguments: &[String]) -> Result<Cli, String> {
     let mut sample_set = false;
     let mut output_mode = None;
     let mut expectation_set = false;
+    let mut wait_set = false;
+    let mut interval_set = false;
+    let mut stable_set = false;
     let mut arguments = arguments.iter().cloned().peekable();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -2179,6 +2492,24 @@ fn parse_check(arguments: &[String]) -> Result<Cli, String> {
                     .ok_or_else(|| "--expect requires none or any".to_string())?;
                 set_check_expectation(&mut cli, &mut expectation_set, &value)?;
             }
+            "--wait" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--wait requires a duration such as 30s or 2m".to_string())?;
+                set_check_wait(&mut cli, &mut wait_set, &value)?;
+            }
+            "--interval-ms" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--interval-ms requires a value".to_string())?;
+                set_check_interval(&mut cli, &mut interval_set, &value)?;
+            }
+            "--stable" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--stable requires a positive sample count".to_string())?;
+                set_check_stable(&mut cli, &mut stable_set, &value)?;
+            }
             _ if argument.starts_with("--query=") => {
                 let value = argument.trim_start_matches("--query=").to_string();
                 set_query(&mut cli, &mut query_set, value)?;
@@ -2190,6 +2521,18 @@ fn parse_check(arguments: &[String]) -> Result<Cli, String> {
             _ if argument.starts_with("--expect=") => {
                 let value = argument.trim_start_matches("--expect=");
                 set_check_expectation(&mut cli, &mut expectation_set, value)?;
+            }
+            _ if argument.starts_with("--wait=") => {
+                let value = argument.trim_start_matches("--wait=");
+                set_check_wait(&mut cli, &mut wait_set, value)?;
+            }
+            _ if argument.starts_with("--interval-ms=") => {
+                let value = argument.trim_start_matches("--interval-ms=");
+                set_check_interval(&mut cli, &mut interval_set, value)?;
+            }
+            _ if argument.starts_with("--stable=") => {
+                let value = argument.trim_start_matches("--stable=");
+                set_check_stable(&mut cli, &mut stable_set, value)?;
             }
             _ if argument.starts_with('-') => {
                 return Err(format!("unknown check option: {argument}"));
@@ -2205,6 +2548,15 @@ fn parse_check(arguments: &[String]) -> Result<Cli, String> {
     }
     if !query_set {
         set_query(&mut cli, &mut query_set, positional_query.join(" "))?;
+    }
+    if cli.check_wait_ms.is_none() && (interval_set || stable_set) {
+        return Err("check --interval-ms and --stable require --wait DURATION".into());
+    }
+    if cli
+        .check_wait_ms
+        .is_some_and(|wait_ms| wait_ms < cli.sample_ms)
+    {
+        return Err("check --wait must be at least as long as --sample-ms".into());
     }
     Ok(cli)
 }
@@ -2234,6 +2586,70 @@ fn set_check_expectation(
     }
     cli.check_expectation = parse_expectation(value)?;
     *expectation_set = true;
+    Ok(())
+}
+
+fn set_check_wait(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+    if *value_set {
+        return Err("check --wait may only be specified once".into());
+    }
+    cli.check_wait_ms = Some(parse_check_duration_ms(value)?);
+    *value_set = true;
+    Ok(())
+}
+
+fn parse_check_duration_ms(value: &str) -> Result<u64, String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    let (number, multiplier) = if let Some(number) = normalized.strip_suffix("ms") {
+        (number, 1.0)
+    } else if let Some(number) = normalized.strip_suffix('s') {
+        (number, 1_000.0)
+    } else if let Some(number) = normalized.strip_suffix('m') {
+        (number, 60_000.0)
+    } else if let Some(number) = normalized.strip_suffix('h') {
+        (number, 3_600_000.0)
+    } else {
+        return Err(format!(
+            "invalid check --wait duration: {value}; include ms, s, m, or h"
+        ));
+    };
+    let amount = number
+        .parse::<f64>()
+        .map_err(|_| format!("invalid check --wait duration: {value}"))?;
+    let milliseconds = amount * multiplier;
+    if !milliseconds.is_finite() || !(100.0..=86_400_000.0).contains(&milliseconds) {
+        return Err("check --wait must be between 100ms and 24h".into());
+    }
+    Ok(milliseconds.ceil() as u64)
+}
+
+fn set_check_interval(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+    if *value_set {
+        return Err("check --interval-ms may only be specified once".into());
+    }
+    let interval = value
+        .parse::<u64>()
+        .map_err(|_| format!("invalid check --interval-ms value: {value}"))?;
+    if !(100..=60_000).contains(&interval) {
+        return Err("check --interval-ms must be between 100 and 60000".into());
+    }
+    cli.check_interval_ms = interval;
+    *value_set = true;
+    Ok(())
+}
+
+fn set_check_stable(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+    if *value_set {
+        return Err("check --stable may only be specified once".into());
+    }
+    let samples = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid check --stable value: {value}"))?;
+    if !(1..=1_000).contains(&samples) {
+        return Err("check --stable must be between 1 and 1000".into());
+    }
+    cli.check_stable_samples = samples;
+    *value_set = true;
     Ok(())
 }
 
@@ -2424,7 +2840,9 @@ COMMANDS:
   tree        Print one PID's complete ancestor and descendant context
   watch       Stream process lifecycle and query transition events
   trace       Record process and complete-subtree resource time series
+  run         Launch a command and profile its complete process subtree
   deleted     Find deleted files that processes still hold open
+  file        Find processes executing, mapped to, or holding a path
   fd          Rank processes by open file-descriptor pressure
   top         Rank current CPU, memory, and disk I/O hotspots
   oom         Diagnose Linux memory pressure and OOM kill priority
@@ -2450,7 +2868,8 @@ Query examples: 'name:python cpu>20'  'user:deploy mem>500m'  'tree.procs>=10'
             "psmore check - evaluate a process query as a health gate
 
 USAGE:
-  psmore check QUERY [--expect none|any] [--table|--json|--quiet] [--sample-ms MS]
+  psmore check QUERY [--expect none|any] [--wait DURATION [--stable N]]
+                     [--interval-ms MS] [--table|--json|--quiet] [--sample-ms MS]
 
 OPTIONS:
       --expect MODE   none: require zero matches; any: require >=1 [default: none]
@@ -2458,12 +2877,18 @@ OPTIONS:
       --json          psmore.check-result JSON
       --quiet         Suppress output and use only the exit code
       --sample-ms MS  Sampling interval, 100-60000 [default: 500]
+      --wait DURATION Retry until policy passes or 100ms-24h expires; >= sample-ms
+      --interval-ms M Evaluation cadence while waiting, 100-60000 [default: 1000]
+      --stable N      Require N consecutive passing evaluations, 1-1000 [default: 1]
       --redact        Mask common secret values in emitted command lines
 
+The collector process is excluded from matching and ancestor tree aggregates,
+so a psmore query cannot satisfy or violate its own gate.
 EXIT: 0 policy passed, 1 runtime error, 2 usage/query error, 3 policy violated
 EXAMPLES:
   psmore check 'state:zombie'
   psmore check 'name:api user:deploy' --expect any --quiet
+  psmore check 'name:api user:deploy' --expect any --wait 30s --stable 3 --quiet
 "
         }
         Some(HelpTopic::Inspect) => {
@@ -2612,6 +3037,33 @@ EXAMPLES:
   psmore trace 1234 --jsonl > trace-1234.jsonl
 "
         }
+        Some(HelpTopic::Run) => {
+            "psmore run - launch a command and profile its complete process subtree
+
+USAGE:
+  psmore run [--table|--json] [--interval-ms MS] [--linger-ms MS] -- COMMAND [ARG...]
+  psmore run --output REPORT.json [--force] [OPTIONS] -- COMMAND [ARG...]
+
+OPTIONS:
+      --table          Human-readable final profile [default]
+      --json           psmore.command-profile JSON
+      --interval-ms MS Sampling interval, 100-60000 [default: 100]
+      --linger-ms MS   Observe descendants this long after COMMAND exits, 0-60000 [default: 1000]
+      --output FILE    Atomically write a private JSON report; refuses overwrite
+      --force          Allow --output to replace an existing regular file
+      --redact          Mask common secret values in the emitted command lines
+
+COMMAND inherits stdin, stdout, and stderr. The profile is written to psmore's
+stderr so command stdout remains safe for pipes. psmore mirrors COMMAND's exit
+code; a Unix signal is reported using the conventional 128+signal status.
+With --output, COMMAND stderr remains untouched and the JSON report is mode 0600.
+Sampling is observational and explicitly reports short-process blind spots.
+EXAMPLES:
+  psmore run -- make test
+  psmore run --interval-ms 250 -- ./server --config ./dev.toml
+  psmore run --output profile.json -- sh -c 'worker & wait'
+"
+        }
         Some(HelpTopic::Deleted) => {
             "psmore deleted - find deleted files still held open
 
@@ -2630,6 +3082,33 @@ EXIT: 0 success/pass, 1 error or inconclusive absence, 2 usage, 3 violation
 EXAMPLES:
   psmore deleted --min-size 100m
   psmore deleted --min-size 1g --expect none --quiet
+"
+        }
+        Some(HelpTopic::File) => {
+            "psmore file - find processes using a file or directory
+
+USAGE:
+  psmore file PATH [--recursive] [--limit N|all] [--table|--json]
+                   [--expect none|any] [--quiet]
+
+OPTIONS:
+      --recursive  Match PATH and every descendant (useful for mounts/directories)
+      --limit N    Maximum evidence rows [default: 100; all disables truncation]
+      --table      Human-readable EXEC/CWD/ROOT/OPEN/MAPPED evidence [default]
+      --json       psmore.file-usage JSON
+      --expect M   Apply none/any policy to all matches before --limit
+      --quiet      Suppress output; requires --expect
+      --redact     Mask common secret values in emitted command lines
+
+Relative paths are resolved from the current directory. Existing targets are
+canonicalized, and exact file matching also recognizes the same device/inode.
+The psmore collector and its helpers are excluded. Zero visible matches with
+incomplete process coverage are inconclusive and exit 1, never a false pass.
+EXIT: 0 success/pass, 1 runtime/inconclusive, 2 usage, 3 policy violation
+EXAMPLES:
+  psmore file ./config.yaml
+  psmore file /Volumes/data --recursive --limit all
+  psmore file /srv/release --recursive --expect none --quiet
 "
         }
         Some(HelpTopic::Fd) => {
@@ -2837,8 +3316,17 @@ mod tests {
                 trace_pid: None,
                 trace_interval_ms: 1_000,
                 trace_count: None,
+                run_command: Vec::new(),
+                run_interval_ms: 100,
+                run_descendant_grace_ms: 1_000,
+                run_output: None,
+                run_force: false,
                 deleted_min_size: 0,
                 deleted_expectation: None,
+                file_path: None,
+                file_recursive: false,
+                file_limit: Some(100),
+                file_expectation: None,
                 fd_min_count: 1,
                 fd_min_percent: None,
                 fd_limit: Some(20),
@@ -2861,6 +3349,9 @@ mod tests {
                 doctor_force: false,
                 redact_secrets: false,
                 check_expectation: CheckExpectation::None,
+                check_wait_ms: None,
+                check_interval_ms: 1_000,
+                check_stable_samples: 1,
                 quiet: false,
             }
         );
@@ -2884,6 +3375,30 @@ mod tests {
             }
         );
         assert_eq!(
+            Cli::parse([
+                "check",
+                "name:api",
+                "--expect=any",
+                "--wait",
+                "1.5s",
+                "--interval-ms=250",
+                "--stable",
+                "3",
+                "--quiet"
+            ])
+            .unwrap(),
+            Cli {
+                mode: LaunchMode::CheckTable,
+                query: "name:api".into(),
+                check_expectation: CheckExpectation::Any,
+                check_wait_ms: Some(1_500),
+                check_interval_ms: 250,
+                check_stable_samples: 3,
+                quiet: true,
+                ..Cli::default()
+            }
+        );
+        assert_eq!(
             Cli::parse(["deleted", "--min-size=1.5g", "--json", "--expect", "none"]).unwrap(),
             Cli {
                 mode: LaunchMode::DeletedJson,
@@ -2892,6 +3407,40 @@ mod tests {
                 ..Cli::default()
             }
         );
+        assert_eq!(
+            Cli::parse([
+                "file",
+                "./config",
+                "--recursive",
+                "--limit=all",
+                "--json",
+                "--expect=any",
+                "--quiet"
+            ])
+            .unwrap(),
+            Cli {
+                mode: LaunchMode::FileJson,
+                file_path: Some("./config".into()),
+                file_recursive: true,
+                file_limit: None,
+                file_expectation: Some(CheckExpectation::Any),
+                quiet: true,
+                ..Cli::default()
+            }
+        );
+        assert_eq!(
+            Cli::parse(["file", "--", "--strange-path"])
+                .unwrap()
+                .file_path
+                .as_deref(),
+            Some("--strange-path")
+        );
+        let literal_redact = Cli::parse(["file", "--", "--redact"]).unwrap();
+        assert_eq!(literal_redact.file_path.as_deref(), Some("--redact"));
+        assert!(!literal_redact.redact_secrets);
+        let redacted_literal = Cli::parse(["file", "--redact", "--", "--redact"]).unwrap();
+        assert_eq!(redacted_literal.file_path.as_deref(), Some("--redact"));
+        assert!(redacted_literal.redact_secrets);
         assert_eq!(
             Cli::parse([
                 "fd",
@@ -2963,6 +3512,47 @@ mod tests {
                 trace_pid: Some(4_242),
                 trace_interval_ms: 250,
                 trace_count: Some(4),
+                ..Cli::default()
+            }
+        );
+        assert_eq!(
+            Cli::parse([
+                "run",
+                "--json",
+                "--interval-ms=250",
+                "--linger-ms",
+                "2000",
+                "--",
+                "worker",
+                "--token",
+                "literal"
+            ])
+            .unwrap(),
+            Cli {
+                mode: LaunchMode::RunJson,
+                run_command: vec!["worker".into(), "--token".into(), "literal".into()],
+                run_interval_ms: 250,
+                run_descendant_grace_ms: 2_000,
+                ..Cli::default()
+            }
+        );
+        assert_eq!(
+            Cli::parse([
+                "run",
+                "--output=profile.json",
+                "--force",
+                "--redact",
+                "--",
+                "worker",
+                "--redact"
+            ])
+            .unwrap(),
+            Cli {
+                mode: LaunchMode::RunJson,
+                run_command: vec!["worker".into(), "--redact".into()],
+                run_output: Some("profile.json".into()),
+                run_force: true,
+                redact_secrets: true,
                 ..Cli::default()
             }
         );
@@ -3196,7 +3786,9 @@ mod tests {
             ("tree", HelpTopic::Tree),
             ("watch", HelpTopic::Watch),
             ("trace", HelpTopic::Trace),
+            ("run", HelpTopic::Run),
             ("deleted", HelpTopic::Deleted),
+            ("file", HelpTopic::File),
             ("fd", HelpTopic::Fd),
             ("top", HelpTopic::Top),
             ("oom", HelpTopic::Oom),
@@ -3227,6 +3819,17 @@ mod tests {
         assert!(Cli::parse(["check", "name:api", "--expect=all"]).is_err());
         assert!(Cli::parse(["check", "name:api", "--query", "name:worker"]).is_err());
         assert!(Cli::parse(["check", "name:api", "--table", "--json"]).is_err());
+        assert!(Cli::parse(["check", "name:api", "--wait=30"]).is_err());
+        assert!(Cli::parse(["check", "name:api", "--wait=99ms"]).is_err());
+        assert!(Cli::parse(["check", "name:api", "--wait=100ms"]).is_err());
+        assert!(Cli::parse(["check", "name:api", "--wait=100ms", "--sample-ms=100"]).is_ok());
+        assert!(Cli::parse(["check", "name:api", "--wait=25h"]).is_err());
+        assert!(Cli::parse(["check", "name:api", "--wait=1s", "--wait=2s"]).is_err());
+        assert!(Cli::parse(["check", "name:api", "--interval-ms=250"]).is_err());
+        assert!(Cli::parse(["check", "name:api", "--stable=2"]).is_err());
+        assert!(Cli::parse(["check", "name:api", "--wait=1s", "--stable=0"]).is_err());
+        assert!(Cli::parse(["check", "name:api", "--wait=1s", "--stable=1001"]).is_err());
+        assert!(Cli::parse(["check", "name:api", "--wait=1s", "--interval-ms=99"]).is_err());
         assert!(Cli::parse(["inspect"]).is_err());
         assert!(Cli::parse(["inspect", "0"]).is_err());
         assert!(Cli::parse(["inspect", "nope"]).is_err());
@@ -3264,12 +3867,32 @@ mod tests {
         assert!(Cli::parse(["trace", "1", "--table", "--jsonl"]).is_err());
         assert!(Cli::parse(["trace", "1", "--interval-ms=99"]).is_err());
         assert!(Cli::parse(["trace", "1", "--count=0"]).is_err());
+        assert!(Cli::parse(["run"]).is_err());
+        assert!(Cli::parse(["run", "worker"]).is_err());
+        assert!(Cli::parse(["run", "--"]).is_err());
+        assert!(Cli::parse(["run", "--table", "--json", "--", "worker"]).is_err());
+        assert!(Cli::parse(["run", "--interval-ms=99", "--", "worker"]).is_err());
+        assert!(Cli::parse(["run", "--linger-ms=60001", "--", "worker"]).is_err());
+        assert!(Cli::parse(["run", "--unknown", "--", "worker"]).is_err());
+        assert!(Cli::parse(["run", "--output=-", "--", "worker"]).is_err());
+        assert!(Cli::parse(["run", "--output=", "--", "worker"]).is_err());
+        assert!(Cli::parse(["run", "--output=a", "--output=b", "--", "worker"]).is_err());
+        assert!(Cli::parse(["run", "--force", "--", "worker"]).is_err());
+        assert!(Cli::parse(["run", "--table", "--output=a", "--", "worker"]).is_err());
         assert!(Cli::parse(["deleted", "extra"]).is_err());
         assert!(Cli::parse(["deleted", "--min-size=nope"]).is_err());
         assert!(Cli::parse(["deleted", "--table", "--json"]).is_err());
         assert!(Cli::parse(["deleted", "--quiet"]).is_err());
         assert!(Cli::parse(["deleted", "--expect=all"]).is_err());
         assert!(Cli::parse(["fd", "extra"]).is_err());
+        assert!(Cli::parse(["file"]).is_err());
+        assert!(Cli::parse(["file", "a", "b"]).is_err());
+        assert!(Cli::parse(["file", "a", "--table", "--json"]).is_err());
+        assert!(Cli::parse(["file", "a", "--limit=0"]).is_err());
+        assert!(Cli::parse(["file", "a", "--limit=10001"]).is_err());
+        assert!(Cli::parse(["file", "a", "--limit=1", "--limit=all"]).is_err());
+        assert!(Cli::parse(["file", "a", "--expect=all"]).is_err());
+        assert!(Cli::parse(["file", "a", "--quiet"]).is_err());
         assert!(Cli::parse(["fd", "--min-count=nope"]).is_err());
         assert!(Cli::parse(["fd", "--min-percent=0"]).is_err());
         assert!(Cli::parse(["fd", "--min-percent=101"]).is_err());
@@ -3353,7 +3976,9 @@ mod tests {
             (HelpTopic::Tree, "tree"),
             (HelpTopic::Watch, "watch"),
             (HelpTopic::Trace, "trace"),
+            (HelpTopic::Run, "run"),
             (HelpTopic::Deleted, "deleted"),
+            (HelpTopic::File, "file"),
             (HelpTopic::Fd, "fd"),
             (HelpTopic::Top, "top"),
             (HelpTopic::Oom, "oom"),

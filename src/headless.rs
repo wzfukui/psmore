@@ -107,10 +107,10 @@ impl ProcessSnapshot {
 }
 
 pub(crate) struct CurrentProcessExclusion {
-    pid: Pid,
     parent: Option<Pid>,
     subtree: ResourceAggregate,
     ancestors: HashSet<Pid>,
+    collector_processes: HashSet<Pid>,
 }
 
 impl CurrentProcessExclusion {
@@ -118,6 +118,14 @@ impl CurrentProcessExclusion {
         let pid = Pid::from_u32(std::process::id());
         let parent = snapshot.process(pid).and_then(|process| process.parent);
         let subtree = snapshot.resource(pid);
+        let mut collector_processes = HashSet::new();
+        let mut pending = vec![pid];
+        while let Some(candidate) = pending.pop() {
+            if !collector_processes.insert(candidate) {
+                continue;
+            }
+            pending.extend_from_slice(snapshot.children_of(candidate));
+        }
         let mut ancestors = HashSet::new();
         let mut current = Some(pid);
         while let Some(candidate) = current {
@@ -129,10 +137,10 @@ impl CurrentProcessExclusion {
                 .and_then(|process| process.parent);
         }
         Self {
-            pid,
             parent,
             subtree,
             ancestors,
+            collector_processes,
         }
     }
 
@@ -170,7 +178,9 @@ impl CurrentProcessExclusion {
         snapshot
             .processes()
             .values()
-            .filter(|process| process.pid != root && process.pid != self.pid)
+            .filter(|process| {
+                process.pid != root && !self.collector_processes.contains(&process.pid)
+            })
             .filter(|process| {
                 let subtree = self.adjust_subtree(process.pid, snapshot.resource(process.pid));
                 let direct_children = self
@@ -199,18 +209,39 @@ pub(crate) fn capture_snapshot(sample_ms: u64) -> ProcessSnapshot {
     ProcessSnapshot::build(processes, sample_ms, generated_at_unix_ms)
 }
 
+#[cfg(test)]
 fn matching_pids(snapshot: &ProcessSnapshot, query: &str) -> Result<Vec<Pid>, String> {
+    matching_pids_for_view(snapshot, query, None)
+}
+
+fn matching_pids_for_view(
+    snapshot: &ProcessSnapshot,
+    query: &str,
+    collector: Option<&CurrentProcessExclusion>,
+) -> Result<Vec<Pid>, String> {
     let query = ProcessQuery::parse(query)?;
-    let mut pids: Vec<Pid> = snapshot.matching_pid_set(&query).into_iter().collect();
+    let matches = collector
+        .map(|collector| collector.matching_pid_set(snapshot, &query))
+        .unwrap_or_else(|| snapshot.matching_pid_set(&query));
+    let mut pids: Vec<Pid> = matches.into_iter().collect();
     pids.sort_by_key(|pid| pid.as_u32());
     Ok(pids)
 }
 
+#[cfg(test)]
 pub(crate) fn matching_process_count(
     snapshot: &ProcessSnapshot,
     query: &str,
 ) -> Result<usize, String> {
     matching_pids(snapshot, query).map(|pids| pids.len())
+}
+
+pub(crate) fn matching_process_count_excluding_collector(
+    snapshot: &ProcessSnapshot,
+    query: &str,
+    collector: &CurrentProcessExclusion,
+) -> Result<usize, String> {
+    matching_pids_for_view(snapshot, query, Some(collector)).map(|pids| pids.len())
 }
 
 #[derive(Debug, Serialize)]
@@ -226,6 +257,8 @@ struct JsonSnapshot {
     query: Option<JsonQuery>,
     system_process_count: usize,
     matched_process_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    collector_process_excluded: Option<bool>,
     processes: Vec<JsonProcess>,
 }
 
@@ -283,12 +316,27 @@ impl From<ResourceAggregate> for JsonAggregate {
 }
 
 pub(crate) fn render_json(snapshot: &ProcessSnapshot, query: &str) -> Result<String, String> {
-    let pids = matching_pids(snapshot, query)?;
+    render_json_for_view(snapshot, query, None)
+}
+
+fn render_json_for_view(
+    snapshot: &ProcessSnapshot,
+    query: &str,
+    collector: Option<&CurrentProcessExclusion>,
+) -> Result<String, String> {
+    let pids = matching_pids_for_view(snapshot, query, collector)?;
     let processes = pids
         .iter()
         .filter_map(|pid| {
             let process = snapshot.processes.get(pid)?;
-            let subtree = snapshot.resources.get(pid).copied().unwrap_or_default();
+            let subtree = collector
+                .map(|collector| collector.adjust_subtree(*pid, snapshot.resource(*pid)))
+                .unwrap_or_else(|| snapshot.resource(*pid));
+            let direct_child_count = collector
+                .map(|collector| {
+                    collector.adjust_direct_children(*pid, snapshot.children_of(*pid).len())
+                })
+                .unwrap_or_else(|| snapshot.children_of(*pid).len());
             Some(JsonProcess {
                 pid: pid.as_u32(),
                 parent_pid: process.parent.map(Pid::as_u32),
@@ -305,11 +353,7 @@ pub(crate) fn render_json(snapshot: &ProcessSnapshot, query: &str) -> Result<Str
                 write_bytes_per_second: process.write_rate,
                 start_time_unix_seconds: process.start_time,
                 runtime_seconds: process.runtime,
-                direct_child_count: snapshot
-                    .children
-                    .get(&Some(*pid))
-                    .map(Vec::len)
-                    .unwrap_or(0),
+                direct_child_count,
                 subtree: subtree.into(),
             })
         })
@@ -331,13 +375,22 @@ pub(crate) fn render_json(snapshot: &ProcessSnapshot, query: &str) -> Result<Str
         }),
         system_process_count: snapshot.processes.len().saturating_sub(1),
         matched_process_count: pids.len(),
+        collector_process_excluded: collector.map(|_| true),
         processes,
     };
     serde_json::to_string_pretty(&output).map_err(|error| error.to_string())
 }
 
 pub(crate) fn render_table(snapshot: &ProcessSnapshot, query: &str) -> Result<String, String> {
-    let pids = matching_pids(snapshot, query)?;
+    render_table_for_view(snapshot, query, None)
+}
+
+fn render_table_for_view(
+    snapshot: &ProcessSnapshot,
+    query: &str,
+    collector: Option<&CurrentProcessExclusion>,
+) -> Result<String, String> {
+    let pids = matching_pids_for_view(snapshot, query, collector)?;
     let mut output = String::from(
         "    PID    PPID   CPU%       MEM  TCPU%      TMEM TPROCS       R/s       W/s USER         STATE        COMMAND\n",
     );
@@ -345,7 +398,9 @@ pub(crate) fn render_table(snapshot: &ProcessSnapshot, query: &str) -> Result<St
         let Some(process) = snapshot.processes.get(&pid) else {
             continue;
         };
-        let subtree = snapshot.resources.get(&pid).copied().unwrap_or_default();
+        let subtree = collector
+            .map(|collector| collector.adjust_subtree(pid, snapshot.resource(pid)))
+            .unwrap_or_else(|| snapshot.resource(pid));
         output.push_str(&format!(
             "{:>7} {:>7} {:>6.1} {:>9} {:>6.1} {:>9} {:>6} {:>9} {:>9} {:<12} {:<12} {}\n",
             pid.as_u32(),
@@ -373,18 +428,75 @@ struct JsonCheckResult {
     expectation: String,
     query: String,
     matched_process_count: usize,
+    collector_process_excluded: bool,
+    evaluation: CheckObservation,
     snapshot: serde_json::Value,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct CheckObservation {
+    pub(crate) attempts: usize,
+    pub(crate) required_consecutive_passes: usize,
+    pub(crate) consecutive_passes: usize,
+    pub(crate) wait_timeout_ms: Option<u64>,
+    pub(crate) elapsed_ms: u64,
+    pub(crate) timed_out: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CheckStability {
+    required: usize,
+    attempts: usize,
+    consecutive_passes: usize,
+}
+
+impl CheckStability {
+    pub(crate) fn new(required: usize) -> Self {
+        Self {
+            required: required.max(1),
+            attempts: 0,
+            consecutive_passes: 0,
+        }
+    }
+
+    pub(crate) fn record(&mut self, passed: bool) -> bool {
+        self.attempts = self.attempts.saturating_add(1);
+        self.consecutive_passes = if passed {
+            self.consecutive_passes.saturating_add(1)
+        } else {
+            0
+        };
+        self.consecutive_passes >= self.required
+    }
+
+    pub(crate) fn observation(
+        self,
+        wait_timeout_ms: Option<u64>,
+        elapsed_ms: u64,
+        timed_out: bool,
+    ) -> CheckObservation {
+        CheckObservation {
+            attempts: self.attempts,
+            required_consecutive_passes: self.required,
+            consecutive_passes: self.consecutive_passes,
+            wait_timeout_ms,
+            elapsed_ms,
+            timed_out,
+        }
+    }
 }
 
 pub(crate) fn render_check_json(
     snapshot: &ProcessSnapshot,
+    collector: &CurrentProcessExclusion,
     query: &str,
     expectation: &str,
     matched: usize,
     passed: bool,
+    observation: CheckObservation,
 ) -> Result<String, String> {
-    let snapshot =
-        serde_json::from_str(&render_json(snapshot, query)?).map_err(|error| error.to_string())?;
+    let snapshot = serde_json::from_str(&render_json_for_view(snapshot, query, Some(collector))?)
+        .map_err(|error| error.to_string())?;
     serde_json::to_string_pretty(&JsonCheckResult {
         schema: "psmore.check-result",
         schema_version: 1,
@@ -392,6 +504,8 @@ pub(crate) fn render_check_json(
         expectation: expectation.to_string(),
         query: query.to_string(),
         matched_process_count: matched,
+        collector_process_excluded: true,
+        evaluation: observation,
         snapshot,
     })
     .map_err(|error| error.to_string())
@@ -399,18 +513,33 @@ pub(crate) fn render_check_json(
 
 pub(crate) fn render_check_table(
     snapshot: &ProcessSnapshot,
+    collector: &CurrentProcessExclusion,
     query: &str,
     expectation: &str,
     matched: usize,
     passed: bool,
+    observation: CheckObservation,
 ) -> Result<String, String> {
     let status = if passed { "PASS" } else { "FAIL" };
+    let timeout = observation
+        .wait_timeout_ms
+        .map(|milliseconds| format!(", timeout {milliseconds}ms"))
+        .unwrap_or_default();
     let mut output = format!(
-        "CHECK {status}  expected {expectation}; matched {matched} process(es)\nquery: {query}\n"
+        "CHECK {status}  expected {expectation}; matched {matched} process(es)\nquery: {query}\nevaluation: {} attempt(s), stable {}/{}, elapsed {}ms{timeout}{}; collector excluded\n",
+        observation.attempts,
+        observation.consecutive_passes,
+        observation.required_consecutive_passes,
+        observation.elapsed_ms,
+        if observation.timed_out {
+            " (timeout reached)"
+        } else {
+            ""
+        },
     );
     if matched > 0 {
         output.push('\n');
-        output.push_str(&render_table(snapshot, query)?);
+        output.push_str(&render_table_for_view(snapshot, query, Some(collector))?);
     }
     Ok(output)
 }
@@ -516,21 +645,131 @@ mod tests {
     #[test]
     fn health_check_outputs_are_explicit_and_machine_readable() {
         let snapshot = snapshot();
+        let collector = CurrentProcessExclusion::capture(&snapshot);
         let matched = matching_process_count(&snapshot, "name:api").unwrap();
         assert_eq!(matched, 1);
-        let table = render_check_table(&snapshot, "name:api", "no matches", matched, false)
-            .expect("render check table");
+        let observation = CheckObservation {
+            attempts: 3,
+            required_consecutive_passes: 2,
+            consecutive_passes: 0,
+            wait_timeout_ms: Some(2_000),
+            elapsed_ms: 2_001,
+            timed_out: true,
+        };
+        let table = render_check_table(
+            &snapshot,
+            &collector,
+            "name:api",
+            "no matches",
+            matched,
+            false,
+            observation,
+        )
+        .expect("render check table");
         assert!(table.starts_with("CHECK FAIL"));
+        assert!(table.contains("3 attempt(s), stable 0/2"));
+        assert!(table.contains("timeout reached"));
+        assert!(table.contains("collector excluded"));
         assert!(table.contains("/srv/api --pid 10"));
 
         let json: Value = serde_json::from_str(
-            &render_check_json(&snapshot, "name:api", "no matches", matched, false)
-                .expect("render check JSON"),
+            &render_check_json(
+                &snapshot,
+                &collector,
+                "name:api",
+                "no matches",
+                matched,
+                false,
+                observation,
+            )
+            .expect("render check JSON"),
         )
         .unwrap();
         assert_eq!(json["schema"], "psmore.check-result");
         assert_eq!(json["passed"], false);
         assert_eq!(json["matched_process_count"], 1);
+        assert_eq!(json["collector_process_excluded"], true);
+        assert_eq!(json["evaluation"]["attempts"], 3);
+        assert_eq!(json["evaluation"]["timed_out"], true);
+        assert_eq!(json["snapshot"]["collector_process_excluded"], true);
         assert_eq!(json["snapshot"]["processes"][0]["pid"], 10);
+    }
+
+    #[test]
+    fn health_check_excludes_its_collector_and_its_ancestor_resource_contribution() {
+        let collector_pid = std::process::id();
+        let collector_child_pid = collector_pid.saturating_add(1);
+        let snapshot = ProcessSnapshot::from_processes(
+            vec![
+                process(0, 0, "kernel / system", 0),
+                process(10, 0, "api", 100 * 1024 * 1024),
+                process(11, 10, "worker", 50 * 1024 * 1024),
+                process(collector_pid, 10, "psmore", 25 * 1024 * 1024),
+                process(
+                    collector_child_pid,
+                    collector_pid,
+                    "collector-helper",
+                    5 * 1024 * 1024,
+                ),
+            ],
+            500,
+        );
+        let collector = CurrentProcessExclusion::capture(&snapshot);
+
+        assert_eq!(
+            matching_process_count_excluding_collector(&snapshot, "name:psmore", &collector)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            matching_process_count_excluding_collector(
+                &snapshot,
+                "name:collector-helper",
+                &collector,
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            matching_process_count_excluding_collector(
+                &snapshot,
+                "name:api tree.procs=2 children=1 tree.mem=150m",
+                &collector,
+            )
+            .unwrap(),
+            1
+        );
+        let json: Value = serde_json::from_str(
+            &render_json_for_view(&snapshot, "name:api", Some(&collector)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json["processes"][0]["direct_child_count"], 1);
+        assert_eq!(json["processes"][0]["subtree"]["process_count"], 2);
+        assert_eq!(
+            json["processes"][0]["subtree"]["memory_bytes"],
+            150 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn check_stability_requires_consecutive_passing_samples() {
+        let mut stability = CheckStability::new(3);
+        assert!(!stability.record(true));
+        assert!(!stability.record(true));
+        assert!(!stability.record(false));
+        assert!(!stability.record(true));
+        assert!(!stability.record(true));
+        assert!(stability.record(true));
+        assert_eq!(
+            stability.observation(Some(10_000), 4_200, false),
+            CheckObservation {
+                attempts: 6,
+                required_consecutive_passes: 3,
+                consecutive_passes: 3,
+                wait_timeout_ms: Some(10_000),
+                elapsed_ms: 4_200,
+                timed_out: false,
+            }
+        );
     }
 }

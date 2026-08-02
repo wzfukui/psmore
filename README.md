@@ -11,7 +11,7 @@
 - 上方以树展示进程父子关系，PID 0 是用于承接系统根、不可见父进程和采集期间消失进程的虚拟根节点
 - 下方显示当前节点的 PID、PPID、子进程数、状态、CPU、内存、磁盘读写速率、运行时间、路径和命令
 - 下方同时聚合当前进程与全部后代的进程数、CPU、内存和磁盘 I/O，便于判断一个完整服务树的真实资源占用
-- 首次进入 TUI 显示三页可翻阅的现场手册；随后 10 次启动各显示一条不阻塞键盘的高级 tip，完成一轮后自动停止，并可随时按 `?` 重新打开
+- 首次进入 TUI 显示三页可翻阅的现场手册；随后每次启动显示一条不阻塞键盘的高级 tip，10 条循环轮播，直到用户主动关闭，并可随时按 `?` 重新打开
 - 每一行在 PID 后显示命令行，若命令行不可用则显示可执行文件路径
 - 同级进程按名称、PID 确定性排序，刷新时不会因 HashMap 或同名进程导致顺序漂移
 - 键盘导航，实时搜索/过滤，聚焦当前进程的父链和子树
@@ -50,7 +50,7 @@
 - 所有无交互表格、JSON 和 JSONL 输出支持 `--redact`：在保留命令结构的同时遮盖常见密码、token、API key、认证 header、URL userinfo 和敏感查询参数
 - `psmore doctor` 提供一条命令的保守主机体检：快速模式结合有效内存、Swap、持续负载、异常进程状态和四类热点榜；显式 `--deep` 再并行扫描网络暴露、FD 压力、已删除仍占用文件及 Linux OOM/PSI 证据
 - `psmore diff BEFORE.json AFTER.json` 自动识别进程快照或主机体检报告：前者对比启动/退出、PID 复用、父进程与资源增量，后者对比新观察到/恢复/持续信号、严重度以及主机和 deep 证据变化；支持 `--fail-on regression --quiet` 发布门禁和 `--output` 私有原子归档
-- `psmore check QUERY` 将任意结构化查询变成 CI/运维健康门禁：默认期望零命中，`--expect any` 可反向要求服务存在；支持表格、`psmore.check-result` JSON 和完全静默的 `--quiet`
+- `psmore check QUERY` 将任意结构化查询变成 CI/运维健康门禁：排除检查器自身及其对子树聚合的干扰，默认期望零命中，`--expect any` 可反向要求服务存在；`--wait` 等待发布/恢复收敛，`--stable` 要求连续多个样本通过
 - `psmore inspect PID` 将 TUI 深度检查直接带到 SSH、脚本和事故工单：一次输出进程身份、完整命令、热点线程、socket、打开文件及平台运行上下文，也可导出 `psmore.process-inspection` JSON
 - `psmore port PORT` 直接回答“谁占用了这个端口”：将 TCP/UDP 本地端点关联到 PID、用户、完整命令、FD 和 Linux 网络 namespace，并可作为端口存在/释放健康门禁
 - `psmore listen` 从全局监听面反查进程和启动上下文，并将 wildcard、非回环网络、loopback 与 Unix socket 分类；`--exposed` 可直接聚焦需要安全复核的主机暴露面
@@ -58,8 +58,10 @@
 - `psmore tree PID` 在非交互环境输出目标的完整父链和后代树，保留目录连接线、稳定同级排序、进程自身/完整子树资源及显式深度截断，也可导出嵌套 JSON
 - `psmore watch [QUERY]` 建立进程基线后持续输出启动、退出、PID 复用、父进程变化及动态查询进入/离开事件；支持实时刷新的表格和每行一个文档的版本化 JSONL
 - `psmore trace PID` 连续记录单个进程及完整服务子树的 CPU、内存和 I/O，给出相对基线/上一采样的增长、实际采样间隔和峰值汇总；进程退出或 PID 复用时安全终止
+- `psmore run -- COMMAND` 从启动瞬间跟踪命令及完整后代树，汇总真实退出状态、耗时、进程构成和 CPU/内存/I/O 峰值；命令标准输出保持可管道使用
 - `psmore top [QUERY]` 将 TUI 热点排名带到 SSH 和脚本：按 CPU、内存、磁盘读或写排序，可在进程自身与完整服务子树口径之间切换，并输出稳定表格或版本化 JSON
 - `psmore oom [QUERY]` 在 Linux 上联合展示主机 MemAvailable/Swap、memory PSI、OOM kill 计数与进程 `oom_score`/调整值/cgroup 内存事件，区分“杀进程优先级”和“正在发生内存压力”
+- `psmore file PATH` 反查谁正在执行、映射、打开或以 cwd/root 使用某个文件；`--recursive` 可定位目录或挂载点下的全部使用者，并可作为发布替换、卸载和清理前的安全门禁
 - `psmore deleted` 定位“文件已删除但进程仍占用”的磁盘空间泄漏：展示 PID、FD、用户、完整命令、文件身份与大小，并按 device+inode 去重估算真正可释放空间
 - `psmore fd` 对全系统打开的文件描述符做风险排名：展示 PID、用户、完整命令、FD 数量以及 Linux 软/硬限制和使用率，可直接作为 FD 泄漏或耗尽的巡检门禁
 - 深度检查仅在打开或手动刷新面板时启动后台采样：macOS 调用一次 `lsof`，Linux 直接读取目标进程的 `/proc`，不会加入两秒一次的全局刷新
@@ -69,7 +71,7 @@
 
 第一次进入交互界面时，psmore 会展示三页现场手册，将主要能力按“理解进程树 → 从症状找到证据 → 安全操作与分享”组织起来。使用 `←`/`→`、`↑`/`↓` 或 `Tab` 翻页，`Enter`/`Esc` 开始工作；`q` 和 `Ctrl-C` 始终可以直接退出。
 
-完成首次手册后，接下来的 10 次启动会依次在右下角展示一条高级 tip，覆盖子树查询、热点、基线、网络、趋势和安全操作。Tip 不会抢走工作键：除 `Enter`、`Esc`、`?`、`T`、`D` 外，按下任意键都会关闭 tip 并继续执行该键原本的操作，例如 `Space` 仍会立即暂停、`/` 仍会开始查询。十条完成后默认自动停止，不会永久循环打扰熟练用户。
+完成首次手册后，每次启动会在右下角展示一条高级 tip，覆盖子树查询、热点、基线、网络、趋势和安全操作；10 条完成后从第一条继续轮播，直到用户主动关闭。Tip 不会抢走工作键：除 `Enter`、`Esc`、`?`、`T`、`D` 外，按下任意键都会关闭 tip 并继续执行该键原本的操作，例如 `Space` 仍会立即暂停、`/` 仍会开始查询。
 
 任何时候按 `?` 都能打开完整现场手册。引导内按 `T` 切换未来启动 tip，按 `D` 永久关闭启动卡片；只想本次跳过可运行：
 
@@ -96,6 +98,47 @@ psmore --no-tips
 
 文本字段包括 `name:`、`cmd:`、`path:`、`user:`、`state:`；数值比较支持 `>`、`>=`、`<`、`<=`、`=`。内存和 I/O 支持 `k`、`m`、`g`、`t`，运行时间支持 `s`、`m`、`h`、`d`。任意条件前加 `!` 表示排除。
 
+## 安装
+
+发布归档不要求目标机器安装 Rust。下载与系统架构匹配的 `psmore-vVERSION-TARGET.tar.gz` 及同名 `.sha256` 后，先校验再安装：
+
+```bash
+# Linux；macOS 将 sha256sum 换成 shasum -a 256
+sha256sum -c psmore-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf psmore-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+cd psmore-v0.1.0-x86_64-unknown-linux-gnu
+
+# 默认安装到 ~/.local，不使用 sudo，不修改 shell 启动文件
+./install.sh --dry-run
+./install.sh
+~/.local/bin/psmore --version
+
+# 精确删除二进制、man page 和补全；用户状态与诊断报告会保留
+~/.local/share/psmore/uninstall.sh --dry-run
+~/.local/share/psmore/uninstall.sh
+```
+
+可以用 `--prefix /absolute/path` 指定安装位置，或设置 `PSMORE_PREFIX`；`--no-completions` 只安装二进制、man page 和卸载器。安装后的 man page 位于 `$PREFIX/share/man/man1/psmore.1`，bash、zsh、fish 补全分别安装到各自约定的 `$PREFIX/share` 目录。若 `~/.local/bin` 尚未加入 `PATH`，安装器会给出明确提示。
+
+从当前源码安装需要 Rust 1.85 或更高版本：
+
+```bash
+cargo install --path . --locked
+psmore --version
+psmore --help
+```
+
+默认目标通常是 `~/.cargo/bin/psmore`；请确保 `~/.cargo/bin` 已加入 `PATH`。开发中的本地覆盖安装可使用 `cargo install --path . --locked --force`。psmore 不要求 root；以更高权限运行只会扩大受操作系统权限控制的进程、FD 和网络可见范围。
+
+源码仓库可为当前机器生成与 CI 相同结构的原生归档，并执行隔离的安装/卸载验证：
+
+```bash
+scripts/package-release.sh
+scripts/verify-release-package.sh dist/psmore-v*.tar.gz
+```
+
+发布归档记录源码 commit、dirty 状态、目标架构、Rust 版本和固定时间源，并生成 SHA-256 校验文件。SHA-256 用于确认下载完整性，不代替发布者身份签名；应从可信的发布页面同时取得归档和校验文件。详细发布流程和许可证边界见 [`docs/RELEASING.md`](docs/RELEASING.md)。
+
 ## 运行
 
 需要 Rust 1.85 或更高版本，以及系统自带的 `ps`（Linux 通常由 `procps` 提供）。macOS 深度检查使用系统 `lsof`；Linux 直接读取 `/proc`，不需要额外诊断工具。缺少诊断数据源时进程树仍可正常使用，检查面板会明确提示原因。
@@ -116,17 +159,7 @@ psmore --no-onboarding
 
 在欢迎页、tip 或按 `?` 打开的帮助中，按 `T` 切换后续启动 tips，按 `D` 永久关闭所有启动卡片；关闭后仍可按 `?` 打开帮助并用 `T` 重新启用。偏好状态使用私有原子文件：macOS 默认位于 `~/Library/Application Support/psmore/ui-state.json`，Linux 默认位于 `${XDG_CONFIG_HOME:-~/.config}/psmore/ui-state.json`；测试、便携安装或受管环境可用 `PSMORE_CONFIG_DIR` 指定目录。状态文件不保存进程信息，Unix 权限为 `0600`。
 
-从当前源码安装到 Cargo 的用户二进制目录：
-
-```bash
-cargo install --path .
-psmore --version
-psmore --help
-```
-
-默认目标通常是 `~/.cargo/bin/psmore`；请确保 `~/.cargo/bin` 已加入 `PATH`。开发中的本地覆盖安装可使用 `cargo install --path . --force`。psmore 不要求 root；以更高权限运行只会扩大受操作系统权限控制的进程、FD 和网络可见范围。
-
-安装后可以启用命令、选项和枚举值补全：
+源码安装后也可以按需手工启用命令、选项和枚举值补全；发布归档的安装器会自动放置这些文件：
 
 ```bash
 # zsh：持久安装；确保 ~/.zfunc 在 fpath 中并已执行 compinit
@@ -224,6 +257,13 @@ psmore check 'state:zombie'
 # 要求部署用户的 API 至少存在一个，否则退出 3
 psmore check 'name:api user:deploy' --expect any
 
+# 发布后最多等待 30 秒，并要求连续 3 次采样都看到 API 才通过
+psmore check 'name:api user:deploy' --expect any \
+  --wait 30s --interval-ms 1000 --stable 3 --quiet
+
+# 等待旧 worker 完全退出；条件收敛即提前返回
+psmore check 'name:old-worker' --expect none --wait 2m --stable 2
+
 # 限制完整服务树内存，并输出适合 CI 归档的单一 JSON 文档
 psmore check 'tree.mem>2g' --json > memory-gate.json
 
@@ -231,7 +271,9 @@ psmore check 'tree.mem>2g' --json > memory-gate.json
 psmore check 'cpu>90 age>5m' --quiet
 ```
 
-默认 expectation 是 `none`，即零命中才通过；`--expect any` 表示至少一个命中才通过。命令仍执行两次采样，默认间隔 500 ms，可用 `--sample-ms` 调整。表格首行明确显示 `CHECK PASS` 或 `CHECK FAIL`，随后仅在有命中时列出相关进程；JSON 包含策略、查询、命中数、通过状态以及完整的过滤快照。
+默认 expectation 是 `none`，即零命中才通过；`--expect any` 表示至少一个命中才通过。默认只评估一次；指定 `--wait 30s`、`--wait 500ms`、`--wait 2m` 或 `--wait 1h` 后，会按 `--interval-ms` 节拍重试，条件满足即提前返回，超时仍不满足则退出 `3`。等待时间必须不短于 `--sample-ms`。`--stable N` 要求连续 N 次评估通过，中间任意失败都会把连续计数清零，适合等待滚动发布真正稳定，而不是被一个瞬时进程骗过。
+
+每次评估仍对 CPU 与 I/O 执行两次采样，默认间隔 500 ms，可用 `--sample-ms` 调整；`--interval-ms` 控制评估开始节拍，两者职责不同。截止前已经开始的最后一次原子采样会完整结束，因此 JSON 中的实际 `elapsed_ms` 可能略高于配置的 timeout。检查器自己的 PID 永远不会参与查询；若 psmore 是某个 shell、CI runner 或服务树的子进程，它的 CPU、内存、I/O 和进程数也会从该祖先的 `tree.*` 与 `children` 条件中扣除，避免探针改变被测对象。表格明确显示尝试次数、连续通过数、耗时、超时状态以及 collector exclusion；`psmore.check-result` JSON 在 `evaluation` 中提供同样的机器可读证据，并保留最后一次过滤快照。
 
 ### 无交互进程深检
 
@@ -402,6 +444,25 @@ jq 'select(.kind == "sample") | [.elapsed_ms, .process.own.memory_bytes, .proces
 
 trace 在开始时固定 PID、启动时间、进程名和命令。目标正常退出或该 PID 被新进程复用时，会先输出明确终止事件，再输出 complete，且不会继续采样新实例；这是成功完成的观察，退出码为 `0`。目标一开始不可见，或采样过程中身份从可验证变为不可验证时退出 `1`。当平台从始至终都拿不到启动时间时，会明确标为 `unverified_fallback`，仅在名称和命令保持一致时继续。JSONL 含完整命令、路径、用户和主机信息，分享前应检查敏感内容。
 
+### 从启动瞬间分析一条命令
+
+短命构建、测试脚本和启动器经常来不及先找 PID 再运行 `trace`。`run` 先启动采集器，再拉起命令，并持续识别其完整后代树：
+
+```bash
+# 被测命令照常使用终端；结束后在 stderr 输出子树资源报告
+psmore run -- make test
+
+# 提高长任务采样间隔；命令自身的参数必须位于 -- 后
+psmore run --interval-ms 250 -- ./server --config ./dev.toml
+
+# 命令 stdout/stderr 均保持原样，JSON 以 0600 权限原子归档
+psmore run --output profile.json -- sh -c 'worker & wait' | consumer
+```
+
+报告使用 `psmore.command-profile` schema v1，包含命令根 PID、退出码或信号、命令耗时、监控耗时、观察到的进程实例数/峰值并发数、完整进程身份及子树 CPU、内存和 I/O 峰值。默认每 100ms 采样；命令退出后继续观察后代最多 1000ms，可用 `--linger-ms 0..60000` 调整。仍有后代时报告标为 `grace_expired`，不会被脱离父进程的守护进程无限阻塞。
+
+命令继承 stdin、stdout 和 stderr；未指定文件时，最终报告写到 psmore 自己的 stderr，因此 shell 管道只收到命令 stdout。需要可靠机器报告时应使用 `--output FILE`：它隐式选择 JSON、以同目录临时文件完整写入后原子发布、权限为 0600，并默认拒绝覆盖；只有显式 `--force` 才替换已有普通文件。这样即使命令自身写 stderr，JSON 也不会混杂。psmore 镜像命令退出码，Unix 信号按惯例返回 `128+signal`。轮询可能漏掉短于采样间隔的进程和尖峰；JSON 的 `observed_lifecycle_complete`、`root_observed`、`first_observation_ms` 与 warnings 会明确说明证据边界。使用 `--redact` 可遮盖报告中的常见密钥，但分享前仍应检查命令、路径、用户名和主机信息。
+
 ### SSH 热点排名
 
 只想快速回答“此刻谁最耗资源”时，不必进入 TUI，也不必先导出全量快照再用外部脚本排序：
@@ -457,6 +518,28 @@ psmore oom --min-score 250 --json > oom-diagnostics.json
 `--min-score` 在完整查询之后筛选，`--limit` 只影响返回行数，健康门禁始终针对全部匹配候选。若查询命中的进程在采集期间退出或 `oom_score` 因权限不可读，零命中不能证明不存在，`--expect` 会返回 `inconclusive` 和退出码 `1`；确认违反策略退出 `3`。JSON 使用 `psmore.oom-diagnostics` schema v1，明确记录 score 覆盖、上下文覆盖、截断和解释文本。
 
 该命令依赖 Linux `/proc`、PSI 和 cgroup 文件系统；macOS 会明确返回“不支持”，可先用 `psmore top --by memory`、`psmore trace PID` 和系统内存压力工具排查，不会伪造 Linux OOM 分数。
+
+### 文件、目录与挂载点使用者
+
+发布替换文件、卸载挂载点、删除构建目录，或者怀疑进程仍在使用旧配置时，可以直接从路径反查进程上下文：
+
+```bash
+# 精确查找执行、映射、打开或作为 cwd/root 使用 config.yaml 的进程
+psmore file ./config.yaml
+
+# 找出挂载点及其全部后代路径的使用者，不截断证据
+psmore file /Volumes/data --recursive --limit all
+
+# 机器可读证据，包括完整命令、角色、FD、访问模式和覆盖完整性
+psmore file /srv/release --recursive --json
+
+# 发布替换或卸载前门禁：发现任意使用者即退出 3
+psmore file /srv/release --recursive --expect none --quiet
+```
+
+默认是精确路径匹配；`--recursive` 同时匹配路径本身和所有后代，并使用组件边界，不会把 `/srv/app` 错配到 `/srv/application`。相对路径从当前目录解析，存在的目标会先 canonicalize；精确文件还会使用 device+inode 识别硬链接到同一对象的路径。角色分为 `EXEC`（正在执行）、`CWD`、`ROOT`、`OPEN`（数字 FD）和 `MAPPED`（动态库或 mmap）。同一进程对同一路径的不同关系会保留为独立证据。
+
+Linux 读取 `/proc/<pid>/exe`、`cwd`、`root`、`fd` 和 `maps`；macOS 使用一次全局 `lsof`。psmore 自身及采集辅助进程会被排除。`--limit` 默认 100，仅限制返回行，不影响针对全部匹配项的策略判断。JSON 使用 `psmore.file-usage` schema v1。若零命中但权限或进程竞态导致文件视图不完整，`--expect` 结果为 `inconclusive` 并退出 `1`，不会把“看不见”说成“无人使用”。命令只读，不关闭 FD、不卸载文件系统，也不发送信号。
 
 ### 文件描述符压力
 

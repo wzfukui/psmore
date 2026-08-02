@@ -37,20 +37,27 @@ _psmore_completion() {
     fi
 
     if (( COMP_CWORD == 1 )); then
-        words="check inspect port listen net tree watch trace deleted fd top oom doctor diff completion --table --json --query --no-tips --sample-ms --redact --help --version"
+        words="check inspect port listen net tree watch trace run deleted file fd top oom doctor diff completion --table --json --query --no-tips --sample-ms --redact --help --version"
         COMPREPLY=( $(compgen -W "$words" -- "$cur") )
         return
     fi
 
+    if [[ "$cmd" == "file" && "$cur" != -* ]]; then
+        COMPREPLY=( $(compgen -f -- "$cur") )
+        return
+    fi
+
     case "$cmd" in
-        check) words="--expect --table --json --quiet --sample-ms --help --version" ;;
+        check) words="--expect --wait --interval-ms --stable --table --json --quiet --sample-ms --help --version" ;;
         inspect) words="--table --json --sample-ms --help --version" ;;
         port) words="--protocol --all --table --json --expect --quiet --help --version" ;;
         listen) words="--query --protocol --exposed --limit --table --json --expect --quiet --help --version" ;;
         tree) words="--depth --table --json --sample-ms --help --version" ;;
         watch) words="--query --table --jsonl --interval-ms --count --help --version" ;;
         trace) words="--table --jsonl --interval-ms --count --help --version" ;;
+        run) words="--table --json --interval-ms --linger-ms --output --force -- --help --version" ;;
         deleted) words="--min-size --table --json --expect --quiet --help --version" ;;
+        file) words="--recursive --limit --table --json --expect --quiet --help --version" ;;
         fd) words="--min-count --min-percent --limit --table --json --expect --quiet --help --version" ;;
         top) words="--query --by --scope --limit --table --json --sample-ms --help --version" ;;
         oom) words="--query --min-score --limit --table --json --expect --quiet --sample-ms --help --version" ;;
@@ -80,7 +87,9 @@ _psmore() {
     'tree:print process ancestor and descendant context'
     'watch:stream lifecycle and query events'
     'trace:record process and subtree resource samples'
+    'run:launch a command and profile its process subtree'
     'deleted:find deleted files still held open'
+    'file:find processes using a file or directory'
     'fd:rank file-descriptor pressure'
     'top:rank CPU memory and disk I/O hotspots'
     'oom:diagnose Linux memory pressure and OOM priority'
@@ -122,7 +131,7 @@ _psmore() {
   fi
 
   case "$cmd" in
-    check) options=( '--expect[none or any]:mode:(none any)' '--table[table output]' '--json[JSON output]' '--quiet[suppress output]' '--sample-ms[sampling milliseconds]:milliseconds:' ) ;;
+    check) options=( '--expect[none or any]:mode:(none any)' '--wait[retry until policy passes]:duration:' '--interval-ms[evaluation cadence]:milliseconds:' '--stable[required consecutive passes]:samples:' '--table[table output]' '--json[JSON output]' '--quiet[suppress output]' '--sample-ms[sampling milliseconds]:milliseconds:' ) ;;
     inspect) options=( '--table[table output]' '--json[JSON output]' '--sample-ms[sampling milliseconds]:milliseconds:' ) ;;
     port) options=( '--protocol[protocol]:protocol:(any tcp udp)' '--all[include connections]' '--table[table output]' '--json[JSON output]' '--expect[policy]:mode:(none any)' '--quiet[suppress output]' ) ;;
     listen) options=( '--query[filter text]:filter:' '--protocol[protocol]:protocol:(any tcp udp unix)' '--exposed[non-loopback binds only]' '--limit[maximum rows]:rows:(all)' '--table[table output]' '--json[JSON output]' '--expect[policy]:mode:(none any)' '--quiet[suppress output]' ) ;;
@@ -130,7 +139,9 @@ _psmore() {
     tree) options=( '--depth[descendant depth]:depth:(all)' '--table[table output]' '--json[JSON output]' '--sample-ms[sampling milliseconds]:milliseconds:' ) ;;
     watch) options=( '--query[process query]:query:' '--table[table stream]' '--jsonl[JSONL stream]' '--interval-ms[refresh milliseconds]:milliseconds:' '--count[refresh count]:count:' ) ;;
     trace) options=( '--table[table stream]' '--jsonl[JSONL stream]' '--interval-ms[refresh milliseconds]:milliseconds:' '--count[sample count]:count:' ) ;;
+    run) options=( '--table[table report on stderr]' '--json[JSON report on stderr]' '--interval-ms[sampling milliseconds]:milliseconds:' '--linger-ms[post-exit descendant grace]:milliseconds:' '--output[atomically write private JSON]:file:_files' '--force[replace an existing output file]' ) ;;
     deleted) options=( '--min-size[minimum reclaimable size]:size:' '--table[table output]' '--json[JSON output]' '--expect[policy]:mode:(none any)' '--quiet[suppress output]' ) ;;
+    file) options=( '--recursive[match all descendants]' '--limit[maximum evidence rows]:rows:(all)' '--table[table output]' '--json[JSON output]' '--expect[policy]:mode:(none any)' '--quiet[suppress output]' ) ;;
     fd) options=( '--min-count[minimum descriptors]:count:' '--min-percent[minimum utilization]:percent:' '--limit[maximum rows]:rows:(all)' '--table[table output]' '--json[JSON output]' '--expect[policy]:mode:(none any)' '--quiet[suppress output]' ) ;;
     top) options=( '--query[process query]:query:' '--by[ranking metric]:metric:(cpu memory read write)' '--scope[ranking scope]:scope:(process tree)' '--limit[maximum rows]:rows:(all)' '--table[table output]' '--json[JSON output]' '--sample-ms[sampling milliseconds]:milliseconds:' ) ;;
     oom) options=( '--query[process query]:query:' '--min-score[minimum kernel OOM score]:score:' '--limit[maximum candidates]:rows:(all)' '--table[table output]' '--json[JSON output]' '--expect[policy]:mode:(none any)' '--quiet[suppress output]' '--sample-ms[sampling milliseconds]:milliseconds:' ) ;;
@@ -155,7 +166,9 @@ complete -c psmore -n '__fish_use_subcommand' -a net -d 'Search all sockets, pee
 complete -c psmore -n '__fish_use_subcommand' -a tree -d 'Print process relationship context'
 complete -c psmore -n '__fish_use_subcommand' -a watch -d 'Stream lifecycle and query events'
 complete -c psmore -n '__fish_use_subcommand' -a trace -d 'Record process and subtree samples'
+complete -c psmore -n '__fish_use_subcommand' -a run -d 'Launch and profile a complete process subtree'
 complete -c psmore -n '__fish_use_subcommand' -a deleted -d 'Find deleted files still held open'
+complete -c psmore -n '__fish_use_subcommand' -a file -d 'Find processes using a file or directory'
 complete -c psmore -n '__fish_use_subcommand' -a fd -d 'Rank file-descriptor pressure'
 complete -c psmore -n '__fish_use_subcommand' -a top -d 'Rank CPU, memory, and disk I/O hotspots'
 complete -c psmore -n '__fish_use_subcommand' -a oom -d 'Diagnose Linux memory pressure and OOM priority'
@@ -164,12 +177,15 @@ complete -c psmore -n '__fish_use_subcommand' -a diff -d 'Compare snapshots or d
 complete -c psmore -n '__fish_use_subcommand' -a completion -d 'Generate shell completion'
 
 complete -c psmore -n '__fish_seen_subcommand_from completion' -a 'bash zsh fish'
-complete -c psmore -n 'not __fish_seen_subcommand_from check inspect port listen net tree watch trace deleted fd top oom doctor diff completion' -s q -l query -r -d 'Initial TUI or snapshot query'
-complete -c psmore -n 'not __fish_seen_subcommand_from check inspect port listen net tree watch trace deleted fd top oom doctor diff completion' -l no-tips -d 'Skip startup guidance for this TUI run'
-complete -c psmore -n 'not __fish_seen_subcommand_from check inspect port listen net tree watch trace deleted fd top oom doctor diff completion' -l table -d 'Print table snapshot'
-complete -c psmore -n 'not __fish_seen_subcommand_from check inspect port listen net tree watch trace deleted fd top oom doctor diff completion' -l json -d 'Print JSON snapshot'
-complete -c psmore -n 'not __fish_seen_subcommand_from check inspect port listen net tree watch trace deleted fd top oom doctor diff completion' -l sample-ms -r -d 'Sampling milliseconds'
-complete -c psmore -n '__fish_seen_subcommand_from check port listen net deleted fd oom' -l expect -xa 'none any'
+complete -c psmore -n 'not __fish_seen_subcommand_from check inspect port listen net tree watch trace run deleted file fd top oom doctor diff completion' -s q -l query -r -d 'Initial TUI or snapshot query'
+complete -c psmore -n 'not __fish_seen_subcommand_from check inspect port listen net tree watch trace run deleted file fd top oom doctor diff completion' -l no-tips -d 'Skip startup guidance for this TUI run'
+complete -c psmore -n 'not __fish_seen_subcommand_from check inspect port listen net tree watch trace run deleted file fd top oom doctor diff completion' -l table -d 'Print table snapshot'
+complete -c psmore -n 'not __fish_seen_subcommand_from check inspect port listen net tree watch trace run deleted file fd top oom doctor diff completion' -l json -d 'Print JSON snapshot'
+complete -c psmore -n 'not __fish_seen_subcommand_from check inspect port listen net tree watch trace run deleted file fd top oom doctor diff completion' -l sample-ms -r -d 'Sampling milliseconds'
+complete -c psmore -n '__fish_seen_subcommand_from check port listen net deleted file fd oom' -l expect -xa 'none any'
+complete -c psmore -n '__fish_seen_subcommand_from check' -l wait -r -d 'Retry until policy passes or duration expires'
+complete -c psmore -n '__fish_seen_subcommand_from check' -l interval-ms -r -d 'Evaluation cadence while waiting'
+complete -c psmore -n '__fish_seen_subcommand_from check' -l stable -r -d 'Required consecutive passing evaluations'
 complete -c psmore -n '__fish_seen_subcommand_from port' -l protocol -xa 'any tcp udp'
 complete -c psmore -n '__fish_seen_subcommand_from listen' -l protocol -xa 'any tcp udp unix'
 complete -c psmore -n '__fish_seen_subcommand_from net' -l protocol -xa 'any tcp udp unix'
@@ -194,15 +210,22 @@ complete -c psmore -n '__fish_seen_subcommand_from port' -l all -d 'Include non-
 complete -c psmore -n '__fish_seen_subcommand_from listen' -l exposed -d 'Wildcard and non-loopback binds only'
 complete -c psmore -n '__fish_seen_subcommand_from watch trace' -l interval-ms -r
 complete -c psmore -n '__fish_seen_subcommand_from watch trace' -l count -r
+complete -c psmore -n '__fish_seen_subcommand_from run' -l interval-ms -r -d 'Sampling milliseconds'
+complete -c psmore -n '__fish_seen_subcommand_from run' -l linger-ms -r -d 'Post-exit descendant grace milliseconds'
+complete -c psmore -n '__fish_seen_subcommand_from run' -l output -r -F -d 'Atomically write private JSON'
+complete -c psmore -n '__fish_seen_subcommand_from run' -l force -d 'Replace an existing output file'
 complete -c psmore -n '__fish_seen_subcommand_from inspect tree check top oom doctor' -l sample-ms -r
 complete -c psmore -n '__fish_seen_subcommand_from deleted' -l min-size -r
+complete -c psmore -n '__fish_seen_subcommand_from file' -l recursive -d 'Match the path and all descendants'
+complete -c psmore -n '__fish_seen_subcommand_from file' -l limit -xa all
+complete -c psmore -n '__fish_seen_subcommand_from file' -F
 complete -c psmore -n '__fish_seen_subcommand_from fd' -l min-count -r
 complete -c psmore -n '__fish_seen_subcommand_from fd' -l min-percent -r
 complete -c psmore -n '__fish_seen_subcommand_from listen net watch top oom doctor' -s q -l query -r
-complete -c psmore -n '__fish_seen_subcommand_from check inspect port listen net tree deleted fd top oom doctor diff' -l table
-complete -c psmore -n '__fish_seen_subcommand_from check inspect port listen net tree deleted fd top oom doctor diff' -l json
+complete -c psmore -n '__fish_seen_subcommand_from check inspect port listen net tree run deleted file fd top oom doctor diff' -l table
+complete -c psmore -n '__fish_seen_subcommand_from check inspect port listen net tree run deleted file fd top oom doctor diff' -l json
 complete -c psmore -n '__fish_seen_subcommand_from watch trace' -l jsonl
-complete -c psmore -n '__fish_seen_subcommand_from check port listen net deleted fd oom doctor diff' -l quiet
+complete -c psmore -n '__fish_seen_subcommand_from check port listen net deleted file fd oom doctor diff' -l quiet
 complete -c psmore -l redact -d 'Mask common secret values in command lines'
 complete -c psmore -s h -l help -d 'Print help'
 complete -c psmore -s V -l version -d 'Print version'
@@ -223,7 +246,9 @@ mod tests {
             "tree",
             "watch",
             "trace",
+            "run",
             "deleted",
+            "file",
             "fd",
             "top",
             "oom",
@@ -288,6 +313,22 @@ mod tests {
                 "{} completion is missing doctor --deep",
                 shell.label()
             );
+            assert!(
+                (script.contains("--wait") || script.contains("-l wait"))
+                    && (script.contains("--stable") || script.contains("-l stable")),
+                "{} completion is missing check convergence options",
+                shell.label()
+            );
+            assert!(
+                script.contains("--recursive") || script.contains("-l recursive"),
+                "{} completion is missing file --recursive",
+                shell.label()
+            );
+            match shell {
+                CompletionShell::Bash => assert!(script.contains("compgen -f")),
+                CompletionShell::Zsh => assert!(script.contains("_files")),
+                CompletionShell::Fish => assert!(script.contains("file' -F")),
+            }
         }
     }
 }

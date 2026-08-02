@@ -1,0 +1,286 @@
+.TH PSMORE 1 "2026-08-02" "psmore" "User Commands"
+.SH NAME
+psmore \- relationship-first process diagnostics for macOS and Linux
+.SH SYNOPSIS
+.B psmore
+.RI [ QUERY ]
+.RI [ OPTIONS ]
+.br
+.B psmore
+.I COMMAND
+.RI [ ARGUMENTS ]
+.SH DESCRIPTION
+.B psmore
+is an interactive process tree and a scriptable diagnostics workbench. It keeps
+parent, child, sibling, service-subtree, command-line, resource, network, file,
+and lifecycle evidence in one model. The default mode opens a terminal UI;
+subcommands provide stable tables and versioned JSON for SSH sessions, incident
+records, and health gates.
+.PP
+Collection is read-only unless the user explicitly invokes a process action in
+the TUI. Visibility is limited by operating-system permissions. Missing evidence
+is reported as incomplete or inconclusive rather than treated as proof that a
+condition is absent.
+.SH COMMANDS
+.TP
+.B check QUERY
+Evaluate whether a process query has any or no matches. The collector process
+and its contribution to ancestor subtree metrics are excluded from the gate.
+Use
+.B --wait
+to retry until a condition converges and
+.B --stable
+to require consecutive passing evaluations.
+.TP
+.B inspect PID
+Inspect one process, its runtime context, threads, sockets, files, limits, and
+security evidence.
+.TP
+.B port PORT
+Find processes and socket references associated with a local TCP or UDP port.
+.TP
+.B listen
+Inventory listening sockets, bind exposure, owners, and namespaces.
+.TP
+.B net
+Search listening, connected, peer, and Unix socket evidence.
+.TP
+.B tree PID
+Print a stable ancestor chain and nested descendants for one process.
+.TP
+.B watch
+Stream starts, exits, PID reuse, reparenting, and query membership changes.
+.TP
+.B trace PID
+Sample process and service-subtree CPU, memory, and I/O over time.
+.TP
+.B run [OPTIONS] -- COMMAND [ARGUMENTS]
+Launch COMMAND and profile every observable process in its descendant tree.
+The command inherits standard input, output, and error; the final profile is
+written to the diagnostic standard error stream so command output remains safe
+for pipelines. The psmore exit status mirrors COMMAND. Use
+.B --linger-ms
+to bound post-exit descendant observation. Use
+.B --output
+to atomically write an unambiguous private JSON report while preserving command
+standard error.
+.TP
+.B deleted
+Find deleted files that remain open and estimate reclaimable space.
+.TP
+.B file PATH
+Find processes executing, mapping, opening, or using PATH as their current or
+root directory. Existing targets are also matched by device and inode. Use
+.B --recursive
+to include every descendant of a directory or mount point; use
+.B --expect none
+as a conservative pre-replacement or pre-unmount safety gate.
+.TP
+.B fd
+Rank file-descriptor pressure and compare counts with known process limits.
+.TP
+.B top
+Rank process or complete subtree CPU, memory, read, and write hotspots.
+.TP
+.B oom
+On Linux, correlate OOM selection priority with memory, swap, PSI, cgroup, and
+kernel OOM evidence.
+.TP
+.B doctor
+Run conservative host and process triage. With
+.BR --deep ,
+also scan network exposure, FD pressure, deleted-open files, and Linux OOM/PSI.
+.TP
+.B diff BEFORE AFTER
+Compare two process snapshots or two host doctor reports. Doctor reports may use
+.B --fail-on regression
+as an automation gate.
+.TP
+.B completion bash|zsh|fish
+Write a completion script to standard output.
+.SH PROCESS QUERY
+Plain terms search names and command context case-insensitively. Structured
+fields include
+.BR name: ,
+.BR cmd: ,
+.BR path: ,
+.BR user: ,
+.BR state: ,
+.BR pid: ,
+and
+.BR ppid: .
+Numeric conditions include
+.BR cpu> ,
+.BR mem>= ,
+.BR read> ,
+.BR write> ,
+.BR age> ,
+.BR children>= ,
+.BR tree.cpu> ,
+.BR tree.mem> ,
+and
+.BR tree.procs>= .
+Prefix a condition with
+.B !
+to exclude it. Memory and I/O units accept k, m, g, and t; age accepts s, m, h,
+and d.
+.SH COMMON OPTIONS
+.TP
+.BR -q , " --query " QUERY
+Apply a process query.
+.TP
+.B --table
+Write a stable human-readable table and exit.
+.TP
+.B --json
+Write a versioned machine-readable JSON document and exit.
+.TP
+.B --redact
+Mask common secret flags, assignments, headers, URLs, and query values in
+command lines. Always review output before sharing it.
+.TP
+.BI --sample-ms " MILLISECONDS"
+Set the resource sampling interval where supported.
+.TP
+.BI --wait " DURATION"
+For
+.BR check ,
+retry until the policy passes or the timeout expires. Durations accept ms, s,
+m, or h and must be at least as long as the sampling interval.
+.TP
+.BI --interval-ms " MILLISECONDS"
+For check, set the evaluation cadence while waiting. For run, set the command
+subtree sampling interval.
+.TP
+.BI --linger-ms " MILLISECONDS"
+For run, continue observing known descendants for this many milliseconds after
+the launched command exits. The default is 1000; the accepted range is 0 to
+60000.
+.TP
+.BI --output " FILE"
+For run, atomically write a mode-0600 JSON report without mixing it with command
+standard error. Existing files are refused unless
+.B --force
+is also specified.
+.TP
+.BI --stable " COUNT"
+For
+.BR check ,
+require COUNT consecutive passing evaluations. A failing evaluation resets the
+consecutive count.
+.TP
+.B --recursive
+For
+.BR file ,
+match the resolved path and all descendants using component-aware path
+comparison.
+.TP
+.BI --limit " COUNT|all"
+Limit returned evidence rows for commands that support it. Policy evaluation is
+performed before truncation.
+.TP
+.BI --expect " none|any"
+Apply a policy to all matches. Confirmed violations exit 3. A zero-match result
+with incomplete collection is inconclusive and exits 1.
+.TP
+.B --quiet
+Suppress normal output for a command with an explicit policy, using only the
+exit status.
+.TP
+.B --no-tips
+Suppress startup guidance for this TUI run without changing saved preferences.
+.TP
+.BR -h , " --help"
+Show global or command-specific help.
+.TP
+.BR -V , " --version"
+Show the psmore version.
+.SH TUI KEYS
+.TP
+.BR Up / Down , " j / k"
+Move the selection. The viewport follows the selected row.
+.TP
+.BR Left / Right , " h / l"
+Reveal parent context or expand/collapse the selected process subtree.
+.TP
+.B /
+Search and locate matching processes. Enter accepts the located result; normal
+navigation leaves locate mode while retaining the result context.
+.TP
+.B Space
+Pause or resume live refresh.
+.TP
+.BR n ,
+.BR d ,
+.BR b ,
+and
+.B i
+Open network, deep inspection, baseline/diff, or process detail workspaces.
+.TP
+.BR ?
+Open the field guide. Within guidance,
+.B T
+toggles future tips and
+.B D
+disables startup cards.
+.TP
+.BR q
+Close the current panel or quit from the main process tree.
+.SH EXIT STATUS
+.TP
+.B 0
+The command completed and any requested policy passed.
+.TP
+.B 1
+Collection or runtime failed, or evidence was insufficient for a conclusive
+policy result.
+.TP
+.B 2
+Command-line usage, input schema, or unsafe output selection was invalid.
+.TP
+.B 3
+A confirmed expectation, severity threshold, or regression policy failed.
+.SH FILES
+.TP
+.I ~/Library/Application Support/psmore/ui-state.json
+Default macOS TUI preference state.
+.TP
+.I ${XDG_CONFIG_HOME:-~/.config}/psmore/ui-state.json
+Default Linux TUI preference state.
+.TP
+.I PREFIX/share/psmore/uninstall.sh
+Uninstaller for a binary-package installation. It does not remove TUI state or
+diagnostic reports.
+.SH ENVIRONMENT
+.TP
+.B PSMORE_CONFIG_DIR
+Override the directory used for private TUI preference state.
+.TP
+.B PSMORE_PREFIX
+Override the binary package install prefix. The default is
+.IR ~/.local .
+.TP
+.B XDG_CONFIG_HOME
+Select the Linux user configuration root when
+.B PSMORE_CONFIG_DIR
+is unset.
+.SH PRIVACY AND SAFETY
+Process arguments, paths, usernames, hostnames, sockets, and files may contain
+sensitive data. JSON exports are created privately when written through psmore,
+but redaction is best effort. Review reports before sharing them. Run with only
+the privileges needed for the incident; higher privileges increase visibility
+and the impact of explicit process actions.
+.PP
+The
+.B file
+command is read-only. Linux reads executable, cwd, root, descriptor, and mapping
+evidence from
+.IR /proc ;
+macOS performs one global
+.BR lsof (8)
+scan. psmore and its collection helper are excluded. Incomplete visibility is
+reported explicitly and never used to prove that a path has no users.
+.SH SEE ALSO
+.BR ps (1),
+.BR lsof (8),
+.BR top (1)

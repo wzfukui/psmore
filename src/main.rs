@@ -8,11 +8,13 @@ mod headless_diff;
 mod headless_doctor;
 mod headless_doctor_diff;
 mod headless_fd;
+mod headless_file;
 mod headless_inspect;
 mod headless_listen;
 mod headless_net;
 mod headless_oom;
 mod headless_port;
+mod headless_run;
 mod headless_top;
 mod headless_trace;
 mod headless_tree;
@@ -36,7 +38,8 @@ use std::{
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     process::ExitCode,
-    time::Duration,
+    thread,
+    time::{Duration, Instant},
 };
 
 use crossterm::{
@@ -51,8 +54,9 @@ use crate::{
     cli::{Cli, DiffPolicyStatus, LaunchMode, help_text},
     completion::completion_script,
     headless::{
-        capture_snapshot, matching_process_count, render_check_json, render_check_table,
-        render_json, render_table, validate_query,
+        CheckObservation, CheckStability, CurrentProcessExclusion, ProcessSnapshot,
+        capture_snapshot, matching_process_count_excluding_collector, render_check_json,
+        render_check_table, render_json, render_table, validate_query,
     },
     headless_deleted::{
         DeletedPolicyStatus, capture_deleted_files, render_deleted_json, render_deleted_table,
@@ -62,6 +66,7 @@ use crate::{
         DoctorPolicyStatus, capture_doctor, render_doctor_json, render_doctor_table,
     },
     headless_fd::{FdPolicyStatus, capture_fd_usage, render_fd_json, render_fd_table},
+    headless_file::{FilePolicyStatus, capture_file_usage, render_file_json, render_file_table},
     headless_inspect::{capture_inspection, render_inspection_json, render_inspection_table},
     headless_listen::{
         ListenPolicyStatus, capture_listeners, render_listeners_json, render_listeners_table,
@@ -71,12 +76,13 @@ use crate::{
     },
     headless_oom::{OomPolicyStatus, capture_oom_diagnostics, render_oom_json, render_oom_table},
     headless_port::{PortPolicyStatus, capture_port, render_port_json, render_port_table},
+    headless_run::{RunOutput, run_command_profile},
     headless_top::{render_top_json, render_top_table},
     headless_trace::{TraceOutput, TraceRunStatus, run_trace},
     headless_tree::{build_tree, render_tree_json, render_tree_table},
     headless_watch::{WatchOutput, run_watch},
     model::{sanitize_terminal_text, set_output_secret_redaction},
-    secure_output::write_secure_atomic,
+    secure_output::{validate_secure_output_target, write_secure_atomic},
     ui::draw,
 };
 
@@ -187,6 +193,56 @@ fn usage_error(message: &str) -> ExitCode {
     ExitCode::from(2)
 }
 
+struct CheckRunResult {
+    snapshot: ProcessSnapshot,
+    collector: CurrentProcessExclusion,
+    matched: usize,
+    passed: bool,
+    observation: CheckObservation,
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn run_process_check(cli: &Cli) -> Result<CheckRunResult, String> {
+    let started = Instant::now();
+    let timeout = cli.check_wait_ms.map(Duration::from_millis);
+    let interval = Duration::from_millis(cli.check_interval_ms);
+    let mut stability = CheckStability::new(cli.check_stable_samples);
+
+    loop {
+        let attempt_started = Instant::now();
+        let snapshot = capture_snapshot(cli.sample_ms);
+        let collector = CurrentProcessExclusion::capture(&snapshot);
+        let matched =
+            matching_process_count_excluding_collector(&snapshot, &cli.query, &collector)?;
+        let observed_pass = cli.check_expectation.passes(matched);
+        let passed = stability.record(observed_pass);
+        let elapsed_ms = elapsed_millis(started);
+        let timed_out = !passed && timeout.is_some_and(|timeout| started.elapsed() >= timeout);
+        if passed || timeout.is_none() || timed_out {
+            return Ok(CheckRunResult {
+                snapshot,
+                collector,
+                matched,
+                passed,
+                observation: stability.observation(cli.check_wait_ms, elapsed_ms, timed_out),
+            });
+        }
+
+        let remaining = timeout
+            .and_then(|timeout| timeout.checked_sub(started.elapsed()))
+            .unwrap_or_default();
+        let sleep_for = interval
+            .saturating_sub(attempt_started.elapsed())
+            .min(remaining);
+        if !sleep_for.is_zero() {
+            thread::sleep(sleep_for);
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let cli = match Cli::parse(env::args().skip(1)) {
         Ok(cli) => cli,
@@ -237,25 +293,26 @@ fn main() -> ExitCode {
                 return usage_error(&format!("invalid query: {error}"));
             }
             let result = (|| -> Result<bool, Box<dyn Error>> {
-                let snapshot = capture_snapshot(cli.sample_ms);
-                let matched =
-                    matching_process_count(&snapshot, &cli.query).map_err(io::Error::other)?;
-                let passed = cli.check_expectation.passes(matched);
+                let checked = run_process_check(&cli).map_err(io::Error::other)?;
                 if !cli.quiet {
                     let output = match cli.mode {
                         LaunchMode::CheckTable => render_check_table(
-                            &snapshot,
+                            &checked.snapshot,
+                            &checked.collector,
                             &cli.query,
                             cli.check_expectation.label(),
-                            matched,
-                            passed,
+                            checked.matched,
+                            checked.passed,
+                            checked.observation,
                         ),
                         LaunchMode::CheckJson => render_check_json(
-                            &snapshot,
+                            &checked.snapshot,
+                            &checked.collector,
                             &cli.query,
                             cli.check_expectation.label(),
-                            matched,
-                            passed,
+                            checked.matched,
+                            checked.passed,
+                            checked.observation,
                         ),
                         _ => unreachable!(),
                     }
@@ -266,7 +323,7 @@ fn main() -> ExitCode {
                         }
                     }
                 }
-                Ok(passed)
+                Ok(checked.passed)
             })();
             match result {
                 Ok(true) => ExitCode::SUCCESS,
@@ -470,6 +527,83 @@ fn main() -> ExitCode {
             match result {
                 Ok(TraceRunStatus::Complete) => ExitCode::SUCCESS,
                 Ok(TraceRunStatus::Inconclusive) => ExitCode::FAILURE,
+                Err(error) => runtime_result(Err(error)),
+            }
+        }
+        LaunchMode::RunTable | LaunchMode::RunJson => {
+            if cli.run_command.is_empty() {
+                return usage_error("run requires COMMAND after --");
+            }
+            let result = (|| -> Result<u8, Box<dyn Error>> {
+                let output = if cli.mode == LaunchMode::RunJson {
+                    RunOutput::Json
+                } else {
+                    RunOutput::Table
+                };
+                let outcome = if let Some(path) = cli.run_output.as_deref() {
+                    validate_secure_output_target(Path::new(path), cli.run_force)?;
+                    let mut report = Vec::new();
+                    let outcome = run_command_profile(
+                        &mut report,
+                        &cli.run_command,
+                        cli.run_interval_ms,
+                        cli.run_descendant_grace_ms,
+                        output,
+                    )?;
+                    write_secure_atomic(Path::new(path), &report, cli.run_force)?;
+                    outcome
+                } else {
+                    let stderr = io::stderr();
+                    let mut stderr = stderr.lock();
+                    run_command_profile(
+                        &mut stderr,
+                        &cli.run_command,
+                        cli.run_interval_ms,
+                        cli.run_descendant_grace_ms,
+                        output,
+                    )?
+                };
+                Ok(outcome.exit_code)
+            })();
+            match result {
+                Ok(exit_code) => ExitCode::from(exit_code),
+                Err(error) => runtime_result(Err(error)),
+            }
+        }
+        LaunchMode::FileTable | LaunchMode::FileJson => {
+            let Some(path) = cli.file_path.as_deref() else {
+                return usage_error("file requires exactly one PATH");
+            };
+            let result = (|| -> Result<Option<FilePolicyStatus>, Box<dyn Error>> {
+                let captured = capture_file_usage(path, cli.file_recursive, cli.file_limit)
+                    .map_err(io::Error::other)?;
+                let policy_status = cli
+                    .file_expectation
+                    .map(|expectation| captured.evaluate_policy(expectation));
+                if !cli.quiet {
+                    let expectation = cli.file_expectation.map(|value| value.label());
+                    let output = match cli.mode {
+                        LaunchMode::FileTable => {
+                            render_file_table(&captured, expectation, policy_status)
+                        }
+                        LaunchMode::FileJson => {
+                            render_file_json(&captured, expectation, policy_status)
+                                .map_err(io::Error::other)?
+                        }
+                        _ => unreachable!(),
+                    };
+                    if let Err(error) = write_stdout(&output) {
+                        if error.kind() != io::ErrorKind::BrokenPipe {
+                            return Err(error.into());
+                        }
+                    }
+                }
+                Ok(policy_status)
+            })();
+            match result {
+                Ok(None | Some(FilePolicyStatus::Passed)) => ExitCode::SUCCESS,
+                Ok(Some(FilePolicyStatus::Violated)) => ExitCode::from(3),
+                Ok(Some(FilePolicyStatus::Inconclusive)) => ExitCode::FAILURE,
                 Err(error) => runtime_result(Err(error)),
             }
         }

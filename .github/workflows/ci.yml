@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_VERSION: 1.85.0
+  RUSTUP_TOOLCHAIN: 1.85.0
+
+jobs:
+  quality:
+    name: Quality gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install minimum Rust toolchain
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt,clippy
+      - name: Rust formatting
+        run: cargo +"$RUST_VERSION" fmt --all -- --check
+      - name: Clippy
+        run: cargo +"$RUST_VERSION" clippy --all-targets --locked -- -D warnings
+      - name: Shell syntax
+        run: bash -n scripts/*.sh
+      - name: Diff hygiene
+        run: git diff --check
+
+  test:
+    name: Test ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install minimum Rust toolchain
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal
+      - name: Test
+        run: cargo +"$RUST_VERSION" test --locked --target "${{ matrix.target }}"
+      - name: Build release binary
+        run: cargo +"$RUST_VERSION" build --release --locked --target "${{ matrix.target }}"
+      - name: Smoke test
+        run: target/${{ matrix.target }}/release/psmore --version
+      - name: Build release archive
+        run: scripts/package-release.sh --target "${{ matrix.target }}" --no-build
+      - name: Verify package install and uninstall
+        run: scripts/verify-release-package.sh dist/psmore-v*-${{ matrix.target }}.tar.gz
