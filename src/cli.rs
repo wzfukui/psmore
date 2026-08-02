@@ -17,6 +17,8 @@ pub(crate) enum LaunchMode {
     ServiceJson,
     LogsTable,
     LogsJson,
+    ExplainTable,
+    ExplainJson,
     PortTable,
     PortJson,
     ListenTable,
@@ -60,6 +62,7 @@ pub(crate) enum HelpTopic {
     Stale,
     Service,
     Logs,
+    Explain,
     Port,
     Listen,
     Tree,
@@ -337,6 +340,10 @@ pub(crate) struct Cli {
     pub(crate) logs_priority: LogPriority,
     pub(crate) logs_since_seconds: u64,
     pub(crate) logs_limit: usize,
+    pub(crate) explain_pid: Option<u32>,
+    pub(crate) explain_include_logs: bool,
+    pub(crate) explain_output: Option<String>,
+    pub(crate) explain_force: bool,
     pub(crate) port: Option<u16>,
     pub(crate) port_protocol: PortProtocol,
     pub(crate) port_all: bool,
@@ -417,6 +424,10 @@ impl Default for Cli {
             logs_priority: LogPriority::Info,
             logs_since_seconds: 15 * 60,
             logs_limit: 100,
+            explain_pid: None,
+            explain_include_logs: true,
+            explain_output: None,
+            explain_force: false,
             port: None,
             port_protocol: PortProtocol::Any,
             port_all: false,
@@ -503,6 +514,7 @@ impl Cli {
                 "stale" => Some((parse_stale(&arguments[1..]), HelpTopic::Stale)),
                 "service" => Some((parse_service(&arguments[1..]), HelpTopic::Service)),
                 "logs" => Some((parse_logs(&arguments[1..]), HelpTopic::Logs)),
+                "explain" => Some((parse_explain(&arguments[1..]), HelpTopic::Explain)),
                 "port" => Some((parse_port(&arguments[1..]), HelpTopic::Port)),
                 "tree" => Some((parse_tree(&arguments[1..]), HelpTopic::Tree)),
                 "diff" => Some((parse_diff(&arguments[1..]), HelpTopic::Diff)),
@@ -2987,6 +2999,195 @@ fn set_service_output_mode(
     Ok(())
 }
 
+fn parse_explain(arguments: &[String]) -> Result<Cli, String> {
+    let mut cli = Cli {
+        mode: LaunchMode::ExplainTable,
+        ..Cli::default()
+    };
+    let mut output_mode = None;
+    let mut output_path_set = false;
+    let mut force_set = false;
+    let mut sample_set = false;
+    let mut scope_set = false;
+    let mut priority_set = false;
+    let mut since_set = false;
+    let mut limit_set = false;
+    let mut hash_disabled = false;
+    let mut logs_disabled = false;
+    let mut pids = Vec::new();
+    let mut arguments = arguments.iter().cloned().peekable();
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "-h" | "--help" => cli.mode = LaunchMode::Help,
+            "-V" | "--version" => cli.mode = LaunchMode::Version,
+            "--table" => {
+                set_explain_output_mode(&mut cli.mode, &mut output_mode, LaunchMode::ExplainTable)?
+            }
+            "--json" => {
+                set_explain_output_mode(&mut cli.mode, &mut output_mode, LaunchMode::ExplainJson)?
+            }
+            "--sample-ms" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "explain --sample-ms requires an integer".to_string())?;
+                set_sample_ms(&mut cli, &mut sample_set, &value)?;
+            }
+            "--no-hash" => {
+                if hash_disabled {
+                    return Err("explain --no-hash may only be specified once".into());
+                }
+                cli.exe_hash = false;
+                hash_disabled = true;
+            }
+            "--no-logs" => {
+                if logs_disabled {
+                    return Err("explain --no-logs may only be specified once".into());
+                }
+                cli.explain_include_logs = false;
+                logs_disabled = true;
+            }
+            "--scope" => {
+                let value = arguments.next().ok_or_else(|| {
+                    "explain --scope requires auto, process, or service".to_string()
+                })?;
+                set_logs_scope(&mut cli, &mut scope_set, &value, "explain")?;
+            }
+            "--priority" => {
+                let value = arguments.next().ok_or_else(|| {
+                    "explain --priority requires error, warning, info, or debug".to_string()
+                })?;
+                set_logs_priority(&mut cli, &mut priority_set, &value, "explain")?;
+            }
+            "--since" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "explain --since requires a duration".to_string())?;
+                set_logs_since(&mut cli, &mut since_set, &value, "explain")?;
+            }
+            "--limit" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "explain --limit requires an integer".to_string())?;
+                set_logs_limit(&mut cli, &mut limit_set, &value, "explain")?;
+            }
+            "--output" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "explain --output requires a file path".to_string())?;
+                set_explain_output_path(&mut cli, &mut output_mode, &mut output_path_set, value)?;
+            }
+            "--force" => {
+                if force_set {
+                    return Err("explain --force may only be specified once".into());
+                }
+                cli.explain_force = true;
+                force_set = true;
+            }
+            _ if argument.starts_with("--sample-ms=") => set_sample_ms(
+                &mut cli,
+                &mut sample_set,
+                argument.trim_start_matches("--sample-ms="),
+            )?,
+            _ if argument.starts_with("--scope=") => set_logs_scope(
+                &mut cli,
+                &mut scope_set,
+                argument.trim_start_matches("--scope="),
+                "explain",
+            )?,
+            _ if argument.starts_with("--priority=") => set_logs_priority(
+                &mut cli,
+                &mut priority_set,
+                argument.trim_start_matches("--priority="),
+                "explain",
+            )?,
+            _ if argument.starts_with("--since=") => set_logs_since(
+                &mut cli,
+                &mut since_set,
+                argument.trim_start_matches("--since="),
+                "explain",
+            )?,
+            _ if argument.starts_with("--limit=") => set_logs_limit(
+                &mut cli,
+                &mut limit_set,
+                argument.trim_start_matches("--limit="),
+                "explain",
+            )?,
+            _ if argument.starts_with("--output=") => set_explain_output_path(
+                &mut cli,
+                &mut output_mode,
+                &mut output_path_set,
+                argument.trim_start_matches("--output=").to_string(),
+            )?,
+            _ if argument.starts_with('-') => {
+                return Err(format!("unknown explain option: {argument}"));
+            }
+            _ => pids.push(argument),
+        }
+    }
+    if matches!(cli.mode, LaunchMode::Help | LaunchMode::Version) {
+        return Ok(cli);
+    }
+    if pids.len() != 1 {
+        return Err(format!(
+            "explain requires exactly one PID; received {}",
+            pids.len()
+        ));
+    }
+    let pid = pids[0]
+        .parse::<u32>()
+        .map_err(|_| format!("invalid PID: {}", pids[0]))?;
+    if pid == 0 {
+        return Err("explain requires a real process PID greater than 0".into());
+    }
+    if pid > i32::MAX as u32 {
+        return Err(format!("PID {pid} exceeds the supported system PID range"));
+    }
+    if !cli.explain_include_logs && (scope_set || priority_set || since_set || limit_set) {
+        return Err(
+            "explain --no-logs cannot be combined with --scope, --priority, --since, or --limit"
+                .into(),
+        );
+    }
+    if cli.explain_force && cli.explain_output.is_none() {
+        return Err("explain --force requires --output FILE".into());
+    }
+    cli.explain_pid = Some(pid);
+    Ok(cli)
+}
+
+fn set_explain_output_mode(
+    mode: &mut LaunchMode,
+    output_mode: &mut Option<LaunchMode>,
+    requested: LaunchMode,
+) -> Result<(), String> {
+    if output_mode.is_some_and(|existing| existing != requested) {
+        return Err("explain --table and --json cannot be used together".into());
+    }
+    *output_mode = Some(requested);
+    if !matches!(mode, LaunchMode::Help | LaunchMode::Version) {
+        *mode = requested;
+    }
+    Ok(())
+}
+
+fn set_explain_output_path(
+    cli: &mut Cli,
+    output_mode: &mut Option<LaunchMode>,
+    value_set: &mut bool,
+    path: String,
+) -> Result<(), String> {
+    if *value_set {
+        return Err("explain --output may only be specified once".into());
+    }
+    if path.trim().is_empty() || path == "-" {
+        return Err("explain --output requires a filesystem path, not stdout".into());
+    }
+    set_explain_output_mode(&mut cli.mode, output_mode, LaunchMode::ExplainJson)?;
+    cli.explain_output = Some(path);
+    *value_set = true;
+    Ok(())
+}
+
 fn parse_logs(arguments: &[String]) -> Result<Cli, String> {
     let mut cli = Cli {
         mode: LaunchMode::LogsTable,
@@ -3013,45 +3214,49 @@ fn parse_logs(arguments: &[String]) -> Result<Cli, String> {
                 let value = arguments
                     .next()
                     .ok_or_else(|| "logs --scope requires auto, process, or service".to_string())?;
-                set_logs_scope(&mut cli, &mut scope_set, &value)?;
+                set_logs_scope(&mut cli, &mut scope_set, &value, "logs")?;
             }
             "--priority" => {
                 let value = arguments.next().ok_or_else(|| {
                     "logs --priority requires error, warning, info, or debug".to_string()
                 })?;
-                set_logs_priority(&mut cli, &mut priority_set, &value)?;
+                set_logs_priority(&mut cli, &mut priority_set, &value, "logs")?;
             }
             "--since" => {
                 let value = arguments
                     .next()
                     .ok_or_else(|| "logs --since requires a duration".to_string())?;
-                set_logs_since(&mut cli, &mut since_set, &value)?;
+                set_logs_since(&mut cli, &mut since_set, &value, "logs")?;
             }
             "--limit" => {
                 let value = arguments
                     .next()
                     .ok_or_else(|| "logs --limit requires an integer".to_string())?;
-                set_logs_limit(&mut cli, &mut limit_set, &value)?;
+                set_logs_limit(&mut cli, &mut limit_set, &value, "logs")?;
             }
             _ if argument.starts_with("--scope=") => set_logs_scope(
                 &mut cli,
                 &mut scope_set,
                 argument.trim_start_matches("--scope="),
+                "logs",
             )?,
             _ if argument.starts_with("--priority=") => set_logs_priority(
                 &mut cli,
                 &mut priority_set,
                 argument.trim_start_matches("--priority="),
+                "logs",
             )?,
             _ if argument.starts_with("--since=") => set_logs_since(
                 &mut cli,
                 &mut since_set,
                 argument.trim_start_matches("--since="),
+                "logs",
             )?,
             _ if argument.starts_with("--limit=") => set_logs_limit(
                 &mut cli,
                 &mut limit_set,
                 argument.trim_start_matches("--limit="),
+                "logs",
             )?,
             _ if argument.starts_with('-') => {
                 return Err(format!("unknown logs option: {argument}"));
@@ -3096,9 +3301,14 @@ fn set_logs_output_mode(
     Ok(())
 }
 
-fn set_logs_scope(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+fn set_logs_scope(
+    cli: &mut Cli,
+    value_set: &mut bool,
+    value: &str,
+    command: &str,
+) -> Result<(), String> {
     if *value_set {
-        return Err("logs --scope may only be specified once".into());
+        return Err(format!("{command} --scope may only be specified once"));
     }
     cli.logs_scope = match value.to_ascii_lowercase().as_str() {
         "auto" => LogScope::Auto,
@@ -3106,7 +3316,7 @@ fn set_logs_scope(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<()
         "service" | "unit" => LogScope::Service,
         _ => {
             return Err(format!(
-                "invalid logs scope: {value}; use auto, process, or service"
+                "invalid {command} scope: {value}; use auto, process, or service"
             ));
         }
     };
@@ -3114,9 +3324,14 @@ fn set_logs_scope(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<()
     Ok(())
 }
 
-fn set_logs_priority(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+fn set_logs_priority(
+    cli: &mut Cli,
+    value_set: &mut bool,
+    value: &str,
+    command: &str,
+) -> Result<(), String> {
     if *value_set {
-        return Err("logs --priority may only be specified once".into());
+        return Err(format!("{command} --priority may only be specified once"));
     }
     cli.logs_priority = match value.to_ascii_lowercase().as_str() {
         "error" | "err" => LogPriority::Error,
@@ -3125,7 +3340,7 @@ fn set_logs_priority(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result
         "debug" => LogPriority::Debug,
         _ => {
             return Err(format!(
-                "invalid logs priority: {value}; use error, warning, info, or debug"
+                "invalid {command} priority: {value}; use error, warning, info, or debug"
             ));
         }
     };
@@ -3133,16 +3348,21 @@ fn set_logs_priority(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result
     Ok(())
 }
 
-fn set_logs_since(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+fn set_logs_since(
+    cli: &mut Cli,
+    value_set: &mut bool,
+    value: &str,
+    command: &str,
+) -> Result<(), String> {
     if *value_set {
-        return Err("logs --since may only be specified once".into());
+        return Err(format!("{command} --since may only be specified once"));
     }
-    cli.logs_since_seconds = parse_logs_duration_seconds(value)?;
+    cli.logs_since_seconds = parse_logs_duration_seconds(value, command)?;
     *value_set = true;
     Ok(())
 }
 
-fn parse_logs_duration_seconds(value: &str) -> Result<u64, String> {
+fn parse_logs_duration_seconds(value: &str, command: &str) -> Result<u64, String> {
     let normalized = value.trim().to_ascii_lowercase();
     let (number, multiplier) = if let Some(number) = normalized.strip_suffix('s') {
         (number, 1.0)
@@ -3154,28 +3374,33 @@ fn parse_logs_duration_seconds(value: &str) -> Result<u64, String> {
         (number, 86_400.0)
     } else {
         return Err(format!(
-            "invalid logs --since duration: {value}; include s, m, h, or d"
+            "invalid {command} --since duration: {value}; include s, m, h, or d"
         ));
     };
     let amount = number
         .parse::<f64>()
-        .map_err(|_| format!("invalid logs --since duration: {value}"))?;
+        .map_err(|_| format!("invalid {command} --since duration: {value}"))?;
     let seconds = amount * multiplier;
     if !seconds.is_finite() || !(1.0..=604_800.0).contains(&seconds) {
-        return Err("logs --since must be between 1s and 7d".into());
+        return Err(format!("{command} --since must be between 1s and 7d"));
     }
     Ok(seconds.ceil() as u64)
 }
 
-fn set_logs_limit(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+fn set_logs_limit(
+    cli: &mut Cli,
+    value_set: &mut bool,
+    value: &str,
+    command: &str,
+) -> Result<(), String> {
     if *value_set {
-        return Err("logs --limit may only be specified once".into());
+        return Err(format!("{command} --limit may only be specified once"));
     }
     let limit = value
         .parse::<usize>()
-        .map_err(|_| format!("invalid logs --limit value: {value}"))?;
+        .map_err(|_| format!("invalid {command} --limit value: {value}"))?;
     if !(1..=1_000).contains(&limit) {
-        return Err("logs --limit must be between 1 and 1000".into());
+        return Err(format!("{command} --limit must be between 1 and 1000"));
     }
     cli.logs_limit = limit;
     *value_set = true;
@@ -3567,6 +3792,7 @@ USAGE:
 COMMANDS:
   check       Evaluate a process query as an operations health gate
   inspect     Inspect one process, threads, sockets, files, and context
+  explain     Build one prioritized process dossier from multiple evidence sources
   exe         Verify a process executable, disk drift, package, and signing
   stale       Find Linux processes still holding deleted or replaced executables
   service     Resolve a PID to its systemd or launchd service context
@@ -3645,6 +3871,40 @@ The PID identity is revalidated after collection; confirmed PID reuse is refused
 EXAMPLES:
   psmore inspect 1234
   psmore inspect 1234 --json > process-1234.json
+"
+        }
+        Some(HelpTopic::Explain) => {
+            "psmore explain - build a prioritized evidence dossier for one process
+
+USAGE:
+  psmore explain PID [--no-logs] [--scope auto|process|service]
+                     [--since DURATION] [--priority LEVEL] [--limit N]
+                     [--no-hash] [--sample-ms MS] [--table|--json]
+                     [--output FILE [--force]]
+
+OPTIONS:
+      --no-logs        Skip native logs; cannot combine with log filter options
+      --scope SCOPE    Native-log scope: auto, process, or service [default: auto]
+      --since DURATION Native-log window, 1s-7d [default: 15m]
+      --priority LEVEL Native-log verbosity: error, warning, info, debug [default: info]
+      --limit N        Maximum native-log entries, 1-1000 [default: 100]
+      --no-hash        Skip executable SHA-256 while retaining identity/provenance
+      --sample-ms MS   Process/thread sampling interval [default: 500]
+      --table          Prioritized signals followed by original evidence [default]
+      --json           psmore.process-dossier JSON with nested source reports
+      --output FILE    Atomically write private JSON instead of printing it
+      --force          Replace an existing --output regular file atomically
+      --redact         Best-effort masking across commands and optional log messages
+
+Inspection, service-manager context, and executable provenance are collected in
+parallel with bounded native logs. Every section keeps its original versioned
+report, coverage, and identity evidence; ranked signals link back to JSON
+evidence paths and are review priorities, not asserted root causes. Use
+--no-logs when log collection is too sensitive or unnecessary.
+EXAMPLES:
+  psmore explain 1234
+  psmore explain 1234 --since 30m --priority warning
+  psmore explain 1234 --output process-1234.dossier.json --redact
 "
         }
         Some(HelpTopic::Exe) => {
@@ -4174,6 +4434,10 @@ mod tests {
                 logs_priority: LogPriority::Info,
                 logs_since_seconds: 900,
                 logs_limit: 100,
+                explain_pid: None,
+                explain_include_logs: true,
+                explain_output: None,
+                explain_force: false,
                 port: None,
                 port_protocol: PortProtocol::Any,
                 port_all: false,
@@ -4492,6 +4756,46 @@ mod tests {
             }
         );
         assert_eq!(
+            Cli::parse([
+                "explain",
+                "4321",
+                "--scope=service",
+                "--since=30m",
+                "--priority=warning",
+                "--limit=40",
+                "--sample-ms=750",
+                "--no-hash",
+                "--output=process-4321.dossier.json",
+                "--force",
+                "--redact",
+            ])
+            .unwrap(),
+            Cli {
+                mode: LaunchMode::ExplainJson,
+                sample_ms: 750,
+                exe_hash: false,
+                logs_scope: LogScope::Service,
+                logs_priority: LogPriority::Warning,
+                logs_since_seconds: 1_800,
+                logs_limit: 40,
+                explain_pid: Some(4_321),
+                explain_output: Some("process-4321.dossier.json".into()),
+                explain_force: true,
+                redact_secrets: true,
+                ..Cli::default()
+            }
+        );
+        assert_eq!(
+            Cli::parse(["explain", "4321", "--no-logs", "--no-hash"]).unwrap(),
+            Cli {
+                mode: LaunchMode::ExplainTable,
+                exe_hash: false,
+                explain_pid: Some(4_321),
+                explain_include_logs: false,
+                ..Cli::default()
+            }
+        );
+        assert_eq!(
             Cli::parse(["service", "4321", "--json", "--redact"]).unwrap(),
             Cli {
                 mode: LaunchMode::ServiceJson,
@@ -4520,6 +4824,36 @@ mod tests {
                 logs_priority: LogPriority::Debug,
                 logs_since_seconds: 150,
                 logs_limit: 250,
+                redact_secrets: true,
+                ..Cli::default()
+            }
+        );
+        assert_eq!(
+            Cli::parse([
+                "explain",
+                "4321",
+                "--scope=service",
+                "--since=2h",
+                "--priority=warning",
+                "--limit=250",
+                "--no-hash",
+                "--sample-ms=300",
+                "--output=incident.json",
+                "--force",
+                "--redact",
+            ])
+            .unwrap(),
+            Cli {
+                mode: LaunchMode::ExplainJson,
+                sample_ms: 300,
+                exe_hash: false,
+                logs_scope: LogScope::Service,
+                logs_priority: LogPriority::Warning,
+                logs_since_seconds: 7_200,
+                logs_limit: 250,
+                explain_pid: Some(4_321),
+                explain_output: Some("incident.json".into()),
+                explain_force: true,
                 redact_secrets: true,
                 ..Cli::default()
             }
@@ -4742,6 +5076,7 @@ mod tests {
         for (command, topic) in [
             ("check", HelpTopic::Check),
             ("inspect", HelpTopic::Inspect),
+            ("explain", HelpTopic::Explain),
             ("exe", HelpTopic::Exe),
             ("stale", HelpTopic::Stale),
             ("service", HelpTopic::Service),
@@ -4861,6 +5196,25 @@ mod tests {
         assert!(Cli::parse(["logs", "1", "--since=8d"]).is_err());
         assert!(Cli::parse(["logs", "1", "--limit=0"]).is_err());
         assert!(Cli::parse(["logs", "1", "--limit=1001"]).is_err());
+        assert!(Cli::parse(["explain"]).is_err());
+        assert!(Cli::parse(["explain", "0"]).is_err());
+        assert!(Cli::parse(["explain", "nope"]).is_err());
+        assert!(Cli::parse(["explain", "1", "2"]).is_err());
+        assert!(Cli::parse(["explain", "1", "--table", "--json"]).is_err());
+        assert!(Cli::parse(["explain", "1", "--table", "--output=a.json"]).is_err());
+        assert!(Cli::parse(["explain", "1", "--force"]).is_err());
+        assert!(Cli::parse(["explain", "1", "--output=-"]).is_err());
+        assert!(Cli::parse(["explain", "1", "--no-logs", "--no-logs"]).is_err());
+        assert!(Cli::parse(["explain", "1", "--no-logs", "--scope=process"]).is_err());
+        assert!(Cli::parse(["explain", "1", "--no-hash", "--no-hash"]).is_err());
+        assert!(Cli::parse(["explain", "1", "--scope=host"]).is_err());
+        assert!(Cli::parse(["explain", "1", "--since=8d"]).is_err());
+        assert!(Cli::parse(["explain", "1", "--no-logs", "--since=1m"]).is_err());
+        assert!(Cli::parse(["explain", "1", "--no-logs", "--priority=error"]).is_err());
+        assert!(Cli::parse(["explain", "1", "--no-logs", "--limit=1"]).is_err());
+        assert!(Cli::parse(["explain", "1", "--output="]).is_err());
+        assert!(Cli::parse(["explain", "1", "--output=a", "--output=b"]).is_err());
+        assert!(Cli::parse(["explain", "1", "--output=a", "--table"]).is_err());
         assert!(Cli::parse(["exe"]).is_err());
         assert!(Cli::parse(["exe", "0"]).is_err());
         assert!(Cli::parse(["exe", "nope"]).is_err());
@@ -4973,6 +5327,7 @@ mod tests {
         for (topic, command) in [
             (HelpTopic::Check, "check"),
             (HelpTopic::Inspect, "inspect"),
+            (HelpTopic::Explain, "explain"),
             (HelpTopic::Exe, "exe"),
             (HelpTopic::Stale, "stale"),
             (HelpTopic::Service, "service"),

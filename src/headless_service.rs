@@ -23,7 +23,7 @@ const SERVICE_SCHEMA: &str = "psmore.service-context";
 const SERVICE_SCHEMA_VERSION: u32 = 1;
 
 #[cfg(target_os = "linux")]
-const SYSTEMD_PROPERTIES: &str = "Id,Names,Description,LoadState,ActiveState,SubState,UnitFileState,FragmentPath,DropInPaths,ControlGroup,MainPID,ExecMainPID,ExecMainCode,ExecMainStatus,Result,Restart,NRestarts,TasksCurrent,MemoryCurrent,CPUUsageNSec,NeedDaemonReload,InvocationID";
+const SYSTEMD_PROPERTIES: &str = "Id,Names,Description,LoadState,ActiveState,SubState,UnitFileState,FragmentPath,DropInPaths,ControlGroup,MainPID,ExecMainPID,ExecMainCode,ExecMainStatus,Result,Restart,NRestarts,TasksCurrent,TasksMax,MemoryCurrent,MemoryMax,CPUUsageNSec,NeedDaemonReload,InvocationID";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IdentityStatus {
@@ -94,10 +94,18 @@ struct ServiceConfiguration {
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
+struct ServiceLimit {
+    value: Option<u64>,
+    unlimited: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
 struct ServiceResources {
     control_group: Option<String>,
     tasks_current: Option<u64>,
+    tasks_max: Option<ServiceLimit>,
     memory_current_bytes: Option<u64>,
+    memory_max_bytes: Option<ServiceLimit>,
     cpu_usage_nanoseconds: Option<u64>,
 }
 
@@ -359,6 +367,27 @@ fn optional_u64(properties: &BTreeMap<String, String>, key: &str) -> Option<u64>
         .filter(|value| *value != u64::MAX)
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn optional_limit(properties: &BTreeMap<String, String>, key: &str) -> Option<ServiceLimit> {
+    let value = properties.get(key)?.trim();
+    if value.is_empty() || value == "[not set]" {
+        return None;
+    }
+    if value.eq_ignore_ascii_case("infinity")
+        || value.eq_ignore_ascii_case("max")
+        || value.parse::<u64>().ok() == Some(u64::MAX)
+    {
+        return Some(ServiceLimit {
+            value: None,
+            unlimited: true,
+        });
+    }
+    value.parse::<u64>().ok().map(|value| ServiceLimit {
+        value: Some(value),
+        unlimited: false,
+    })
+}
+
 #[cfg(target_os = "linux")]
 fn optional_i32(properties: &BTreeMap<String, String>, key: &str) -> Option<i32> {
     properties.get(key).and_then(|value| value.parse().ok())
@@ -589,7 +618,9 @@ fn collect_systemd_context(pid: u32) -> ManagerContext {
         resources: ServiceResources {
             control_group: optional_string(&properties, "ControlGroup").or(Some(selected_path)),
             tasks_current: optional_u64(&properties, "TasksCurrent"),
+            tasks_max: optional_limit(&properties, "TasksMax"),
             memory_current_bytes: optional_u64(&properties, "MemoryCurrent"),
+            memory_max_bytes: optional_limit(&properties, "MemoryMax"),
             cpu_usage_nanoseconds: optional_u64(&properties, "CPUUsageNSec"),
         },
         collection: CollectionEvidence {
@@ -1141,22 +1172,54 @@ pub(crate) fn render_service_table(captured: &CapturedService) -> String {
     let resources = &manager.resources;
     if resources.control_group.is_some()
         || resources.tasks_current.is_some()
+        || resources.tasks_max.is_some()
         || resources.memory_current_bytes.is_some()
+        || resources.memory_max_bytes.is_some()
     {
+        let task_limit = resources
+            .tasks_max
+            .as_ref()
+            .map(|limit| {
+                if limit.unlimited {
+                    "unlimited".to_string()
+                } else {
+                    limit
+                        .value
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "unknown".into())
+                }
+            })
+            .unwrap_or_else(|| "unknown".into());
+        let memory_limit = resources
+            .memory_max_bytes
+            .as_ref()
+            .map(|limit| {
+                if limit.unlimited {
+                    "unlimited".to_string()
+                } else {
+                    limit
+                        .value
+                        .map(human_bytes)
+                        .unwrap_or_else(|| "unknown".into())
+                }
+            })
+            .unwrap_or_else(|| "unknown".into());
         let _ = writeln!(
             output,
-            "cgroup {}  tasks {}  memory {}  CPU {:.3}s",
+            "cgroup {}  tasks {}/{}  memory {}/{}  CPU {:.3}s",
             optional(resources.control_group.as_deref()),
             resources
                 .tasks_current
                 .map(|value| value.to_string())
                 .as_deref()
                 .unwrap_or("unknown"),
+            task_limit,
             resources
                 .memory_current_bytes
                 .map(human_bytes)
                 .as_deref()
                 .unwrap_or("unknown"),
+            memory_limit,
             resources.cpu_usage_nanoseconds.unwrap_or(0) as f64 / 1_000_000_000.0,
         );
     }
@@ -1222,10 +1285,17 @@ mod tests {
     #[test]
     fn parses_systemctl_properties_without_order_assumptions() {
         let properties = parse_key_value_lines(
-            "Restart=on-failure\nMainPID=42\nDescription=API service\nActiveState=active\nMemoryCurrent=4096\nNeedDaemonReload=no\n",
+            "Restart=on-failure\nMainPID=42\nDescription=API service\nActiveState=active\nMemoryCurrent=4096\nMemoryMax=8192\nTasksMax=infinity\nNeedDaemonReload=no\n",
         );
         assert_eq!(optional_u32(&properties, "MainPID"), Some(42));
         assert_eq!(optional_u64(&properties, "MemoryCurrent"), Some(4096));
+        assert_eq!(
+            optional_limit(&properties, "MemoryMax").unwrap().value,
+            Some(8192)
+        );
+        assert!(!optional_limit(&properties, "MemoryMax").unwrap().unlimited);
+        assert!(optional_limit(&properties, "TasksMax").unwrap().unlimited);
+        assert!(optional_limit(&properties, "Missing").is_none());
         assert_eq!(
             optional_string(&properties, "ActiveState").as_deref(),
             Some("active")

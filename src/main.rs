@@ -9,6 +9,7 @@ mod headless_diff;
 mod headless_doctor;
 mod headless_doctor_diff;
 mod headless_exe;
+mod headless_explain;
 mod headless_fd;
 mod headless_file;
 mod headless_inspect;
@@ -72,6 +73,10 @@ use crate::{
         DoctorPolicyStatus, capture_doctor, render_doctor_json, render_doctor_table,
     },
     headless_exe::{capture_executable, render_executable_json, render_executable_table},
+    headless_explain::{
+        ExplainOptions, capture_dossier, dossier_summary_line, render_dossier_json,
+        render_dossier_table,
+    },
     headless_fd::{FdPolicyStatus, capture_fd_usage, render_fd_json, render_fd_table},
     headless_file::{FilePolicyStatus, capture_file_usage, render_file_json, render_file_table},
     headless_inspect::{capture_inspection, render_inspection_json, render_inspection_table},
@@ -356,6 +361,44 @@ fn main() -> ExitCode {
                     _ => unreachable!(),
                 };
                 write_stdout(&output)?;
+                Ok(())
+            })();
+            runtime_result(result)
+        }
+        LaunchMode::ExplainTable | LaunchMode::ExplainJson => {
+            let Some(pid) = cli.explain_pid else {
+                return usage_error("explain requires exactly one PID");
+            };
+            let result = (|| -> Result<(), Box<dyn Error>> {
+                if let Some(path) = cli.explain_output.as_deref() {
+                    validate_secure_output_target(Path::new(path), cli.explain_force)?;
+                }
+                let captured = capture_dossier(
+                    pid,
+                    ExplainOptions {
+                        sample_ms: cli.sample_ms,
+                        hash: cli.exe_hash,
+                        include_logs: cli.explain_include_logs,
+                        logs_scope: cli.logs_scope,
+                        logs_priority: cli.logs_priority,
+                        logs_since_seconds: cli.logs_since_seconds,
+                        logs_limit: cli.logs_limit,
+                    },
+                )
+                .map_err(io::Error::other)?;
+                let output = match cli.mode {
+                    LaunchMode::ExplainTable => render_dossier_table(&captured),
+                    LaunchMode::ExplainJson => {
+                        render_dossier_json(&captured).map_err(io::Error::other)?
+                    }
+                    _ => unreachable!(),
+                };
+                if let Some(path) = cli.explain_output.as_deref() {
+                    write_secure_atomic(Path::new(path), output.as_bytes(), cli.explain_force)?;
+                    write_stdout(&format!("{}\n{}", path, dossier_summary_line(&captured)))?;
+                } else {
+                    write_stdout(&output)?;
+                }
                 Ok(())
             })();
             runtime_result(result)
@@ -2046,6 +2089,12 @@ Max address space         unlimited            unlimited            bytes\n";
             },
             "entries": [{ "priority": "error", "message": "request failed" }]
         });
+        let dossier_context = serde_json::json!({
+            "schema": "psmore.process-dossier",
+            "schema_version": 1,
+            "process": { "pid": 42, "name": "worker" },
+            "assessment": { "status": "warning" }
+        });
 
         let path = export_report(
             ReportInput {
@@ -2072,6 +2121,8 @@ Max address space         unlimited            unlimited            bytes\n";
                 executable_context_in_progress: false,
                 logs_context: Some(&logs_context),
                 logs_context_in_progress: false,
+                dossier_context: Some(&dossier_context),
+                dossier_context_in_progress: false,
                 action_history: &action_history,
                 baseline: None,
             },
@@ -2083,7 +2134,7 @@ Max address space         unlimited            unlimited            bytes\n";
                 .expect("parse exported report");
 
         assert_eq!(report["schema"], "psmore.diagnostic-report");
-        assert_eq!(report["schema_version"], 6);
+        assert_eq!(report["schema_version"], 7);
         assert_eq!(report["tool"]["name"], "psmore");
         assert_eq!(report["platform"], platform_name());
         assert_eq!(report["selected_pid"], 42);
@@ -2107,6 +2158,14 @@ Max address space         unlimited            unlimited            bytes\n";
             report["collection_status"]["logs_context_in_progress"],
             false
         );
+        assert_eq!(
+            report["collection_status"]["dossier_context_in_progress"],
+            false
+        );
+        assert_eq!(
+            report["collection_status"]["dossier_context_in_progress"],
+            false
+        );
         assert_eq!(report["process_count"], 2);
         assert_eq!(report["system"]["write_bytes_per_second"], 8_192);
         assert_eq!(report["processes"][0]["pid"], 0);
@@ -2121,6 +2180,10 @@ Max address space         unlimited            unlimited            bytes\n";
         assert_eq!(
             report["network_scan"]["endpoints"][0]["remote_endpoint"],
             "10.0.0.8:443"
+        );
+        assert_eq!(
+            report["selected_process_dossier"]["schema"],
+            "psmore.process-dossier"
         );
         assert_eq!(report["network_scan"]["endpoints"][0]["listener"], false);
         assert_eq!(report["process_actions"][0]["pid"], 42);
@@ -2163,6 +2226,14 @@ Max address space         unlimited            unlimited            bytes\n";
         assert_eq!(
             report["selected_logs_context"]["entries"][0]["message"],
             "request failed"
+        );
+        assert_eq!(
+            report["selected_process_dossier"]["schema"],
+            "psmore.process-dossier"
+        );
+        assert_eq!(
+            report["selected_process_dossier"]["assessment"]["status"],
+            "warning"
         );
         assert!(report["baseline"].is_null());
         #[cfg(unix)]

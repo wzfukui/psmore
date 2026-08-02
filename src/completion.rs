@@ -21,11 +21,11 @@ _psmore_completion() {
         --protocol)
             if [[ "$cmd" == "listen" || "$cmd" == "net" ]]; then words="any tcp udp unix"; else words="any tcp udp"; fi ;;
         --depth) words="all" ;;
-        --limit) if [[ "$cmd" == "logs" ]]; then words=""; else words="all"; fi ;;
+        --limit) if [[ "$cmd" == "logs" || "$cmd" == "explain" ]]; then words=""; else words="all"; fi ;;
         --by)
             if [[ "$cmd" == "cgroup" ]]; then words="cpu memory pressure processes"; else words="cpu memory read write"; fi ;;
         --scope)
-            if [[ "$cmd" == "logs" ]]; then words="auto process service"; else words="process tree"; fi ;;
+            if [[ "$cmd" == "logs" || "$cmd" == "explain" ]]; then words="auto process service"; else words="process tree"; fi ;;
         --priority) words="error warning info debug" ;;
         --state) words="ESTABLISHED LISTEN TIME_WAIT CLOSE_WAIT SYN_SENT SYN_RECV CONNECTED CONNECTING BOUND OPEN" ;;
         --fail-on)
@@ -40,7 +40,7 @@ _psmore_completion() {
     fi
 
     if (( COMP_CWORD == 1 )); then
-        words="check inspect exe stale service logs port listen net tree watch trace run deleted file fd top oom cgroup doctor diff completion --table --json --query --no-tips --sample-ms --redact --help --version"
+        words="check inspect explain exe stale service logs port listen net tree watch trace run deleted file fd top oom cgroup doctor diff completion --table --json --query --no-tips --sample-ms --redact --help --version"
         COMPREPLY=( $(compgen -W "$words" -- "$cur") )
         return
     fi
@@ -53,6 +53,7 @@ _psmore_completion() {
     case "$cmd" in
         check) words="--expect --wait --interval-ms --stable --table --json --quiet --sample-ms --help --version" ;;
         inspect) words="--table --json --sample-ms --help --version" ;;
+        explain) words="--scope --since --priority --limit --no-logs --no-hash --sample-ms --table --json --output --force --help --version" ;;
         exe) words="--table --json --no-hash --help --version" ;;
         stale) words="--query --limit --table --json --expect --quiet --sample-ms --help --version" ;;
         service) words="--table --json --help --version" ;;
@@ -89,6 +90,7 @@ _psmore() {
   commands=(
     'check:evaluate a process-query health gate'
     'inspect:deep inspection for one process'
+    'explain:build a prioritized process evidence dossier'
     'exe:verify a process executable image and provenance'
     'stale:find Linux processes holding obsolete executables'
     'service:resolve a PID to systemd or launchd context'
@@ -134,7 +136,7 @@ _psmore() {
       return ;;
     --depth) _values 'value' all; return ;;
     --limit)
-      if [[ "$cmd" != logs ]]; then _values 'value' all; return; fi ;;
+      if [[ "$cmd" != logs && "$cmd" != explain ]]; then _values 'value' all; return; fi ;;
     --by)
       if [[ "$cmd" == cgroup ]]; then _values 'metric' cpu memory pressure processes
       else _values 'metric' cpu memory read write; fi
@@ -144,7 +146,7 @@ _psmore() {
       else _values 'severity' never warning critical; fi
       return ;;
     --scope)
-      if [[ "$cmd" == logs ]]; then _values 'scope' auto process service
+      if [[ "$cmd" == logs || "$cmd" == explain ]]; then _values 'scope' auto process service
       else _values 'scope' process tree; fi
       return ;;
     --priority) _values 'priority' error warning info debug; return ;;
@@ -157,6 +159,7 @@ _psmore() {
   case "$cmd" in
     check) options=( '--expect[none or any]:mode:(none any)' '--wait[retry until policy passes]:duration:' '--interval-ms[evaluation cadence]:milliseconds:' '--stable[required consecutive passes]:samples:' '--table[table output]' '--json[JSON output]' '--quiet[suppress output]' '--sample-ms[sampling milliseconds]:milliseconds:' ) ;;
     inspect) options=( '--table[table output]' '--json[JSON output]' '--sample-ms[sampling milliseconds]:milliseconds:' ) ;;
+    explain) options=( '--scope[process or service log boundary]:scope:(auto process service)' '--since[recent log window]:duration:' '--priority[maximum log verbosity]:priority:(error warning info debug)' '--limit[newest log entries]:rows:' '--no-logs[skip native logs]' '--no-hash[skip SHA-256 reads]' '--sample-ms[sampling milliseconds]:milliseconds:' '--table[table output]' '--json[JSON output]' '--output[atomically write private JSON]:file:_files' '--force[replace an existing output file]' ) ;;
     exe) options=( '--table[table output]' '--json[JSON output]' '--no-hash[skip SHA-256 reads]' ) ;;
     stale) options=( '--query[process query]:query:' '--limit[maximum stale processes]:rows:(all)' '--table[table output]' '--json[JSON output]' '--expect[policy]:mode:(none any)' '--quiet[suppress output]' '--sample-ms[sampling milliseconds]:milliseconds:' ) ;;
     service) options=( '--table[table output]' '--json[JSON output]' ) ;;
@@ -189,6 +192,7 @@ const FISH_COMPLETION: &str = r#"# psmore fish completion
 complete -c psmore -f
 complete -c psmore -n '__fish_use_subcommand' -a check -d 'Evaluate a process-query health gate'
 complete -c psmore -n '__fish_use_subcommand' -a inspect -d 'Deep inspection for one process'
+complete -c psmore -n '__fish_use_subcommand' -a explain -d 'Build a prioritized process evidence dossier'
 complete -c psmore -n '__fish_use_subcommand' -a exe -d 'Verify a process executable image and provenance'
 complete -c psmore -n '__fish_use_subcommand' -a stale -d 'Find Linux processes holding obsolete executables'
 complete -c psmore -n '__fish_use_subcommand' -a service -d 'Resolve a PID to systemd or launchd context'
@@ -211,11 +215,11 @@ complete -c psmore -n '__fish_use_subcommand' -a diff -d 'Compare snapshots or d
 complete -c psmore -n '__fish_use_subcommand' -a completion -d 'Generate shell completion'
 
 complete -c psmore -n '__fish_seen_subcommand_from completion' -a 'bash zsh fish'
-complete -c psmore -n 'not __fish_seen_subcommand_from check inspect exe stale service logs port listen net tree watch trace run deleted file fd top oom cgroup doctor diff completion' -s q -l query -r -d 'Initial TUI or snapshot query'
-complete -c psmore -n 'not __fish_seen_subcommand_from check inspect exe stale service logs port listen net tree watch trace run deleted file fd top oom cgroup doctor diff completion' -l no-tips -d 'Skip startup guidance for this TUI run'
-complete -c psmore -n 'not __fish_seen_subcommand_from check inspect exe stale service logs port listen net tree watch trace run deleted file fd top oom cgroup doctor diff completion' -l table -d 'Print table snapshot'
-complete -c psmore -n 'not __fish_seen_subcommand_from check inspect exe stale service logs port listen net tree watch trace run deleted file fd top oom cgroup doctor diff completion' -l json -d 'Print JSON snapshot'
-complete -c psmore -n 'not __fish_seen_subcommand_from check inspect exe stale service logs port listen net tree watch trace run deleted file fd top oom cgroup doctor diff completion' -l sample-ms -r -d 'Sampling milliseconds'
+complete -c psmore -n 'not __fish_seen_subcommand_from check inspect explain exe stale service logs port listen net tree watch trace run deleted file fd top oom cgroup doctor diff completion' -s q -l query -r -d 'Initial TUI or snapshot query'
+complete -c psmore -n 'not __fish_seen_subcommand_from check inspect explain exe stale service logs port listen net tree watch trace run deleted file fd top oom cgroup doctor diff completion' -l no-tips -d 'Skip startup guidance for this TUI run'
+complete -c psmore -n 'not __fish_seen_subcommand_from check inspect explain exe stale service logs port listen net tree watch trace run deleted file fd top oom cgroup doctor diff completion' -l table -d 'Print table snapshot'
+complete -c psmore -n 'not __fish_seen_subcommand_from check inspect explain exe stale service logs port listen net tree watch trace run deleted file fd top oom cgroup doctor diff completion' -l json -d 'Print JSON snapshot'
+complete -c psmore -n 'not __fish_seen_subcommand_from check inspect explain exe stale service logs port listen net tree watch trace run deleted file fd top oom cgroup doctor diff completion' -l sample-ms -r -d 'Sampling milliseconds'
 complete -c psmore -n '__fish_seen_subcommand_from check stale port listen net deleted file fd oom' -l expect -xa 'none any'
 complete -c psmore -n '__fish_seen_subcommand_from check' -l wait -r -d 'Retry until policy passes or duration expires'
 complete -c psmore -n '__fish_seen_subcommand_from check' -l interval-ms -r -d 'Evaluation cadence while waiting'
@@ -228,10 +232,14 @@ complete -c psmore -n '__fish_seen_subcommand_from net' -l state -xa 'ESTABLISHE
 complete -c psmore -n '__fish_seen_subcommand_from stale listen net fd' -l limit -xa all
 complete -c psmore -n '__fish_seen_subcommand_from top' -l by -xa 'cpu memory read write'
 complete -c psmore -n '__fish_seen_subcommand_from top' -l scope -xa 'process tree'
-complete -c psmore -n '__fish_seen_subcommand_from logs' -l scope -xa 'auto process service'
-complete -c psmore -n '__fish_seen_subcommand_from logs' -l since -r -d 'Recent time window such as 15m or 2h'
-complete -c psmore -n '__fish_seen_subcommand_from logs' -l priority -xa 'error warning info debug'
-complete -c psmore -n '__fish_seen_subcommand_from logs' -l limit -r
+complete -c psmore -n '__fish_seen_subcommand_from logs explain' -l scope -xa 'auto process service'
+complete -c psmore -n '__fish_seen_subcommand_from logs explain' -l since -r -d 'Recent time window such as 15m or 2h'
+complete -c psmore -n '__fish_seen_subcommand_from logs explain' -l priority -xa 'error warning info debug'
+complete -c psmore -n '__fish_seen_subcommand_from logs explain' -l limit -r
+complete -c psmore -n '__fish_seen_subcommand_from explain' -l no-logs -d 'Skip native logs'
+complete -c psmore -n '__fish_seen_subcommand_from explain' -l no-hash -d 'Skip SHA-256 reads'
+complete -c psmore -n '__fish_seen_subcommand_from explain' -l output -r -F -d 'Atomically write private JSON'
+complete -c psmore -n '__fish_seen_subcommand_from explain' -l force -d 'Replace an existing output file'
 complete -c psmore -n '__fish_seen_subcommand_from cgroup' -l by -xa 'cpu memory pressure processes'
 complete -c psmore -n '__fish_seen_subcommand_from cgroup' -l limit -xa all
 complete -c psmore -n '__fish_seen_subcommand_from top' -l limit -xa all
@@ -255,7 +263,7 @@ complete -c psmore -n '__fish_seen_subcommand_from run' -l linger-ms -r -d 'Post
 complete -c psmore -n '__fish_seen_subcommand_from run' -l output -r -F -d 'Atomically write private JSON'
 complete -c psmore -n '__fish_seen_subcommand_from run' -l force -d 'Replace an existing output file'
 complete -c psmore -n '__fish_seen_subcommand_from exe' -l no-hash -d 'Skip SHA-256 reads'
-complete -c psmore -n '__fish_seen_subcommand_from inspect stale tree check top oom cgroup doctor' -l sample-ms -r
+complete -c psmore -n '__fish_seen_subcommand_from inspect explain stale tree check top oom cgroup doctor' -l sample-ms -r
 complete -c psmore -n '__fish_seen_subcommand_from deleted' -l min-size -r
 complete -c psmore -n '__fish_seen_subcommand_from file' -l recursive -d 'Match the path and all descendants'
 complete -c psmore -n '__fish_seen_subcommand_from file' -l limit -xa all
@@ -263,8 +271,8 @@ complete -c psmore -n '__fish_seen_subcommand_from file' -F
 complete -c psmore -n '__fish_seen_subcommand_from fd' -l min-count -r
 complete -c psmore -n '__fish_seen_subcommand_from fd' -l min-percent -r
 complete -c psmore -n '__fish_seen_subcommand_from stale listen net watch top oom cgroup doctor' -s q -l query -r
-complete -c psmore -n '__fish_seen_subcommand_from check inspect exe stale service logs port listen net tree run deleted file fd top oom cgroup doctor diff' -l table
-complete -c psmore -n '__fish_seen_subcommand_from check inspect exe stale service logs port listen net tree run deleted file fd top oom cgroup doctor diff' -l json
+complete -c psmore -n '__fish_seen_subcommand_from check inspect explain exe stale service logs port listen net tree run deleted file fd top oom cgroup doctor diff' -l table
+complete -c psmore -n '__fish_seen_subcommand_from check inspect explain exe stale service logs port listen net tree run deleted file fd top oom cgroup doctor diff' -l json
 complete -c psmore -n '__fish_seen_subcommand_from watch trace' -l jsonl
 complete -c psmore -n '__fish_seen_subcommand_from check stale port listen net deleted file fd oom doctor diff' -l quiet
 complete -c psmore -l redact -d 'Mask common secret values in command lines'
@@ -281,6 +289,7 @@ mod tests {
         let commands = [
             "check",
             "inspect",
+            "explain",
             "exe",
             "stale",
             "service",

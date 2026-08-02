@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise psmore's image, manager, and native-log workspaces in a real PTY."""
+"""Exercise psmore's dossier and raw-evidence workspaces in a real PTY."""
 
 from __future__ import annotations
 
@@ -63,12 +63,17 @@ def main() -> int:
                 chunk = b""
             if chunk:
                 output.extend(chunk)
-        fail(f"timed out waiting for {needle!r}")
+        tail = bytes(output[-12000:]).decode("utf-8", errors="replace")
+        fail(f"timed out waiting for {needle!r}; terminal tail:\n{tail}")
 
     try:
         time.sleep(0.5)
         os.write(master, f"/pid:{pid}\r".encode())
         time.sleep(0.2)
+        os.write(master, b"D")
+        read_until(b"PSMORE PROCESS DOSSIER", 30.0)
+        read_until(b"EVIDENCE OVERVIEW", 5.0)
+
         os.write(master, b"v")
         read_until(b"PSMORE EXECUTABLE IMAGE", 25.0)
         read_until(b"coverage ", 5.0)
@@ -101,7 +106,7 @@ def main() -> int:
     finally:
         os.close(master)
 
-    print(f"Verified TUI image -> manager -> logs -> manager workflow for PID {pid}")
+    print(f"Verified TUI dossier -> image -> manager -> logs -> manager workflow for PID {pid}")
     return 0
 
 

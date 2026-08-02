@@ -108,6 +108,9 @@ grep -q 'stale' "$prefix/share/fish/vendor_completions.d/psmore.fish" || fail 'f
 grep -q 'logs' "$prefix/share/bash-completion/completions/psmore" || fail 'bash completion is missing the logs command'
 grep -q 'logs' "$prefix/share/zsh/site-functions/_psmore" || fail 'zsh completion is missing the logs command'
 grep -q 'logs' "$prefix/share/fish/vendor_completions.d/psmore.fish" || fail 'fish completion is missing the logs command'
+grep -q 'explain' "$prefix/share/bash-completion/completions/psmore" || fail 'bash completion is missing the explain command'
+grep -q 'explain' "$prefix/share/zsh/site-functions/_psmore" || fail 'zsh completion is missing the explain command'
+grep -q 'explain' "$prefix/share/fish/vendor_completions.d/psmore.fish" || fail 'fish completion is missing the explain command'
 file_report="$temp_dir/file-report.json"
 "$prefix/bin/psmore" file "$prefix/bin/psmore" --json --limit 1 > "$file_report"
 grep -q '"schema": "psmore.file-usage"' "$file_report" || fail 'installed file command returned an unexpected schema'
@@ -123,6 +126,14 @@ grep -q '"schema": "psmore.executable-image"' "$exe_report" || fail 'installed e
 logs_report="$temp_dir/logs-report.json"
 "$prefix/bin/psmore" logs "$$" --scope process --since 1s --limit 1 --json > "$logs_report"
 grep -q '"schema": "psmore.process-logs"' "$logs_report" || fail 'installed logs command returned an unexpected schema'
+
+explain_report="$temp_dir/explain-report.json"
+"$prefix/bin/psmore" explain "$$" --no-logs --no-hash --sample-ms 100 --output "$explain_report" >/dev/null
+grep -q '"schema": "psmore.process-dossier"' "$explain_report" || fail 'installed explain command returned an unexpected schema'
+grep -q '"process_identity": "verified"' "$explain_report" || fail 'installed explain command did not verify the target process identity'
+grep -q '"schema": "psmore.process-inspection"' "$explain_report" || fail 'installed explain command is missing inspection evidence'
+grep -q '"schema": "psmore.service-context"' "$explain_report" || fail 'installed explain command is missing service evidence'
+grep -q '"schema": "psmore.executable-image"' "$explain_report" || fail 'installed explain command is missing executable evidence'
 
 if [ "$(uname -s)" = Linux ]; then
     cgroup_report="$temp_dir/cgroup-report.json"

@@ -11,7 +11,7 @@
 - 上方以树展示进程父子关系，PID 0 是用于承接系统根、不可见父进程和采集期间消失进程的虚拟根节点
 - 下方显示当前节点的 PID、PPID、子进程数、状态、CPU、内存、磁盘读写速率、运行时间、路径和命令
 - 下方同时聚合当前进程与全部后代的进程数、CPU、内存和磁盘 I/O，便于判断一个完整服务树的真实资源占用
-- 首次进入 TUI 显示三页可翻阅的现场手册；随后每次启动显示一条不阻塞键盘的高级 tip，12 条循环轮播，直到用户主动关闭，并可随时按 `?` 重新打开
+- 首次进入 TUI 显示三页可翻阅的现场手册；随后每次启动显示一条不阻塞键盘的高级 tip，13 条循环轮播，直到用户主动关闭，并可随时按 `?` 重新打开
 - 每一行在 PID 后显示命令行，若命令行不可用则显示可执行文件路径
 - 同级进程按名称、PID 确定性排序，刷新时不会因 HashMap 或同名进程导致顺序漂移
 - 键盘导航，实时搜索/过滤，聚焦当前进程的父链和子树
@@ -29,6 +29,7 @@
 - `Space` 暂停/恢复自动刷新，暂停后进程树完全静止，仍可导航、搜索并按 `r` 手动采样
 - `e` 打开活动审计面板；内存中保留最近 100 次人工进程操作和 200 条进程变化，最新操作固定显示在变化列表上方，避免被高频短命进程淹没
 - `Enter` 深度检查选中进程，集中展示运行用户、工作目录、TCP/UDP/Unix 套接字和打开的文件描述符
+- `D` 为选中进程建立一键事故档案：并行汇总深检、服务归属、可执行映像和有界原生日志，先展示带证据路径的优先级线索，再可跳入四类原始证据
 - 深度检查按 CPU 从高到低展示热点线程：macOS 通过系统 `libproc` 获取 64 位线程 ID、名称、状态和调度器 CPU 估值；Linux 对 `/proc/<pid>/task` 做约 250 ms 差分采样，并显示 TID、状态、优先级、nice 值和所在 CPU 核
 - 线程列表最多展示最热的 50 行，但始终保留真实线程总数、采样间隔、截断状态和采集警告；线程采集与其他深度检查一起在后台运行，不阻塞进程树
 - Linux 深度检查进一步展示线程、RSS/Swap、上下文切换、cgroup、systemd 单元、Docker/containerd/Podman/Kubernetes 线索、命名空间、Seccomp、能力位和关键资源限制
@@ -44,7 +45,7 @@
 - 全局网络扫描、进程深度检查、Service Context、原生日志和可执行映像验证都在后台执行；耗时采集会显示动画与已用时间，期间进程树继续刷新，键盘关闭面板和退出始终可用
 - `p` 打开进程操作中心，可发送 TERM、KILL、STOP、CONT；选择操作后必须另按 `y` 确认，执行前会重新校验 PID 与启动时间，避免把信号发给复用该 PID 的新进程
 - PID 0、PID 1 和 `psmore` 自身受强制保护；每次已发送、被安全策略拒绝或被操作系统拒绝的结果都会进入活动审计
-- `o` 将当前诊断上下文导出为带版本号的 JSON 报告，包括完整进程清单、资源聚合、当前查询及命中数、关注事项、最近事件和进程操作审计；已经打开的网络扫描、深度检查、Service Context、原生日志、可执行映像证据及已捕获基线会一并写入，但导出本身不会触发额外扫描
+- `o` 将当前诊断上下文导出为带版本号的 JSON 报告，包括完整进程清单、资源聚合、当前查询及命中数、关注事项、最近事件和进程操作审计；已经打开的网络扫描、深度检查、Dossier、Service Context、原生日志、可执行映像证据及已捕获基线会一并写入，但导出本身不会触发额外扫描
 - 支持无交互快照模式：`--table` 输出适合 SSH 现场查看的稳定表格，`--json` 输出带版本号的机器可读快照；两者复用 TUI 的完整查询语法与子树资源聚合
 - 无交互模式执行两次采样，默认间隔 500 ms，使 CPU 与磁盘 I/O 速率具有实际意义；可用 `--sample-ms` 在 100–60000 ms 之间调整
 - 所有无交互表格、JSON 和 JSONL 输出支持 `--redact`：在保留命令结构的同时遮盖常见密码、token、API key、认证 header、URL userinfo 和敏感查询参数
@@ -52,6 +53,7 @@
 - `psmore diff BEFORE.json AFTER.json` 自动识别进程快照或主机体检报告：前者对比启动/退出、PID 复用、父进程与资源增量，后者对比新观察到/恢复/持续信号、严重度以及主机和 deep 证据变化；支持 `--fail-on regression --quiet` 发布门禁和 `--output` 私有原子归档
 - `psmore check QUERY` 将任意结构化查询变成 CI/运维健康门禁：排除检查器自身及其对子树聚合的干扰，默认期望零命中，`--expect any` 可反向要求服务存在；`--wait` 等待发布/恢复收敛，`--stable` 要求连续多个样本通过
 - `psmore inspect PID` 将 TUI 深度检查直接带到 SSH、脚本和事故工单：一次输出进程身份、完整命令、热点线程、socket、打开文件及平台运行上下文，也可导出 `psmore.process-inspection` JSON
+- `psmore explain PID` 是面向事故现场的一键进程档案：并行拼合深检、服务归属、可执行映像和原生日志，再按严重程度列出可追溯到原始证据的关注事项
 - `psmore exe PID` 核对进程实际持有的可执行映像与当前磁盘路径，识别发布后仍运行旧映像、文件已删除或被替换，并补充软件包和代码签名来源
 - `psmore stale [QUERY]` 在 Linux 整机扫描仍持有已删除或已替换可执行映像的进程，关联 systemd unit/软件包，并可作为发布后的保守健康门禁
 - `psmore service PID` 将任意进程反查到 Linux systemd unit 或 macOS launchd job，展示状态、重启、配置来源、资源边界和可复制的下一步只读诊断命令
@@ -76,7 +78,7 @@
 
 第一次进入交互界面时，psmore 会展示三页现场手册，将主要能力按“理解进程树 → 从症状找到证据 → 安全操作与分享”组织起来。使用 `←`/`→`、`↑`/`↓` 或 `Tab` 翻页，`Enter`/`Esc` 开始工作；`q` 和 `Ctrl-C` 始终可以直接退出。
 
-完成首次手册后，每次启动会在右下角展示一条高级 tip，覆盖子树查询、热点、基线、网络、趋势、原生日志、映像验证和安全操作；12 条完成后从第一条继续轮播，直到用户主动关闭。Tip 不会抢走工作键：除 `Enter`、`Esc`、`?`、`T`、`D` 外，按下任意键都会关闭 tip 并继续执行该键原本的操作，例如 `Space` 仍会立即暂停、`/` 仍会开始查询。
+完成首次手册后，每次启动会在右下角展示一条高级 tip，覆盖子树查询、热点、基线、网络、趋势、Dossier、原生日志、映像验证和安全操作；13 条完成后从第一条继续轮播，直到用户主动关闭。Tip 不会抢走工作键：除 `Enter`、`Esc`、`?`、`T`、`D` 外，按下任意键都会关闭 tip 并继续执行该键原本的操作，例如 `Space` 仍会立即暂停、`/` 仍会开始查询。
 
 任何时候按 `?` 都能打开完整现场手册。引导内按 `T` 切换未来启动 tip，按 `D` 永久关闭启动卡片；只想本次跳过可运行：
 
@@ -299,6 +301,30 @@ psmore inspect 1234 --sample-ms 1000
 
 命令在深检前后重新采集目标 PID：若确认发生 PID 复用，会拒绝合并两个进程实例并以退出码 `1` 失败；若目标在采集中正常退出，则保留已经取得的诊断结果，同时将身份标记为 `exited_during_collection`。无法取得启动时间时会标记为 `unverified`，不会伪装成已经确认。输出可能包含敏感参数、路径、用户名、线程名和网络端点，分享前应检查。
 
+### 一条命令建立进程事故档案
+
+现场看到一个可疑 PID 时，通常还要依次检查运行上下文、服务管理器、磁盘上的程序是否已替换，以及最近日志。`explain` 把这四段只读证据并行采集成一个 dossier，并先给出按 `critical / warning / notice` 排序的线索，再附上每个原始报告：
+
+```bash
+# 默认包含最近 15 分钟原生日志和可执行文件 SHA-256
+psmore explain 1234
+
+# 快速元数据档案，不读取日志内容和大文件哈希
+psmore explain 1234 --no-logs --no-hash --sample-ms 100
+
+# 调整日志边界；Linux 的 service scope 可保留重启前的同服务日志
+psmore explain 1234 --scope service --since 2h --priority warning --limit 250
+
+# 私有原子归档；默认拒绝覆盖，确需替换时显式加 --force
+psmore explain 1234 --redact --output incident-1234.json
+```
+
+四个采集器共享初始 PID 和启动时间作为 dossier 身份，完成后还会再次刷新目标；任何分段 PID/启动时间不一致都会被拒绝归因，整个采集期间确认 PID 复用则整份报告失败。某项因权限、平台能力或竞争条件只得到部分证据时，section 会标记 `partial`，不会把“未看到”解释成“不存在”。
+
+JSON 使用 `psmore.process-dossier` schema v1。每条汇总信号都有稳定 code 和 `evidence_path`，便于工单系统或自动化定位对应原始字段；除服务失败、映像漂移和日志等级外，还会保守提示单次 CPU 热点、线程/socket 规模、可见 FD 对 `RLIMIT_NOFILE` 的占用，以及 Linux 服务对 `TasksMax`/`MemoryMax` 的余量。FD 在 75%/90%/100%、TasksMax 在 75%/90%/100%、MemoryMax 在 80%/90%/100% 分别提高关注级别；单次 CPU 只产生 notice，并明确建议用 `trace` 确认持续性。所有信号只表示复核优先级，不武断宣称根因。
+
+TUI 中选中进程按 `D` 打开同一份摘要；`s`/`p`/`w` 调整日志边界，`L` 开关日志，`h` 开关哈希，`i`/`m`/`v`/`l` 跳到四类原始证据。采集始终在后台进行，`o` 会把已完成的 dossier 嵌入诊断报告但不会为了导出额外触发采集。CLI 的 `--output` 强制写 JSON，使用 mode `0600` 的私有原子文件并默认拒绝覆盖。指定 `--no-logs` 后不能再同时指定 `--scope`、`--since`、`--priority` 或 `--limit`，避免接受实际不会生效的参数。档案可能包含命令参数、路径、用户、文件/网络资源、服务配置、哈希、签名和业务日志；对外分享前应使用 `--redact`，并再次人工检查。
+
 ### 进程实际运行的是哪个可执行映像
 
 发布完成但服务没有真正加载新二进制、磁盘文件已被覆盖而旧进程仍存活，或者需要确认程序来自哪个包和签名主体时，可以从 PID 直接核对。在 TUI 中选中进程按 `v` 可直接打开同一份 Verify Image 工作区：
@@ -351,7 +377,7 @@ psmore service 1234
 psmore service 1234 --json --redact > service-1234.safe.json
 ```
 
-Linux 从目标 `/proc/<pid>/cgroup` 选择最具体的 `.service` 或 `.scope`，区分 system/user manager，再使用 `systemctl show` 获取 ActiveState/SubState、Result、MainPID、重启策略/次数、unit 文件、drop-in、TasksCurrent、MemoryCurrent 和累计 CPU。若当前用户无权访问其他用户的 user manager，仍保留内核 cgroup 归属并明确标为 partial。报告会给出可复制但不会自动执行的 `systemctl status`、`journalctl` 和 `systemctl cat` 命令。
+Linux 从目标 `/proc/<pid>/cgroup` 选择最具体的 `.service` 或 `.scope`，区分 system/user manager，再使用 `systemctl show` 获取 ActiveState/SubState、Result、MainPID、重启策略/次数、unit 文件、drop-in、TasksCurrent/TasksMax、MemoryCurrent/MemoryMax 和累计 CPU。`infinity`、有限数值和不可见字段会分别保留，不把未知说成无限制。若当前用户无权访问其他用户的 user manager，仍保留内核 cgroup 归属并明确标为 partial。报告会给出可复制但不会自动执行的 `systemctl status`、`journalctl` 和 `systemctl cat` 命令。
 
 macOS 沿目标父链匹配当前 bootstrap namespace 中已加载的 launchd job，并结合 `launchctl print pid/PID`、job label 和可访问的 `gui/user/system` target，展示 label、运行状态、最近退出状态、程序参数和 plist 来源；下一步提供 `launchctl print`、`launchctl blame`、统一日志及 `plutil` 命令。普通 App 或未能映射到当前 namespace 的进程会明确显示 unmanaged/partial，不猜测不存在的 job。
 
@@ -763,6 +789,7 @@ doctor 对比使用稳定 finding code 识别同一类信号，分别列出新�
 | `d` | 打开基线差异面板；支持方向键、`j/k`、PageUp/PageDown 滚动 |
 | `x` | 清除当前基线；在差异面板内同样可用 |
 | `n` | 打开全局网络面板；`v` 切换监听/全部连接，`/` 过滤，`r` 重新扫描，`Enter` 跳到所有者进程，`Esc` 或 `n` 关闭 |
+| `D` | 并行建立选中进程的 Dossier，汇总深检、服务归属、运行映像与日志并优先展示异常线索；`i`/`m`/`v`/`l` 查看原始证据，`L` 切换日志采集，`h` 切换哈希，`Esc` 或 `D` 关闭 |
 | `m` | 在后台解析选中进程的 systemd unit 或 launchd job，展示状态、配置、资源边界和下一步只读命令；`Enter`/`r` 刷新，`Esc` 或 `m` 关闭 |
 | `v` | 在后台验证选中进程的运行映像、磁盘漂移、软件包与代码签名；面板内 `h` 切换 SHA-256，`m` 切到服务上下文，`Esc` 或 `v` 关闭 |
 | `l` | 后台读取选中进程的原生日志；面板内 `s` 切换 auto/process/service，`p` 切换等级，`w` 切换时间窗，`m`/`v` 跳到关联上下文 |
@@ -791,4 +818,4 @@ doctor 对比使用稳定 finding code 识别同一类信号，分别列出新�
 - 两个平台都建议使用与目标进程相同的用户运行；更高权限能够看到更多进程参数，但 `psmore` 本身不要求 root。
 - 进程操作遵循当前用户权限，不会提权。确认时如果目标已退出、启动时间不可用或 PID 已被复用，操作会拒绝并留下原因；信号只发送给选中 PID，不会隐式发送给整个子树或进程组。
 - Linux 原生日志来自 journald，普通用户只能看到其权限允许的记录；macOS 原生日志来自 Unified Logging。两者都会限制时间窗和返回条数，但日志消息仍可能包含业务数据或密钥，`--redact` 只是辅助措施。
-- 诊断报告 schema v6 先写临时文件再原子改名，并在 Unix 平台使用 `0600` 权限。报告可能包含完整命令行、文件路径、用户名、主机名、线程名、socket 端点、systemd/launchd 服务上下文、原生日志、可执行映像哈希与签名和人工操作审计，分享前应先检查敏感信息。
+- 诊断报告 schema v7 先写临时文件再原子改名，并在 Unix 平台使用 `0600` 权限。报告可嵌入已采集的 process dossier，并可能包含完整命令行、文件路径、用户名、主机名、线程名、socket 端点、systemd/launchd 服务上下文、原生日志、可执行映像哈希与签名和人工操作审计，分享前应先检查敏感信息。

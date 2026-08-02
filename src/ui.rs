@@ -617,7 +617,7 @@ fn draw_inspection_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         .min(u16::MAX as usize) as u16;
     app.inspection_scroll = app.inspection_scroll.min(max_scroll);
     let title = format!(
-        " inspect {} [{}]{}  Enter/r refresh  ↑↓ scroll  Esc close ",
+        " inspect {} [{}]{}  Enter/r refresh  ↑↓ scroll  D dossier  Esc close ",
         inspection.name, inspection.pid, inspection_status
     );
     frame.render_widget(Clear, popup);
@@ -625,6 +625,125 @@ fn draw_inspection_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         Paragraph::new(lines)
             .block(Block::default().borders(Borders::ALL).title(title))
             .scroll((app.inspection_scroll, 0))
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
+fn draw_dossier_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
+    let Some(panel) = app.dossier_context.clone() else {
+        return;
+    };
+    let width = area.width.saturating_sub(2).clamp(1, 160);
+    let height = area.height.saturating_sub(2).max(1);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let mut lines = Vec::new();
+    if app.dossier_context_is_scanning() {
+        let elapsed = app.dossier_context_elapsed();
+        lines.push(Line::from(Span::styled(
+            format!(
+                " {} collecting process dossier in parallel ({:.1}s)",
+                activity_spinner(elapsed),
+                elapsed.as_secs_f64()
+            ),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+    }
+    if let Some(warning) = panel.warning.as_deref() {
+        lines.push(Line::from(Span::styled(
+            format!(" WARNING  {warning}"),
+            Style::default().fg(Color::LightRed),
+        )));
+        lines.push(Line::from(""));
+    }
+    for line in panel.content.lines() {
+        let trimmed = line.trim_start();
+        let style = if trimmed.starts_with("CRIT") {
+            Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD)
+        } else if trimmed.starts_with("WARN") {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else if trimmed.starts_with("NOTE") {
+            Style::default().fg(Color::LightCyan)
+        } else if line.starts_with("status ") {
+            if line.contains("status critical") || line.contains("status warning") {
+                Style::default()
+                    .fg(Color::LightRed)
+                    .add_modifier(Modifier::BOLD)
+            } else if line.contains("status notice") {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(Color::LightGreen)
+                    .add_modifier(Modifier::BOLD)
+            }
+        } else if matches!(line, "PRIORITIZED SIGNALS" | "EVIDENCE OVERVIEW") {
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD)
+        } else if trimmed.contains("partial") || trimmed.contains("failed") {
+            Style::default().fg(Color::Yellow)
+        } else if trimmed.contains("complete") {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(Span::styled(line.to_owned(), style)));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " No process dossier available",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    let content_height = height.saturating_sub(2) as usize;
+    let content_width = width.saturating_sub(2).max(1) as usize;
+    let visual_lines = lines
+        .iter()
+        .map(|line| line.width().max(1).div_ceil(content_width))
+        .sum::<usize>();
+    let max_scroll = visual_lines
+        .saturating_sub(content_height)
+        .min(u16::MAX as usize) as u16;
+    app.dossier_context_scroll = app.dossier_context_scroll.min(max_scroll);
+    let scanning = if app.dossier_context_is_scanning() {
+        " scanning"
+    } else {
+        ""
+    };
+    let logs = if panel.include_logs {
+        format!(
+            "logs on {} <= {} {}",
+            panel.scope.label(),
+            panel.priority.label(),
+            compact_duration(panel.since_seconds)
+        )
+    } else {
+        "logs off".into()
+    };
+    let hash = if panel.hash { "hash on" } else { "hash off" };
+    let title = format!(
+        " dossier {} [{}]{}  {}  {}  r refresh  s/p/w logs  h hash  L logs  i/m/v/l evidence  D/Esc close ",
+        panel.name, panel.pid, scanning, logs, hash
+    );
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .scroll((app.dossier_context_scroll, 0))
             .wrap(Wrap { trim: false }),
         popup,
     );
@@ -706,7 +825,7 @@ fn draw_service_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         ""
     };
     let title = format!(
-        " manager {} [{}]{}  Enter/r refresh  ↑↓ scroll  v verify  l logs  m/Esc close ",
+        " manager {} [{}]{}  Enter/r refresh  ↑↓ scroll  D dossier  v verify  l logs  m/Esc close ",
         panel.name, panel.pid, scanning
     );
     frame.render_widget(Clear, popup);
@@ -806,7 +925,7 @@ fn draw_executable_context_overlay(frame: &mut Frame, app: &mut App, area: Rect)
     };
     let hash = if panel.hash { "hash on" } else { "hash off" };
     let title = format!(
-        " verify image {} [{}]{}  {}  Enter/r refresh  h hash  m manager  l logs  v/Esc close ",
+        " verify image {} [{}]{}  {}  Enter/r refresh  h hash  D dossier  m manager  l logs  v/Esc close ",
         panel.name, panel.pid, scanning, hash
     );
     frame.render_widget(Clear, popup);
@@ -909,7 +1028,7 @@ fn draw_logs_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         ""
     };
     let title = format!(
-        " logs {} [{}]{}  scope {}  <= {}  {}  r refresh  s scope  p level  w window  m/v context  l/Esc close ",
+        " logs {} [{}]{}  scope {}  <= {}  {}  r refresh  s scope  p level  w window  D dossier  m/v context  l/Esc close ",
         panel.name,
         panel.pid,
         scanning,
@@ -2073,11 +2192,12 @@ fn guidance_page(page: usize) -> Vec<Line<'static>> {
                 "systemd or launchd ownership, state, config, and next commands",
             ),
             guidance_key("l", "bounded native logs for this process or service"),
+            guidance_key("D", "one process dossier with prioritized evidence"),
             guidance_key("b / d / x", "capture baseline, compare, and clear"),
             guidance_key("Space / r", "freeze the scene; sample manually"),
             Line::from(""),
             Line::from(Span::styled(
-                " Tip: m, v, and l switch manager, executable, and native-log evidence.",
+                " Tip: D collects manager, image, logs, and process evidence in parallel.",
                 Style::default().fg(Color::Yellow),
             )),
         ],
@@ -2097,7 +2217,7 @@ fn guidance_page(page: usize) -> Vec<Line<'static>> {
             guidance_key("q / Ctrl-C", "leave psmore"),
             Line::from(""),
             Line::from(Span::styled(
-                " CLI companions: doctor, inspect, exe, service, logs, tree, net, trace, diff",
+                " CLI companions: doctor, explain, inspect, exe, service, logs, tree, net, trace, diff",
                 Style::default().fg(Color::Yellow),
             )),
         ],
@@ -2429,7 +2549,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     } else if !app.search.is_empty() {
         " filter active | / new search or clear | ↑↓/jk move | Enter inspect | q quit ".into()
     } else {
-        " ↑↓/jk move | ←/→ tree | / find | a attention | h hot | m manager | v image | l logs | p actions | t trend | n network | b base | d diff | o report | ? help ".into()
+        " ↑↓/jk move | ←/→ tree | / find | D dossier | a attention | h hot | m manager | v image | l logs | p actions | t trend | n network | b base | d diff | o report | ? help ".into()
     };
     let footer = Paragraph::new(vec![
         Line::from(format!(
@@ -2463,6 +2583,8 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         draw_snapshot_diff_overlay(frame, app, area);
     } else if app.trend_pid.is_some() {
         draw_trend_overlay(frame, app, area);
+    } else if app.dossier_context.is_some() {
+        draw_dossier_context_overlay(frame, app, area);
     } else if app.logs_context.is_some() {
         draw_logs_context_overlay(frame, app, area);
     } else if app.executable_context.is_some() {
@@ -2488,7 +2610,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        app::{ExecutableContextPanel, LogsContextPanel, ServiceContextPanel},
+        app::{DossierContextPanel, ExecutableContextPanel, LogsContextPanel, ServiceContextPanel},
         cli::{LogPriority, LogScope},
         onboarding::{Guidance, TIPS},
     };
@@ -2616,6 +2738,77 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.service_context.is_none());
         assert!(!app.service_context_is_scanning());
+    }
+
+    #[test]
+    fn dossier_overlay_renders_controls_and_closes() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        let current_pid = sysinfo::get_current_pid().unwrap();
+        app.dossier_context = Some(DossierContextPanel {
+            pid: current_pid,
+            name: "worker".into(),
+            content: [
+                "PSMORE PROCESS DOSSIER",
+                "process worker [42]  user deploy  status Run  identity verified",
+                "status warning  signals 2 (critical 0, warning 1, notice 1)",
+                "PRIORITIZED SIGNALS",
+                "  WARN resource.fd_limit_pressure      92% of soft limit",
+                "  NOTE resource.cpu_hot_sample         sampled CPU is high",
+                "EVIDENCE OVERVIEW",
+                "  inspection         complete      20ms",
+                "  service_context    partial       40ms",
+            ]
+            .join("\n"),
+            report: Some(serde_json::json!({"schema": "psmore.process-dossier"})),
+            warning: None,
+            include_logs: true,
+            hash: true,
+            scope: LogScope::Auto,
+            priority: LogPriority::Info,
+            since_seconds: 900,
+            limit: 100,
+        });
+        let backend = TestBackend::new(110, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let output = buffer_text(&terminal);
+        assert!(output.contains(&format!("dossier worker [{current_pid}]")));
+        assert!(output.contains("resource.fd_limit_pressure"));
+        assert!(output.contains("logs on auto <= info 15m"));
+
+        app.on_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE));
+        assert!(!app.dossier_context.as_ref().unwrap().include_logs);
+        assert!(app.dossier_context_is_scanning());
+        app.on_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE));
+        assert!(app.dossier_context.is_none());
+        assert!(!app.dossier_context_is_scanning());
+    }
+
+    #[test]
+    fn dossier_key_opens_context_for_the_selected_process() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        let current_pid = sysinfo::get_current_pid().unwrap();
+        app.selected = app
+            .visible
+            .iter()
+            .position(|row| row.pid == current_pid)
+            .expect("current test process should be visible");
+
+        app.on_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE));
+        let panel = app
+            .dossier_context
+            .as_ref()
+            .expect("D should open process dossier");
+        assert_eq!(panel.pid, current_pid);
+        assert!(panel.include_logs);
+        assert!(panel.hash);
+        assert!(app.dossier_context_is_scanning());
+
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.dossier_context.is_none());
+        assert!(!app.dossier_context_is_scanning());
     }
 
     #[test]

@@ -16,6 +16,9 @@ use crate::{
     },
     cli::{LogPriority, LogScope},
     headless_exe::{capture_executable, render_executable_json, render_executable_table},
+    headless_explain::{
+        ExplainOptions, capture_dossier, render_dossier_json, render_dossier_summary_table,
+    },
     headless_logs::{capture_logs, render_logs_json, render_logs_table},
     headless_service::{capture_service_context, render_service_json, render_service_table},
     history::ResourceHistory,
@@ -476,6 +479,13 @@ struct LogsContextTask {
     start_time: u64,
 }
 
+struct DossierContextTask {
+    receiver: Receiver<Result<(String, serde_json::Value), String>>,
+    started_at: Instant,
+    pid: Pid,
+    start_time: u64,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ServiceContextPanel {
     pub(crate) pid: Pid,
@@ -502,6 +512,21 @@ pub(crate) struct LogsContextPanel {
     pub(crate) content: String,
     pub(crate) report: Option<serde_json::Value>,
     pub(crate) warning: Option<String>,
+    pub(crate) scope: LogScope,
+    pub(crate) priority: LogPriority,
+    pub(crate) since_seconds: u64,
+    pub(crate) limit: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DossierContextPanel {
+    pub(crate) pid: Pid,
+    pub(crate) name: String,
+    pub(crate) content: String,
+    pub(crate) report: Option<serde_json::Value>,
+    pub(crate) warning: Option<String>,
+    pub(crate) include_logs: bool,
+    pub(crate) hash: bool,
     pub(crate) scope: LogScope,
     pub(crate) priority: LogPriority,
     pub(crate) since_seconds: u64,
@@ -566,6 +591,9 @@ pub(crate) struct App {
     pub(crate) logs_context: Option<LogsContextPanel>,
     logs_context_task: Option<LogsContextTask>,
     pub(crate) logs_context_scroll: u16,
+    pub(crate) dossier_context: Option<DossierContextPanel>,
+    dossier_context_task: Option<DossierContextTask>,
+    pub(crate) dossier_context_scroll: u16,
     pub(crate) process_action: Option<ProcessActionDialog>,
     pub(crate) action_history: Vec<ProcessActionRecord>,
     pub(crate) guidance: Guidance,
@@ -642,6 +670,9 @@ impl App {
             logs_context: None,
             logs_context_task: None,
             logs_context_scroll: 0,
+            dossier_context: None,
+            dossier_context_task: None,
+            dossier_context_scroll: 0,
             process_action: None,
             action_history: Vec::new(),
             guidance,
@@ -934,6 +965,60 @@ impl App {
             }
             Some(Err(TryRecvError::Empty)) | None => {}
         }
+
+        let dossier_result = self
+            .dossier_context_task
+            .as_ref()
+            .map(|task| task.receiver.try_recv());
+        match dossier_result {
+            Some(Ok(result)) => {
+                let task = self.dossier_context_task.take();
+                let same_instance = task
+                    .as_ref()
+                    .map(|task| {
+                        self.processes
+                            .get(&task.pid)
+                            .map(|process| {
+                                task.start_time == 0
+                                    || process.start_time == 0
+                                    || process.start_time == task.start_time
+                            })
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if let Some(panel) = &mut self.dossier_context {
+                    if !same_instance {
+                        panel.content.clear();
+                        panel.report = None;
+                        panel.warning = Some(
+                            "process exited or PID was reused while the dossier was collected"
+                                .into(),
+                        );
+                    } else {
+                        match result {
+                            Ok((content, report)) => {
+                                panel.content = content;
+                                panel.report = Some(report);
+                                panel.warning = None;
+                            }
+                            Err(error) => {
+                                panel.content.clear();
+                                panel.report = None;
+                                panel.warning = Some(error);
+                            }
+                        }
+                    }
+                }
+                self.dossier_context_scroll = 0;
+            }
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.dossier_context_task = None;
+                if let Some(panel) = &mut self.dossier_context {
+                    panel.warning = Some("dossier background worker stopped".into());
+                }
+            }
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
     }
 
     pub(crate) fn network_is_scanning(&self) -> bool {
@@ -991,6 +1076,17 @@ impl App {
             .unwrap_or_default()
     }
 
+    pub(crate) fn dossier_context_is_scanning(&self) -> bool {
+        self.dossier_context_task.is_some()
+    }
+
+    pub(crate) fn dossier_context_elapsed(&self) -> Duration {
+        self.dossier_context_task
+            .as_ref()
+            .map(|task| task.started_at.elapsed())
+            .unwrap_or_default()
+    }
+
     fn record_changes(&mut self, changes: Vec<ProcessChange>) {
         let mut summary = ChangeSummary::default();
         let now = Instant::now();
@@ -1027,6 +1123,12 @@ impl App {
         if !self.paused {
             self.refresh();
         }
+    }
+
+    fn close_dossier_context(&mut self) {
+        self.dossier_context = None;
+        self.dossier_context_task = None;
+        self.dossier_context_scroll = 0;
     }
 
     fn start_inspection(&mut self, process: ProcessInfo, clear_previous: bool) {
@@ -1076,6 +1178,7 @@ impl App {
             return;
         };
         self.show_events = false;
+        self.close_dossier_context();
         self.start_inspection(process, true);
     }
 
@@ -1169,6 +1272,7 @@ impl App {
         self.logs_context = None;
         self.logs_context_task = None;
         self.logs_context_scroll = 0;
+        self.close_dossier_context();
         self.show_events = false;
         self.start_service_context(process, true);
     }
@@ -1266,6 +1370,7 @@ impl App {
         self.logs_context = None;
         self.logs_context_task = None;
         self.logs_context_scroll = 0;
+        self.close_dossier_context();
         self.show_events = false;
         self.start_executable_context(process, true, true);
     }
@@ -1391,6 +1496,7 @@ impl App {
         self.executable_context = None;
         self.executable_context_task = None;
         self.executable_context_scroll = 0;
+        self.close_dossier_context();
         self.show_events = false;
         self.start_logs_context(
             process,
@@ -1462,6 +1568,222 @@ impl App {
             };
         }
         self.refresh_logs_context();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_dossier_context(
+        &mut self,
+        process: ProcessInfo,
+        include_logs: bool,
+        hash: bool,
+        scope: LogScope,
+        priority: LogPriority,
+        since_seconds: u64,
+        limit: usize,
+        clear_previous: bool,
+    ) {
+        if self.dossier_context_task.is_some() {
+            return;
+        }
+        if clear_previous {
+            self.dossier_context = Some(DossierContextPanel {
+                pid: process.pid,
+                name: process.name.clone(),
+                content: String::new(),
+                report: None,
+                warning: None,
+                include_logs,
+                hash,
+                scope,
+                priority,
+                since_seconds,
+                limit,
+            });
+            self.dossier_context_scroll = 0;
+        } else if let Some(panel) = &mut self.dossier_context {
+            panel.content.clear();
+            panel.report = None;
+            panel.warning = None;
+        }
+        let pid = process.pid;
+        let start_time = process.start_time;
+        let (sender, receiver) = mpsc::channel();
+        match thread::Builder::new()
+            .name(format!("psmore-dossier-{}", pid.as_u32()))
+            .spawn(move || {
+                let result = capture_dossier(
+                    pid.as_u32(),
+                    ExplainOptions {
+                        sample_ms: 500,
+                        hash,
+                        include_logs,
+                        logs_scope: scope,
+                        logs_priority: priority,
+                        logs_since_seconds: since_seconds,
+                        logs_limit: limit,
+                    },
+                )
+                .and_then(|captured| {
+                    let content = render_dossier_summary_table(&captured);
+                    let json = render_dossier_json(&captured)
+                        .map_err(|error| format!("cannot serialize process dossier: {error}"))?;
+                    let report = serde_json::from_str(&json)
+                        .map_err(|error| format!("cannot parse process dossier JSON: {error}"))?;
+                    Ok((content, report))
+                });
+                let _ = sender.send(result);
+            }) {
+            Ok(_) => {
+                self.dossier_context_task = Some(DossierContextTask {
+                    receiver,
+                    started_at: Instant::now(),
+                    pid,
+                    start_time,
+                });
+            }
+            Err(error) => {
+                if let Some(panel) = &mut self.dossier_context {
+                    panel.warning = Some(format!("cannot start dossier collection: {error}"));
+                }
+            }
+        }
+    }
+
+    fn open_dossier_context(&mut self) {
+        let Some(process) = self
+            .selected_pid()
+            .and_then(|pid| self.processes.get(&pid))
+            .cloned()
+        else {
+            return;
+        };
+        self.show_attention = false;
+        self.attention_selected = None;
+        self.show_hotspots = false;
+        self.hotspot_selected = None;
+        self.show_network = false;
+        self.network_filter.clear();
+        self.network_searching = false;
+        self.show_snapshot_diff = false;
+        self.trend_pid = None;
+        self.inspection = None;
+        self.inspection_task = None;
+        self.service_context = None;
+        self.service_context_task = None;
+        self.service_context_scroll = 0;
+        self.executable_context = None;
+        self.executable_context_task = None;
+        self.executable_context_scroll = 0;
+        self.logs_context = None;
+        self.logs_context_task = None;
+        self.logs_context_scroll = 0;
+        self.show_events = false;
+        self.start_dossier_context(
+            process,
+            true,
+            true,
+            LogScope::Auto,
+            LogPriority::Info,
+            15 * 60,
+            100,
+            true,
+        );
+    }
+
+    fn refresh_dossier_context(&mut self) {
+        if self.dossier_context_task.is_some() {
+            return;
+        }
+        let Some((pid, include_logs, hash, scope, priority, since_seconds, limit)) =
+            self.dossier_context.as_ref().map(|panel| {
+                (
+                    panel.pid,
+                    panel.include_logs,
+                    panel.hash,
+                    panel.scope,
+                    panel.priority,
+                    panel.since_seconds,
+                    panel.limit,
+                )
+            })
+        else {
+            self.open_dossier_context();
+            return;
+        };
+        let Some(process) = self.processes.get(&pid).cloned() else {
+            if let Some(panel) = &mut self.dossier_context {
+                panel.warning = Some("process has exited since this snapshot".into());
+            }
+            return;
+        };
+        self.start_dossier_context(
+            process,
+            include_logs,
+            hash,
+            scope,
+            priority,
+            since_seconds,
+            limit,
+            false,
+        );
+    }
+
+    fn cycle_dossier_scope(&mut self) {
+        if self.dossier_context_task.is_some() {
+            return;
+        }
+        if let Some(panel) = &mut self.dossier_context {
+            panel.scope = panel.scope.next();
+            panel.include_logs = true;
+        }
+        self.refresh_dossier_context();
+    }
+
+    fn cycle_dossier_priority(&mut self) {
+        if self.dossier_context_task.is_some() {
+            return;
+        }
+        if let Some(panel) = &mut self.dossier_context {
+            panel.priority = panel.priority.next();
+            panel.include_logs = true;
+        }
+        self.refresh_dossier_context();
+    }
+
+    fn cycle_dossier_window(&mut self) {
+        if self.dossier_context_task.is_some() {
+            return;
+        }
+        if let Some(panel) = &mut self.dossier_context {
+            panel.since_seconds = match panel.since_seconds {
+                0..=300 => 15 * 60,
+                301..=900 => 60 * 60,
+                901..=3_600 => 6 * 60 * 60,
+                _ => 5 * 60,
+            };
+            panel.include_logs = true;
+        }
+        self.refresh_dossier_context();
+    }
+
+    fn toggle_dossier_hash(&mut self) {
+        if self.dossier_context_task.is_some() {
+            return;
+        }
+        if let Some(panel) = &mut self.dossier_context {
+            panel.hash = !panel.hash;
+        }
+        self.refresh_dossier_context();
+    }
+
+    fn toggle_dossier_logs(&mut self) {
+        if self.dossier_context_task.is_some() {
+            return;
+        }
+        if let Some(panel) = &mut self.dossier_context {
+            panel.include_logs = !panel.include_logs;
+        }
+        self.refresh_dossier_context();
     }
 
     fn rebuild_visible(&mut self) {
@@ -1858,6 +2180,11 @@ impl App {
                         .as_ref()
                         .and_then(|panel| panel.report.as_ref()),
                     logs_context_in_progress: self.logs_context_is_scanning(),
+                    dossier_context: self
+                        .dossier_context
+                        .as_ref()
+                        .and_then(|panel| panel.report.as_ref()),
+                    dossier_context_in_progress: self.dossier_context_is_scanning(),
                     action_history: &self.action_history,
                     baseline: self.baseline.as_ref(),
                 },
@@ -2543,6 +2870,50 @@ impl App {
             }
             return false;
         }
+        if self.dossier_context.is_some() {
+            match key.code {
+                KeyCode::Char('q') => return true,
+                KeyCode::Esc | KeyCode::Char('D') => self.close_dossier_context(),
+                KeyCode::Char('i') => {
+                    self.close_dossier_context();
+                    self.open_inspection();
+                }
+                KeyCode::Char('m') => {
+                    self.close_dossier_context();
+                    self.open_service_context();
+                }
+                KeyCode::Char('v') => {
+                    self.close_dossier_context();
+                    self.open_executable_context();
+                }
+                KeyCode::Char('l') => {
+                    self.close_dossier_context();
+                    self.open_logs_context();
+                }
+                KeyCode::Enter | KeyCode::Char('r') => self.refresh_dossier_context(),
+                KeyCode::Char('h') => self.toggle_dossier_hash(),
+                KeyCode::Char('L') => self.toggle_dossier_logs(),
+                KeyCode::Char('s') => self.cycle_dossier_scope(),
+                KeyCode::Char('p') => self.cycle_dossier_priority(),
+                KeyCode::Char('w') => self.cycle_dossier_window(),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.dossier_context_scroll = self.dossier_context_scroll.saturating_add(1);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.dossier_context_scroll = self.dossier_context_scroll.saturating_sub(1);
+                }
+                KeyCode::PageDown => {
+                    self.dossier_context_scroll = self.dossier_context_scroll.saturating_add(10);
+                }
+                KeyCode::PageUp => {
+                    self.dossier_context_scroll = self.dossier_context_scroll.saturating_sub(10);
+                }
+                KeyCode::Char(' ') => self.toggle_paused(),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
+                _ => {}
+            }
+            return false;
+        }
         if self.logs_context.is_some() {
             match key.code {
                 KeyCode::Char('q') => return true,
@@ -2562,6 +2933,12 @@ impl App {
                     self.logs_context_task = None;
                     self.logs_context_scroll = 0;
                     self.open_executable_context();
+                }
+                KeyCode::Char('D') => {
+                    self.logs_context = None;
+                    self.logs_context_task = None;
+                    self.logs_context_scroll = 0;
+                    self.open_dossier_context();
                 }
                 KeyCode::Enter | KeyCode::Char('r') => self.refresh_logs_context(),
                 KeyCode::Char('s') => self.cycle_logs_scope(),
@@ -2605,6 +2982,12 @@ impl App {
                     self.service_context_scroll = 0;
                     self.open_logs_context();
                 }
+                KeyCode::Char('D') => {
+                    self.service_context = None;
+                    self.service_context_task = None;
+                    self.service_context_scroll = 0;
+                    self.open_dossier_context();
+                }
                 KeyCode::Enter | KeyCode::Char('r') => self.refresh_service_context(),
                 KeyCode::Down | KeyCode::Char('j') => {
                     self.service_context_scroll = self.service_context_scroll.saturating_add(1);
@@ -2644,6 +3027,12 @@ impl App {
                     self.executable_context_scroll = 0;
                     self.open_logs_context();
                 }
+                KeyCode::Char('D') => {
+                    self.executable_context = None;
+                    self.executable_context_task = None;
+                    self.executable_context_scroll = 0;
+                    self.open_dossier_context();
+                }
                 KeyCode::Enter | KeyCode::Char('r') => self.refresh_executable_context(),
                 KeyCode::Char('h') => self.toggle_executable_hash(),
                 KeyCode::Down | KeyCode::Char('j') => {
@@ -2675,6 +3064,12 @@ impl App {
                     self.inspection = None;
                     self.inspection_task = None;
                     self.inspection_scroll = 0;
+                }
+                KeyCode::Char('D') => {
+                    self.inspection = None;
+                    self.inspection_task = None;
+                    self.inspection_scroll = 0;
+                    self.open_dossier_context();
                 }
                 KeyCode::Enter | KeyCode::Char('r') => self.refresh_inspection(),
                 KeyCode::Down | KeyCode::Char('j') => {
@@ -2798,6 +3193,7 @@ impl App {
             KeyCode::Char('n') => self.open_network(),
             KeyCode::Char('h') => self.open_hotspots(),
             KeyCode::Char('a') => self.open_attention(),
+            KeyCode::Char('D') => self.open_dossier_context(),
             KeyCode::Char('m') => self.open_service_context(),
             KeyCode::Char('v') => self.open_executable_context(),
             KeyCode::Char('l') => self.open_logs_context(),

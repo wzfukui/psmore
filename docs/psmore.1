@@ -36,6 +36,21 @@ to require consecutive passing evaluations.
 Inspect one process, its runtime context, threads, sockets, files, limits, and
 security evidence.
 .TP
+.B explain PID
+Build one process dossier by collecting inspection, service-manager,
+executable-image, and bounded native-log evidence in parallel. Rank review
+signals by severity while retaining each source report and its coverage. It
+also reports conservative CPU-sample, thread/socket volume, open-file soft-limit,
+and Linux systemd TasksMax/MemoryMax pressure signals when the required evidence
+is visible. A sampled CPU signal is not treated as sustained load.
+Use
+.B --no-logs
+or
+.B --no-hash
+for a faster metadata-only dossier, and
+.B --output
+to create a private JSON incident artifact.
+.TP
 .B exe PID
 Compare the executable image held by a process with the current disk path.
 Report replaced, deleted, missing, or matching image evidence, optional SHA-256,
@@ -181,16 +196,28 @@ command lines. Always review output before sharing it.
 Set the resource sampling interval where supported.
 .TP
 .BI --scope " auto|process|service"
-For logs, choose an exact process instance, an owning systemd unit, or automatic
-selection. Automatic mode broadens only to an actual .service, not a generic
-login scope. macOS supports process and auto scope but refuses service scope.
+For logs and explain, choose an exact process instance, an owning systemd unit,
+or automatic selection. Automatic mode broadens only to an actual .service, not
+a generic login scope. macOS supports process and auto scope but refuses service
+scope.
 .TP
 .BI --since " DURATION"
-For logs, select a recent window from 1 second through 7 days. Durations accept
-s, m, h, or d. Process-scoped windows are clamped to the target start time.
+For logs and explain, select a recent window from 1 second through 7 days.
+Durations accept s, m, h, or d. Process-scoped windows are clamped to the target
+start time.
 .TP
 .BI --priority " error|warning|info|debug"
-For logs, select the maximum native-log verbosity. The default is info.
+For logs and explain, select the maximum native-log verbosity. The default is
+info.
+.TP
+.B --no-logs
+For explain, omit the native-log section while retaining process, manager, and
+executable evidence. It cannot be combined with log scope, time, priority, or
+limit options.
+.TP
+.B --no-hash
+For exe and explain, skip executable SHA-256 reads while retaining file
+identity, package, and signing evidence.
 .TP
 .BI --wait " DURATION"
 For
@@ -208,8 +235,9 @@ the launched command exits. The default is 1000; the accepted range is 0 to
 60000.
 .TP
 .BI --output " FILE"
-For run, atomically write a mode-0600 JSON report without mixing it with command
-standard error. Existing files are refused unless
+Atomically write a mode-0600 JSON report for commands that support private
+artifacts, including explain, run, doctor, and diff. Existing files are refused
+unless
 .B --force
 is also specified.
 .TP
@@ -260,11 +288,19 @@ navigation leaves locate mode while retaining the result context.
 .B Space
 Pause or resume live refresh.
 .TP
+.B D
+Build a process dossier for the selected process in the background. The panel
+prioritizes signals from deep inspection, service ownership, executable-image,
+and bounded native-log evidence. Enter or r refreshes; i, m, v, and l open the
+corresponding raw evidence; L toggles log collection; h toggles SHA-256; D or
+Escape closes the workspace.
+.TP
 .B m
 Open the selected process service-context workspace. Resolve the owning systemd
 unit or launchd job in the background and show state, configuration, resource
-boundaries, and suggested read-only commands. Enter or r refreshes; m or Escape
-closes the workspace.
+boundaries, and suggested read-only commands. Linux preserves finite,
+unlimited, and unavailable TasksMax and MemoryMax states separately. Enter or r
+refreshes; m or Escape closes the workspace.
 .TP
 .B v
 Open the selected process executable-image workspace. Verify image identity,
@@ -348,6 +384,19 @@ macOS performs one global
 .BR lsof (8)
 scan. psmore and its collection helper are excluded. Incomplete visibility is
 reported explicitly and never used to prove that a path has no users.
+.PP
+The
+.B explain
+command runs the process inspection, service-manager, executable-image, and
+native-log collectors in parallel. It validates every nested PID and start time
+against one initial process identity and refreshes the target after collection;
+confirmed PID reuse is refused. Partial evidence remains visible and is never
+treated as proof of absence. Ranked signals are review priorities with stable
+codes and JSON evidence paths, not asserted root causes. Open-file pressure uses
+visible descriptor counts against RLIMIT_NOFILE; systemd task and memory pressure
+signals use TasksCurrent/TasksMax and MemoryCurrent/MemoryMax. The versioned
+.B psmore.process-dossier
+report can contain all sensitive fields from its source reports.
 .PP
 The
 .B exe

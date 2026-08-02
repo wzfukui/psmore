@@ -77,6 +77,11 @@ pub(crate) const TIPS: &[Tip] = &[
         keys: "l logs  |  s scope  |  p priority  |  w window",
     },
     Tip {
+        title: "Build one process dossier",
+        body: "Collect process, service-manager, executable-image, and bounded log evidence in parallel, then review prioritized signals without losing their source paths.",
+        keys: "D dossier  |  r refresh  |  L logs on/off  |  h hash",
+    },
+    Tip {
         title: "Export the context you already collected",
         body: "The report includes the current tree, query, attention findings, events, actions, and any opened diagnostic panels.",
         keys: "o private JSON report",
