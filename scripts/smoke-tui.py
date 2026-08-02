@@ -80,6 +80,10 @@ def main() -> int:
         os.write(master, b"\r")
         read_until(b"path~^/definitely-not-real$", 5.0)
         os.write(master, b"F")
+        os.write(master, b"\x1b")
+        time.sleep(0.2)
+        if process.poll() is not None:
+            fail("bare-tree Escape unexpectedly quit psmore")
         os.write(master, f"{pid}".encode())
         time.sleep(0.2)
         os.write(master, b"\r")
@@ -142,7 +146,7 @@ def main() -> int:
         config_directory.cleanup()
 
     print(
-        "Verified TUI persistent filter -> PID locate -> delayed search apply -> dossier -> memory -> dossier -> image -> "
+        "Verified TUI persistent filter -> safe bare-tree Escape -> PID locate -> delayed search apply -> dossier -> memory -> dossier -> image -> "
         f"manager -> logs -> manager -> two-step end dialog for PID {pid}"
     )
     return 0

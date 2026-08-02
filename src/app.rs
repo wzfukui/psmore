@@ -4039,7 +4039,11 @@ impl App {
                 self.search.clear();
                 self.rebuild_visible();
             }
-            KeyCode::Char('q') | KeyCode::Esc => return true,
+            KeyCode::Char('q') => return true,
+            // Escape is intentionally inert on the bare process tree. It is
+            // reserved for cancelling input, clearing search, and closing
+            // overlays so an extra key press cannot terminate psmore.
+            KeyCode::Esc => {}
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Up => self.move_selection(-1),
             KeyCode::PageDown => self.move_selection(self.page_size as isize),

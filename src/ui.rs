@@ -3538,6 +3538,15 @@ mod tests {
     }
 
     #[test]
+    fn escape_never_quits_from_the_bare_process_tree() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+
+        assert!(!app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)));
+    }
+
+    #[test]
     fn welcome_is_modal_but_a_tip_never_steals_the_first_working_key() {
         let mut welcome = App::new_for_test(Guidance::welcome_for_test());
         welcome.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));

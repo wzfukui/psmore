@@ -369,6 +369,11 @@ toggles future tips and
 .B D
 disables startup cards.
 .TP
+.B Escape
+Cancel the current editor, clear an active search, or close the current
+workspace. Escape intentionally does nothing on the bare process tree and
+cannot quit psmore.
+.TP
 .B L
 Switch between Chinese and English from the main process tree or field guide.
 Inside the process dossier, L remains the log-collection toggle.
@@ -378,7 +383,7 @@ Switch between Chinese and English from any TUI workspace. The manual choice is
 saved and takes precedence over operating-system language on later starts.
 .TP
 .BR q
-Close the current panel or quit from the main process tree.
+Quit psmore. Control-C also exits from the TUI.
 .SH EXIT STATUS
 .TP
 .B 0
