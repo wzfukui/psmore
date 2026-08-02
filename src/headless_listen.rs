@@ -310,6 +310,61 @@ impl CapturedListeners {
             .collect::<HashSet<_>>()
             .len()
     }
+
+    pub(crate) fn diagnostic_summary(&self) -> ListenerDiagnosticSummary {
+        ListenerDiagnosticSummary {
+            exposed_bind_count: self.exposed_bind_count(),
+            socket_reference_count: self.endpoints.len(),
+            known_owner_count: self.known_owner_count(),
+            unresolved_socket_count: self
+                .endpoints
+                .iter()
+                .filter(|endpoint| endpoint.pid.is_none())
+                .count(),
+            collection_complete: self.collection_complete,
+            warning: self.warning.clone(),
+            listeners: self
+                .visible_endpoints()
+                .map(|endpoint| {
+                    let process = endpoint.pid.and_then(|pid| self.processes.get(&pid));
+                    ListenerDiagnosticItem {
+                        exposure: bind_exposure(endpoint).label(),
+                        protocol: endpoint.protocol.clone(),
+                        local_endpoint: endpoint.local_endpoint.clone(),
+                        pid: endpoint.pid.map(Pid::as_u32),
+                        process: endpoint.process.clone(),
+                        user: process.map(|process| process.user.clone()),
+                        command: process.map(process_command_line),
+                        namespace: (!endpoint.namespace.is_empty())
+                            .then(|| endpoint.namespace.clone()),
+                    }
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ListenerDiagnosticSummary {
+    pub(crate) exposed_bind_count: usize,
+    pub(crate) socket_reference_count: usize,
+    pub(crate) known_owner_count: usize,
+    pub(crate) unresolved_socket_count: usize,
+    pub(crate) collection_complete: bool,
+    pub(crate) warning: Option<String>,
+    pub(crate) listeners: Vec<ListenerDiagnosticItem>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ListenerDiagnosticItem {
+    pub(crate) exposure: &'static str,
+    pub(crate) protocol: String,
+    pub(crate) local_endpoint: String,
+    pub(crate) pid: Option<u32>,
+    pub(crate) process: String,
+    pub(crate) user: Option<String>,
+    pub(crate) command: Option<String>,
+    pub(crate) namespace: Option<String>,
 }
 
 pub(crate) fn capture_listeners(

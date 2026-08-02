@@ -208,6 +208,89 @@ impl CapturedOomDiagnostics {
     fn visible_entries(&self) -> impl Iterator<Item = &OomCandidate> {
         self.entries.iter().take(self.returned_count())
     }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn diagnostic_summary(&self) -> OomDiagnosticSummary {
+        OomDiagnosticSummary {
+            available_memory_bytes: self.host.available_bytes,
+            available_memory_percent: self.host.available_percent(),
+            oom_kill_count_since_boot: self.host.oom_kill_count_since_boot,
+            pressure: self
+                .host
+                .pressure
+                .as_ref()
+                .map(|pressure| OomPressureSummary {
+                    some_avg10_percent: pressure.some.avg10,
+                    some_avg60_percent: pressure.some.avg60,
+                    full_avg10_percent: pressure.full.avg10,
+                    full_avg60_percent: pressure.full.avg60,
+                }),
+            matched_candidate_count: self.entries.len(),
+            score_inspected_process_count: self.score_inspected_process_count,
+            score_selection_complete: self.score_selection_complete,
+            warning: self.warning.clone(),
+            candidates: self
+                .visible_entries()
+                .map(|candidate| OomDiagnosticCandidate {
+                    pid: candidate.pid,
+                    process: candidate.process.clone(),
+                    user: candidate.user.clone(),
+                    command: candidate.command.clone(),
+                    oom_score: candidate.oom_score,
+                    oom_score_adj: candidate.oom_score_adj,
+                    selection_priority: candidate.priority().label(),
+                    rss_bytes: candidate.rss_bytes,
+                    swap_bytes: candidate.swap_bytes,
+                    cgroup_path: candidate.cgroup.as_ref().map(|cgroup| cgroup.path.clone()),
+                    cgroup_oom_event_count: candidate
+                        .cgroup
+                        .as_ref()
+                        .and_then(|cgroup| cgroup.oom_event_count),
+                    cgroup_oom_kill_count: candidate
+                        .cgroup
+                        .as_ref()
+                        .and_then(|cgroup| cgroup.oom_kill_count),
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct OomDiagnosticSummary {
+    pub(crate) available_memory_bytes: Option<u64>,
+    pub(crate) available_memory_percent: Option<f64>,
+    pub(crate) oom_kill_count_since_boot: Option<u64>,
+    pub(crate) pressure: Option<OomPressureSummary>,
+    pub(crate) matched_candidate_count: usize,
+    pub(crate) score_inspected_process_count: usize,
+    pub(crate) score_selection_complete: bool,
+    pub(crate) warning: Option<String>,
+    pub(crate) candidates: Vec<OomDiagnosticCandidate>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OomPressureSummary {
+    pub(crate) some_avg10_percent: f64,
+    pub(crate) some_avg60_percent: f64,
+    pub(crate) full_avg10_percent: f64,
+    pub(crate) full_avg60_percent: f64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct OomDiagnosticCandidate {
+    pub(crate) pid: u32,
+    pub(crate) process: String,
+    pub(crate) user: String,
+    pub(crate) command: String,
+    pub(crate) oom_score: u16,
+    pub(crate) oom_score_adj: Option<i16>,
+    pub(crate) selection_priority: &'static str,
+    pub(crate) rss_bytes: u64,
+    pub(crate) swap_bytes: Option<u64>,
+    pub(crate) cgroup_path: Option<String>,
+    pub(crate) cgroup_oom_event_count: Option<u64>,
+    pub(crate) cgroup_oom_kill_count: Option<u64>,
 }
 
 #[cfg(any(target_os = "linux", test))]

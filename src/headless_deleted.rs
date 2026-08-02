@@ -111,6 +111,60 @@ impl CapturedDeletedFiles {
             DeletedPolicyStatus::Violated
         }
     }
+
+    pub(crate) fn diagnostic_summary(
+        &self,
+        result_limit: Option<usize>,
+    ) -> DeletedDiagnosticSummary {
+        DeletedDiagnosticSummary {
+            unique_file_count: self.summary.unique_file_count,
+            fd_reference_count: self.summary.fd_reference_count,
+            process_count: self.summary.process_count,
+            logical_bytes: self.summary.logical_bytes,
+            estimated_reclaimable_bytes: self.summary.estimated_reclaimable_bytes,
+            estimate_basis: self.estimate_basis,
+            warning: self.warning.clone(),
+            files: self
+                .entries
+                .iter()
+                .take(result_limit.unwrap_or(self.entries.len()))
+                .map(|file| DeletedDiagnosticItem {
+                    pid: file.pid,
+                    process: file.process.clone(),
+                    user: file.user.clone(),
+                    command: file.command.clone(),
+                    fd: file.fd.clone(),
+                    path: file.path.clone(),
+                    logical_size_bytes: file.logical_size,
+                    estimated_reclaimable_bytes: file.estimated_reclaimable_bytes(),
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DeletedDiagnosticSummary {
+    pub(crate) unique_file_count: usize,
+    pub(crate) fd_reference_count: usize,
+    pub(crate) process_count: usize,
+    pub(crate) logical_bytes: u64,
+    pub(crate) estimated_reclaimable_bytes: u64,
+    pub(crate) estimate_basis: &'static str,
+    pub(crate) warning: Option<String>,
+    pub(crate) files: Vec<DeletedDiagnosticItem>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DeletedDiagnosticItem {
+    pub(crate) pid: u32,
+    pub(crate) process: String,
+    pub(crate) user: String,
+    pub(crate) command: String,
+    pub(crate) fd: String,
+    pub(crate) path: String,
+    pub(crate) logical_size_bytes: u64,
+    pub(crate) estimated_reclaimable_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

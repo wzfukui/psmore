@@ -5,6 +5,7 @@ mod completion;
 mod headless;
 mod headless_deleted;
 mod headless_diff;
+mod headless_doctor;
 mod headless_fd;
 mod headless_inspect;
 mod headless_listen;
@@ -22,6 +23,7 @@ mod network;
 mod provider;
 mod query;
 mod report;
+mod secure_output;
 mod snapshot;
 mod ui;
 
@@ -29,6 +31,7 @@ use std::{
     env,
     error::Error,
     io::{self, IsTerminal, Write},
+    path::Path,
     process::ExitCode,
     time::Duration,
 };
@@ -52,6 +55,9 @@ use crate::{
         DeletedPolicyStatus, capture_deleted_files, render_deleted_json, render_deleted_table,
     },
     headless_diff::{load_comparison, render_diff_json, render_diff_table},
+    headless_doctor::{
+        DoctorPolicyStatus, capture_doctor, render_doctor_json, render_doctor_table,
+    },
     headless_fd::{FdPolicyStatus, capture_fd_usage, render_fd_json, render_fd_table},
     headless_inspect::{capture_inspection, render_inspection_json, render_inspection_table},
     headless_listen::{
@@ -66,7 +72,8 @@ use crate::{
     headless_trace::{TraceOutput, TraceRunStatus, run_trace},
     headless_tree::{build_tree, render_tree_json, render_tree_table},
     headless_watch::{WatchOutput, run_watch},
-    model::set_output_secret_redaction,
+    model::{sanitize_terminal_text, set_output_secret_redaction},
+    secure_output::write_secure_atomic,
     ui::draw,
 };
 
@@ -574,6 +581,53 @@ fn main() -> ExitCode {
                 Ok(None | Some(OomPolicyStatus::Passed)) => ExitCode::SUCCESS,
                 Ok(Some(OomPolicyStatus::Violated)) => ExitCode::from(3),
                 Ok(Some(OomPolicyStatus::Inconclusive)) => ExitCode::FAILURE,
+                Err(error) => runtime_result(Err(error)),
+            }
+        }
+        LaunchMode::DoctorTable | LaunchMode::DoctorJson => {
+            if let Err(error) = validate_query(&cli.query) {
+                return usage_error(&format!("invalid query: {error}"));
+            }
+            let result = (|| -> Result<Option<DoctorPolicyStatus>, Box<dyn Error>> {
+                let snapshot = capture_snapshot(cli.sample_ms);
+                let captured =
+                    capture_doctor(&snapshot, &cli.query, cli.doctor_limit, cli.doctor_deep)
+                        .map_err(io::Error::other)?;
+                let policy_status = captured.evaluate_policy(cli.doctor_fail_on);
+                if !cli.quiet || cli.doctor_output.is_some() {
+                    let output = match cli.mode {
+                        LaunchMode::DoctorTable => {
+                            render_doctor_table(&captured, cli.doctor_fail_on, policy_status)
+                        }
+                        LaunchMode::DoctorJson => {
+                            render_doctor_json(&captured, cli.doctor_fail_on, policy_status)
+                                .map_err(io::Error::other)?
+                        }
+                        _ => unreachable!(),
+                    };
+                    if let Some(path) = cli.doctor_output.as_deref() {
+                        write_secure_atomic(Path::new(path), output.as_bytes(), cli.doctor_force)?;
+                        if !cli.quiet {
+                            write_stdout(&format!(
+                                "PSMORE DOCTOR REPORT  {}  status {}  findings {} (critical {}, warning {})",
+                                sanitize_terminal_text(path),
+                                captured.status_label(),
+                                captured.critical_count() + captured.warning_count(),
+                                captured.critical_count(),
+                                captured.warning_count(),
+                            ))?;
+                        }
+                    } else if let Err(error) = write_stdout(&output) {
+                        if error.kind() != io::ErrorKind::BrokenPipe {
+                            return Err(error.into());
+                        }
+                    }
+                }
+                Ok(policy_status)
+            })();
+            match result {
+                Ok(None | Some(DoctorPolicyStatus::Passed)) => ExitCode::SUCCESS,
+                Ok(Some(DoctorPolicyStatus::Violated)) => ExitCode::from(3),
                 Err(error) => runtime_result(Err(error)),
             }
         }

@@ -29,6 +29,8 @@ pub(crate) enum LaunchMode {
     OomJson,
     NetTable,
     NetJson,
+    DoctorTable,
+    DoctorJson,
     DiffTable,
     DiffJson,
     Completion,
@@ -50,6 +52,7 @@ pub(crate) enum HelpTopic {
     Top,
     Oom,
     Net,
+    Doctor,
     Diff,
     Completion,
 }
@@ -117,6 +120,24 @@ pub(crate) enum CheckExpectation {
     Any,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum DoctorFailOn {
+    #[default]
+    Never,
+    Warning,
+    Critical,
+}
+
+impl DoctorFailOn {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Never => "never",
+            Self::Warning => "warning",
+            Self::Critical => "critical",
+        }
+    }
+}
+
 impl CheckExpectation {
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -174,6 +195,11 @@ pub(crate) struct Cli {
     pub(crate) net_state: Option<String>,
     pub(crate) net_limit: Option<usize>,
     pub(crate) net_expectation: Option<CheckExpectation>,
+    pub(crate) doctor_limit: Option<usize>,
+    pub(crate) doctor_fail_on: DoctorFailOn,
+    pub(crate) doctor_deep: bool,
+    pub(crate) doctor_output: Option<String>,
+    pub(crate) doctor_force: bool,
     pub(crate) redact_secrets: bool,
     pub(crate) check_expectation: CheckExpectation,
     pub(crate) quiet: bool,
@@ -221,6 +247,11 @@ impl Default for Cli {
             net_state: None,
             net_limit: Some(100),
             net_expectation: None,
+            doctor_limit: Some(5),
+            doctor_fail_on: DoctorFailOn::Never,
+            doctor_deep: false,
+            doctor_output: None,
+            doctor_force: false,
             redact_secrets: false,
             check_expectation: CheckExpectation::None,
             quiet: false,
@@ -245,6 +276,7 @@ impl Cli {
                 "top" => Some((parse_top(&arguments[1..]), HelpTopic::Top)),
                 "oom" => Some((parse_oom(&arguments[1..]), HelpTopic::Oom)),
                 "net" => Some((parse_net(&arguments[1..]), HelpTopic::Net)),
+                "doctor" => Some((parse_doctor(&arguments[1..]), HelpTopic::Doctor)),
                 "check" => Some((parse_check(&arguments[1..]), HelpTopic::Check)),
                 "listen" => Some((parse_listen(&arguments[1..]), HelpTopic::Listen)),
                 "inspect" => Some((parse_inspect(&arguments[1..]), HelpTopic::Inspect)),
@@ -309,7 +341,7 @@ impl Cli {
 }
 
 fn extract_secret_redaction(arguments: &mut Vec<String>) -> Result<bool, String> {
-    const VALUE_OPTIONS: [&str; 17] = [
+    const VALUE_OPTIONS: [&str; 18] = [
         "-q",
         "--query",
         "--sample-ms",
@@ -327,6 +359,7 @@ fn extract_secret_redaction(arguments: &mut Vec<String>) -> Result<bool, String>
         "--min-score",
         "--state",
         "--output",
+        "--fail-on",
     ];
     let mut enabled = false;
     let mut expects_value = false;
@@ -409,6 +442,194 @@ fn parse_completion(arguments: &[String]) -> Result<Cli, String> {
         completion_shell: Some(completion_shell),
         ..Cli::default()
     })
+}
+
+fn parse_doctor(arguments: &[String]) -> Result<Cli, String> {
+    let mut cli = Cli {
+        mode: LaunchMode::DoctorTable,
+        ..Cli::default()
+    };
+    let mut output_mode = false;
+    let mut query_set = false;
+    let mut sample_set = false;
+    let mut limit_set = false;
+    let mut fail_on_set = false;
+    let mut output_path_set = false;
+    let mut positional_query = Vec::new();
+    let mut arguments = arguments.iter().cloned().peekable();
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "-h" | "--help" => cli.mode = LaunchMode::Help,
+            "-V" | "--version" => cli.mode = LaunchMode::Version,
+            "--table" => {
+                set_doctor_output(&mut cli.mode, &mut output_mode, LaunchMode::DoctorTable)?
+            }
+            "--json" => set_doctor_output(&mut cli.mode, &mut output_mode, LaunchMode::DoctorJson)?,
+            "--quiet" => cli.quiet = true,
+            "--deep" => cli.doctor_deep = true,
+            "--force" => cli.doctor_force = true,
+            "-q" | "--query" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| format!("{argument} requires a value"))?;
+                set_query(&mut cli, &mut query_set, value)?;
+            }
+            "--sample-ms" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--sample-ms requires a value".to_string())?;
+                set_sample_ms(&mut cli, &mut sample_set, &value)?;
+            }
+            "--limit" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--limit requires a positive integer or all".to_string())?;
+                set_doctor_limit(&mut cli, &mut limit_set, &value)?;
+            }
+            "--fail-on" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--fail-on requires never, warning, or critical".to_string())?;
+                set_doctor_fail_on(&mut cli, &mut fail_on_set, &value)?;
+            }
+            "--output" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--output requires a file path".to_string())?;
+                set_doctor_output_path(&mut cli, &mut output_path_set, value)?;
+            }
+            _ if argument.starts_with("--query=") => {
+                set_query(
+                    &mut cli,
+                    &mut query_set,
+                    argument.trim_start_matches("--query=").to_string(),
+                )?;
+            }
+            _ if argument.starts_with("--sample-ms=") => {
+                set_sample_ms(
+                    &mut cli,
+                    &mut sample_set,
+                    argument.trim_start_matches("--sample-ms="),
+                )?;
+            }
+            _ if argument.starts_with("--limit=") => {
+                set_doctor_limit(
+                    &mut cli,
+                    &mut limit_set,
+                    argument.trim_start_matches("--limit="),
+                )?;
+            }
+            _ if argument.starts_with("--fail-on=") => {
+                set_doctor_fail_on(
+                    &mut cli,
+                    &mut fail_on_set,
+                    argument.trim_start_matches("--fail-on="),
+                )?;
+            }
+            _ if argument.starts_with("--output=") => {
+                set_doctor_output_path(
+                    &mut cli,
+                    &mut output_path_set,
+                    argument.trim_start_matches("--output=").to_string(),
+                )?;
+            }
+            _ if argument.starts_with('-') => {
+                return Err(format!("unknown doctor option: {argument}"));
+            }
+            _ => positional_query.push(argument),
+        }
+    }
+    if matches!(cli.mode, LaunchMode::Help | LaunchMode::Version) {
+        return Ok(cli);
+    }
+    if !positional_query.is_empty() {
+        if query_set {
+            return Err("doctor query may be positional or passed with --query, not both".into());
+        }
+        cli.query = positional_query.join(" ");
+    }
+    if cli.doctor_output.is_some() {
+        if output_mode && cli.mode == LaunchMode::DoctorTable {
+            return Err("doctor --output writes JSON and cannot be combined with --table".into());
+        }
+        cli.mode = LaunchMode::DoctorJson;
+    }
+    if cli.doctor_force && cli.doctor_output.is_none() {
+        return Err("doctor --force requires --output FILE".into());
+    }
+    if cli.quiet && cli.doctor_fail_on == DoctorFailOn::Never && cli.doctor_output.is_none() {
+        return Err("doctor --quiet requires --fail-on warning or --fail-on critical".into());
+    }
+    Ok(cli)
+}
+
+fn set_doctor_output_path(
+    cli: &mut Cli,
+    value_set: &mut bool,
+    value: String,
+) -> Result<(), String> {
+    if *value_set {
+        return Err("doctor --output may only be specified once".into());
+    }
+    if value.is_empty() || value == "-" {
+        return Err("doctor --output requires a file path; use --json for stdout".into());
+    }
+    cli.doctor_output = Some(value);
+    *value_set = true;
+    Ok(())
+}
+
+fn set_doctor_output(
+    mode: &mut LaunchMode,
+    output_set: &mut bool,
+    value: LaunchMode,
+) -> Result<(), String> {
+    if *output_set {
+        return Err("doctor --table and --json cannot be used together or repeated".into());
+    }
+    *mode = value;
+    *output_set = true;
+    Ok(())
+}
+
+fn set_doctor_limit(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+    if *value_set {
+        return Err("doctor --limit may only be specified once".into());
+    }
+    cli.doctor_limit = if value.eq_ignore_ascii_case("all") {
+        None
+    } else {
+        let limit = value
+            .parse::<usize>()
+            .map_err(|_| format!("invalid doctor --limit value: {value}"))?;
+        if limit == 0 {
+            return Err("doctor --limit must be positive or all".into());
+        }
+        if limit > 10_000 {
+            return Err("doctor --limit must be at most 10000 or all".into());
+        }
+        Some(limit)
+    };
+    *value_set = true;
+    Ok(())
+}
+
+fn set_doctor_fail_on(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+    if *value_set {
+        return Err("doctor --fail-on may only be specified once".into());
+    }
+    cli.doctor_fail_on = match value.to_ascii_lowercase().as_str() {
+        "never" | "none" => DoctorFailOn::Never,
+        "warning" | "warn" => DoctorFailOn::Warning,
+        "critical" | "crit" => DoctorFailOn::Critical,
+        _ => {
+            return Err(format!(
+                "invalid doctor --fail-on value: {value}; use never, warning, or critical"
+            ));
+        }
+    };
+    *value_set = true;
+    Ok(())
 }
 
 fn parse_top(arguments: &[String]) -> Result<Cli, String> {
@@ -2079,6 +2300,7 @@ COMMANDS:
   fd          Rank processes by open file-descriptor pressure
   top         Rank current CPU, memory, and disk I/O hotspots
   oom         Diagnose Linux memory pressure and OOM kill priority
+  doctor      Run conservative host and process triage in one command
   diff        Compare two psmore process snapshot JSON files
   completion  Generate shell completion for bash, zsh, or fish
 
@@ -2354,6 +2576,40 @@ EXAMPLES:
   psmore oom name:api --min-score 700 --expect none --quiet
 "
         }
+        Some(HelpTopic::Doctor) => {
+            "psmore doctor - run conservative host and process triage
+
+USAGE:
+  psmore doctor [QUERY] [--deep] [--limit N|all] [--table|--json]
+                [--output FILE [--force]] [--fail-on never|warning|critical]
+                [--quiet] [--sample-ms MS]
+
+OPTIONS:
+  -q, --query QUERY  Scope quick process signals/hotspots; host/deep checks stay global
+      --deep         Also scan exposure, FD pressure, deleted files, and Linux OOM/PSI
+      --limit N|all  Maximum process evidence rows per section [default: 5]
+      --table        Human-readable findings, evidence, and hotspots [default]
+      --json         Versioned psmore.host-doctor JSON
+      --output FILE  Atomically write private JSON instead of the report to stdout
+      --force        Atomically replace FILE; default refuses an existing path
+      --fail-on L    Exit 3 at warning or critical severity [default: never]
+      --quiet        Suppress stdout; requires a gate threshold or --output
+      --sample-ms MS CPU and I/O sampling interval, 100-60000 [default: 500]
+      --redact       Mask common secret values in emitted command lines
+
+Doctor reports sampled signals, not confirmed root causes. Default mode checks
+effective memory, swap, load, process states/resources, and four hotspot lists.
+Deep scans run concurrently and may expose additional permission gaps.
+EXIT: 0 report/pass, 1 runtime error, 2 usage/query error, 3 threshold reached
+EXAMPLES:
+  psmore doctor
+  psmore doctor 'user:deploy' --limit 10
+  psmore doctor --deep
+  psmore doctor --json --redact > doctor.json
+  psmore doctor --deep --redact --output doctor.safe.json
+  psmore doctor --fail-on critical --quiet
+"
+        }
         Some(HelpTopic::Diff) => {
             "psmore diff - compare two persistent process snapshots
 
@@ -2447,6 +2703,11 @@ mod tests {
                 net_state: None,
                 net_limit: Some(100),
                 net_expectation: None,
+                doctor_limit: Some(5),
+                doctor_fail_on: DoctorFailOn::Never,
+                doctor_deep: false,
+                doctor_output: None,
+                doctor_force: false,
                 redact_secrets: false,
                 check_expectation: CheckExpectation::None,
                 quiet: false,
@@ -2706,6 +2967,52 @@ mod tests {
                 ..Cli::default()
             }
         );
+        assert_eq!(
+            Cli::parse([
+                "doctor",
+                "user:deploy",
+                "age>1m",
+                "--limit=all",
+                "--json",
+                "--fail-on=critical",
+                "--sample-ms=750",
+                "--deep",
+                "--output=incident.json",
+                "--force",
+                "--redact"
+            ])
+            .unwrap(),
+            Cli {
+                mode: LaunchMode::DoctorJson,
+                query: "user:deploy age>1m".into(),
+                sample_ms: 750,
+                doctor_limit: None,
+                doctor_fail_on: DoctorFailOn::Critical,
+                doctor_deep: true,
+                doctor_output: Some("incident.json".into()),
+                doctor_force: true,
+                redact_secrets: true,
+                ..Cli::default()
+            }
+        );
+        assert_eq!(
+            Cli::parse(["doctor", "--fail-on", "warning", "--quiet"]).unwrap(),
+            Cli {
+                mode: LaunchMode::DoctorTable,
+                doctor_fail_on: DoctorFailOn::Warning,
+                quiet: true,
+                ..Cli::default()
+            }
+        );
+        assert_eq!(
+            Cli::parse(["doctor", "--output", "doctor.json", "--quiet"]).unwrap(),
+            Cli {
+                mode: LaunchMode::DoctorJson,
+                doctor_output: Some("doctor.json".into()),
+                quiet: true,
+                ..Cli::default()
+            }
+        );
         for (command, topic) in [
             ("check", HelpTopic::Check),
             ("inspect", HelpTopic::Inspect),
@@ -2719,6 +3026,7 @@ mod tests {
             ("top", HelpTopic::Top),
             ("oom", HelpTopic::Oom),
             ("net", HelpTopic::Net),
+            ("doctor", HelpTopic::Doctor),
             ("diff", HelpTopic::Diff),
             ("completion", HelpTopic::Completion),
         ] {
@@ -2825,6 +3133,20 @@ mod tests {
         assert!(Cli::parse(["net", "api", "--query=worker"]).is_err());
         assert!(Cli::parse(["net", "--expect=all"]).is_err());
         assert!(Cli::parse(["net", "--quiet"]).is_err());
+        assert!(Cli::parse(["doctor", "--limit=0"]).is_err());
+        assert!(Cli::parse(["doctor", "--limit=10001"]).is_err());
+        assert!(Cli::parse(["doctor", "--limit=1", "--limit=all"]).is_err());
+        assert!(Cli::parse(["doctor", "--table", "--json"]).is_err());
+        assert!(Cli::parse(["doctor", "api", "--query=worker"]).is_err());
+        assert!(Cli::parse(["doctor", "--fail-on=error"]).is_err());
+        assert!(Cli::parse(["doctor", "--fail-on=warning", "--fail-on=critical"]).is_err());
+        assert!(Cli::parse(["doctor", "--quiet"]).is_err());
+        assert!(Cli::parse(["doctor", "--sample-ms=99"]).is_err());
+        assert!(Cli::parse(["doctor", "--output", "-"]).is_err());
+        assert!(Cli::parse(["doctor", "--output="]).is_err());
+        assert!(Cli::parse(["doctor", "--output=a", "--output=b"]).is_err());
+        assert!(Cli::parse(["doctor", "--output=a", "--table"]).is_err());
+        assert!(Cli::parse(["doctor", "--force"]).is_err());
         assert!(Cli::parse(["--redact"]).is_err());
         assert!(Cli::parse(["--redact", "--redact", "--table"]).is_err());
         assert!(Cli::parse(["completion"]).is_err());
@@ -2851,6 +3173,7 @@ mod tests {
             (HelpTopic::Top, "top"),
             (HelpTopic::Oom, "oom"),
             (HelpTopic::Net, "net"),
+            (HelpTopic::Doctor, "doctor"),
             (HelpTopic::Diff, "diff"),
             (HelpTopic::Completion, "completion"),
         ] {

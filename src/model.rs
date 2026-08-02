@@ -102,6 +102,24 @@ fn command_token_ranges(value: &str) -> Vec<(usize, usize)> {
     ranges
 }
 
+fn whitespace_token_ranges(value: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut start = None;
+    for (index, character) in value.char_indices() {
+        if character.is_whitespace() {
+            if let Some(start) = start.take() {
+                ranges.push((start, index));
+            }
+        } else if start.is_none() {
+            start = Some(index);
+        }
+    }
+    if let Some(start) = start {
+        ranges.push((start, value.len()));
+    }
+    ranges
+}
+
 fn unquoted(value: &str) -> &str {
     if value.len() >= 2 {
         let first = value.as_bytes()[0];
@@ -283,8 +301,7 @@ fn redact_url_query(value: &str) -> String {
     output
 }
 
-pub(crate) fn redact_command_secrets(value: &str) -> String {
-    let ranges = command_token_ranges(value);
+fn redact_token_ranges(value: &str, ranges: Vec<(usize, usize)>) -> String {
     let mut output = String::with_capacity(value.len());
     let mut previous_end = 0;
     let mut redact_next = false;
@@ -310,6 +327,75 @@ pub(crate) fn redact_command_secrets(value: &str) -> String {
     }
     output.push_str(&value[previous_end..]);
     output
+}
+
+fn redact_embedded_assignments(value: &str) -> String {
+    let mut output = value.to_string();
+    let mut cursor = 0_usize;
+    while cursor < output.len() {
+        let Some(relative_equals) = output[cursor..].find('=') else {
+            break;
+        };
+        let equals = cursor + relative_equals;
+        let key_start = output[..equals]
+            .char_indices()
+            .rev()
+            .take_while(|(_, character)| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+            })
+            .last()
+            .map(|(index, _)| index)
+            .unwrap_or(equals);
+        if key_start == equals || !is_secret_key(&output[key_start..equals]) {
+            cursor = equals + 1;
+            continue;
+        }
+        let value_start = equals + 1;
+        if value_start >= output.len() {
+            break;
+        }
+        let first = output[value_start..].chars().next();
+        let (secret_start, secret_end) = match first {
+            Some(quote @ ('\'' | '"')) => {
+                let secret_start = value_start + quote.len_utf8();
+                let secret_end = output[secret_start..]
+                    .find(quote)
+                    .map(|relative| secret_start + relative)
+                    .unwrap_or(output.len());
+                (secret_start, secret_end)
+            }
+            Some(_) => {
+                let secret_end = output[value_start..]
+                    .char_indices()
+                    .find(|(_, character)| {
+                        character.is_whitespace()
+                            || matches!(character, '&' | '#' | '\'' | '"' | ';')
+                    })
+                    .map(|(relative, _)| value_start + relative)
+                    .unwrap_or(output.len());
+                (value_start, secret_end)
+            }
+            None => break,
+        };
+        if secret_start < secret_end && &output[secret_start..secret_end] != REDACTED {
+            output.replace_range(secret_start..secret_end, REDACTED);
+            cursor = secret_start + REDACTED.len();
+        } else {
+            cursor = secret_end.max(equals + 1);
+        }
+    }
+    output
+}
+
+pub(crate) fn redact_command_secrets(value: &str) -> String {
+    let structured = redact_token_ranges(value, command_token_ranges(value));
+    // Process APIs expose argv as a reconstructed display string, not a shell
+    // source line. Embedded code (for example `python -c`) can therefore make
+    // quote characters look unbalanced. A second, conservative pass ignores
+    // quote state so later standalone secret flags cannot escape redaction.
+    let ranges = whitespace_token_ranges(&structured);
+    let conservative = redact_token_ranges(&structured, ranges);
+    redact_embedded_assignments(&conservative)
 }
 
 #[cfg(test)]
@@ -363,6 +449,20 @@ mod terminal_text_tests {
             redact_command_secrets("curl https://example.test/?page=2&sort=name"),
             "curl https://example.test/?page=2&sort=name"
         );
+        let reconstructed =
+            "python3 -c \"print('unterminated) --password hidden-one --token=hidden-two";
+        let redacted = redact_command_secrets(reconstructed);
+        assert!(!redacted.contains("hidden-one"));
+        assert!(!redacted.contains("hidden-two"));
+        assert!(redacted.contains("--password [REDACTED]"));
+        assert!(redacted.contains("--token=[REDACTED]"));
+        let embedded = redact_command_secrets(
+            "python -c code-fragment--token=hidden-three;next OPENAI_API_KEY='hidden four'",
+        );
+        assert!(!embedded.contains("hidden-three"));
+        assert!(!embedded.contains("hidden four"));
+        assert!(embedded.contains("code-fragment--token=[REDACTED]"));
+        assert!(embedded.contains("OPENAI_API_KEY='[REDACTED]'"));
     }
 }
 

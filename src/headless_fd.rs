@@ -200,6 +200,57 @@ impl CapturedFdUsage {
             .iter()
             .take(self.result_limit.unwrap_or(self.entries.len()))
     }
+
+    pub(crate) fn diagnostic_summary(&self) -> FdDiagnosticSummary {
+        FdDiagnosticSummary {
+            matched_process_count: self.entries.len(),
+            inspected_process_count: self.inspected_process_count,
+            limit_coverage_count: self.limit_coverage_count,
+            collection_complete: self.collection_complete,
+            selection_complete: self.selection_complete,
+            warning: self.warning.clone(),
+            processes: self
+                .visible_entries()
+                .map(|usage| FdDiagnosticItem {
+                    pid: usage.pid,
+                    process: usage.process.clone(),
+                    user: usage.user.clone(),
+                    command: usage.command.clone(),
+                    open_fd_count: usage.open_fd_count,
+                    soft_limit: usage.soft_limit.numeric(),
+                    soft_limit_unlimited: usage.soft_limit.is_unlimited(),
+                    utilization_percent: usage
+                        .utilization_percent()
+                        .filter(|percent| percent.is_finite()),
+                    pressure: usage.pressure().label(),
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FdDiagnosticSummary {
+    pub(crate) matched_process_count: usize,
+    pub(crate) inspected_process_count: usize,
+    pub(crate) limit_coverage_count: usize,
+    pub(crate) collection_complete: bool,
+    pub(crate) selection_complete: bool,
+    pub(crate) warning: Option<String>,
+    pub(crate) processes: Vec<FdDiagnosticItem>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FdDiagnosticItem {
+    pub(crate) pid: u32,
+    pub(crate) process: String,
+    pub(crate) user: String,
+    pub(crate) command: String,
+    pub(crate) open_fd_count: usize,
+    pub(crate) soft_limit: Option<u64>,
+    pub(crate) soft_limit_unlimited: bool,
+    pub(crate) utilization_percent: Option<f64>,
+    pub(crate) pressure: &'static str,
 }
 
 #[derive(Default)]

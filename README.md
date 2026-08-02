@@ -47,6 +47,7 @@
 - 支持无交互快照模式：`--table` 输出适合 SSH 现场查看的稳定表格，`--json` 输出带版本号的机器可读快照；两者复用 TUI 的完整查询语法与子树资源聚合
 - 无交互模式执行两次采样，默认间隔 500 ms，使 CPU 与磁盘 I/O 速率具有实际意义；可用 `--sample-ms` 在 100–60000 ms 之间调整
 - 所有无交互表格、JSON 和 JSONL 输出支持 `--redact`：在保留命令结构的同时遮盖常见密码、token、API key、认证 header、URL userinfo 和敏感查询参数
+- `psmore doctor` 提供一条命令的保守主机体检：快速模式结合有效内存、Swap、持续负载、异常进程状态和四类热点榜；显式 `--deep` 再并行扫描网络暴露、FD 压力、已删除仍占用文件及 Linux OOM/PSI 证据
 - `psmore diff BEFORE.json AFTER.json` 将两份持久快照对比为启动/退出、PID 复用、父进程变化，以及 CPU、内存、I/O 和子树进程数增量；默认输出透明的分类榜单，增加 `--json` 可获得完整机器可读差异
 - `psmore check QUERY` 将任意结构化查询变成 CI/运维健康门禁：默认期望零命中，`--expect any` 可反向要求服务存在；支持表格、`psmore.check-result` JSON 和完全静默的 `--quiet`
 - `psmore inspect PID` 将 TUI 深度检查直接带到 SSH、脚本和事故工单：一次输出进程身份、完整命令、热点线程、socket、打开文件及平台运行上下文，也可导出 `psmore.process-inspection` JSON
@@ -150,6 +151,40 @@ psmore diff before.json after.json --redact
 ```
 
 脱敏会将识别到的值替换为 `[REDACTED]`，并尽量保留原有参数名、引号和 URL 结构。它是便于事故工单和团队协作的尽力保护，不是完整匿名化：主机名、用户名、文件路径、普通查询参数、IP 和端口仍会保留，分享前仍应检查输出。交互式 TUI 不接受 `--redact`，因为 TUI 不产生可直接分享的命令输出文件。
+
+### 一键主机体检
+
+刚登录一台陌生主机、还不知道该从 PID、端口还是资源入手时，可以先运行：
+
+```bash
+# 主机证据、风险信号以及 CPU/内存/读/写四类热点
+psmore doctor
+
+# 主机检查仍保持全局，仅把进程信号与热点限定到部署用户
+psmore doctor 'user:deploy' --limit 10
+
+# 显式执行较重的全局扫描，并把结果合并到同一份报告
+psmore doctor --deep
+
+# 生成适合工单归档的版本化、安全分享 JSON
+psmore doctor --json --redact > doctor.safe.json
+
+# 更安全的归档方式：同目录临时文件、0600、完整写入后原子发布
+psmore doctor --deep --redact --output doctor.safe.json
+
+# 自动化门禁：仅发现 critical 信号时退出 3，正常时完全静默
+psmore doctor --fail-on critical --quiet
+```
+
+`doctor` 有意采用保守语义：它报告的是需要核对的采样信号，不把启发式判断包装成已确认根因。快速模式检查有效内存可用比例、Swap 与当前低内存的组合压力、按逻辑 CPU 数归一化的 15 分钟负载、僵尸/停止进程、单进程内存占比、运行超过一定时间后的高 CPU 或高 I/O 样本，以及超过 250 个进程的服务树。Linux 容器内优先采用当前 cgroup 的内存限额；macOS 使用系统 `memory_pressure`，失败后再回退到 `vm_stat`，表格和 JSON 都会标明内存证据来源。
+
+`--deep` 明确表示接受额外扫描成本：网络暴露、FD、删除文件和 Linux OOM 采集会并行执行，并记录总耗时、完整性和权限警告。暴露端口和累计 OOM 次数本身只作为观察证据，不会因为“存在”就判定故障；只有 FD 使用率达到 75%、至少 100 MiB 的已删除文件仍被持有，或 Linux PSI 显示当前内存停顿时才新增 warning/critical 信号。macOS 无法可靠取得所有进程的 soft FD limit 时会显示 `partial`，不会把未知伪装成安全。OOM/PSI 在非 Linux 平台明确标为不支持。
+
+`--output FILE` 自动选择 JSON，并在目标目录写入 `0600` 临时文件，完成写入和 `sync_all` 后再原子发布；不指定 `--force` 时通过 no-replace 发布拒绝覆盖已有路径，指定后才原子替换。写入成功后标准输出只显示文件路径和 findings 摘要，不再重复整份 JSON；配合 `--quiet` 可完全静默。`--table` 与 `--output` 冲突，`--output -` 也会拒绝并提示直接使用 `--json`。JSON 的 `secrets_redacted` 字段明确记录本次是否启用了 `--redact`。
+
+默认 `--fail-on never`，所以发现信号也会成功退出，适合人工体检。显式使用 `--fail-on warning` 或 `--fail-on critical` 后，达到阈值退出 `3`；`--quiet` 必须配合这两个阈值之一。查询只作用于快速进程信号和热点，主机内存、Swap、负载以及所有 deep 检查始终保持全局，避免把“筛选不到进程”误解为“主机健康”。JSON 使用 `psmore.host-doctor` schema v1；未启用时 `deep` 为 `null`，启用后包含四类采集证据。
+
+快速体检结果底部会建议继续运行独立诊断命令或改用 `--deep`。全局 socket、文件描述符和删除文件扫描不会被悄悄塞进默认体检耗时中。
 
 ### 查询健康门禁
 

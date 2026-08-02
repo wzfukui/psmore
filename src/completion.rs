@@ -25,6 +25,8 @@ _psmore_completion() {
         --by) words="cpu memory read write" ;;
         --scope) words="process tree" ;;
         --state) words="ESTABLISHED LISTEN TIME_WAIT CLOSE_WAIT SYN_SENT SYN_RECV CONNECTED CONNECTING BOUND OPEN" ;;
+        --fail-on) words="never warning critical" ;;
+        --output) compopt -o default; return ;;
         completion) words="bash zsh fish" ;;
         *) words="" ;;
     esac
@@ -34,7 +36,7 @@ _psmore_completion() {
     fi
 
     if (( COMP_CWORD == 1 )); then
-        words="check inspect port listen net tree watch trace deleted fd top oom diff completion --table --json --query --sample-ms --redact --help --version"
+        words="check inspect port listen net tree watch trace deleted fd top oom doctor diff completion --table --json --query --sample-ms --redact --help --version"
         COMPREPLY=( $(compgen -W "$words" -- "$cur") )
         return
     fi
@@ -52,6 +54,7 @@ _psmore_completion() {
         top) words="--query --by --scope --limit --table --json --sample-ms --help --version" ;;
         oom) words="--query --min-score --limit --table --json --expect --quiet --sample-ms --help --version" ;;
         net) words="--query --protocol --connected --state --limit --table --json --expect --quiet --help --version" ;;
+        doctor) words="--query --deep --limit --table --json --output --force --fail-on --quiet --sample-ms --help --version" ;;
         diff) words="--table --json --help --version" ;;
         completion) words="bash zsh fish --help --version" ;;
         *) words="--query --table --json --sample-ms --help --version" ;;
@@ -80,6 +83,7 @@ _psmore() {
     'fd:rank file-descriptor pressure'
     'top:rank CPU memory and disk I/O hotspots'
     'oom:diagnose Linux memory pressure and OOM priority'
+    'doctor:run conservative host and process triage'
     'diff:compare process snapshot JSON files'
     'completion:generate shell completion'
     '--table:print a table snapshot and exit'
@@ -105,6 +109,7 @@ _psmore() {
       else _values 'protocol' any tcp udp; fi
       return ;;
     --depth|--limit) _values 'value' all; return ;;
+    --fail-on) _values 'severity' never warning critical; return ;;
   esac
   if [[ "$cmd" == completion && CURRENT == 3 ]]; then
     _values 'shell' bash zsh fish
@@ -124,6 +129,7 @@ _psmore() {
     fd) options=( '--min-count[minimum descriptors]:count:' '--min-percent[minimum utilization]:percent:' '--limit[maximum rows]:rows:(all)' '--table[table output]' '--json[JSON output]' '--expect[policy]:mode:(none any)' '--quiet[suppress output]' ) ;;
     top) options=( '--query[process query]:query:' '--by[ranking metric]:metric:(cpu memory read write)' '--scope[ranking scope]:scope:(process tree)' '--limit[maximum rows]:rows:(all)' '--table[table output]' '--json[JSON output]' '--sample-ms[sampling milliseconds]:milliseconds:' ) ;;
     oom) options=( '--query[process query]:query:' '--min-score[minimum kernel OOM score]:score:' '--limit[maximum candidates]:rows:(all)' '--table[table output]' '--json[JSON output]' '--expect[policy]:mode:(none any)' '--quiet[suppress output]' '--sample-ms[sampling milliseconds]:milliseconds:' ) ;;
+    doctor) options=( '--query[scope quick process signals and hotspots]:query:' '--deep[scan exposure fd deleted files and Linux OOM]' '--limit[maximum rows per section]:rows:(all)' '--table[table output]' '--json[JSON output]' '--output[atomically write private JSON]:file:_files' '--force[replace an existing output file]' '--fail-on[exit threshold]:severity:(never warning critical)' '--quiet[suppress stdout]' '--sample-ms[sampling milliseconds]:milliseconds:' ) ;;
     diff) options=( '--table[table output]' '--json[JSON output]' ) ;;
     completion) options=() ;;
     *) options=( '--query[process query]:query:' '--table[table snapshot]' '--json[JSON snapshot]' '--sample-ms[sampling milliseconds]:milliseconds:' ) ;;
@@ -148,14 +154,15 @@ complete -c psmore -n '__fish_use_subcommand' -a deleted -d 'Find deleted files 
 complete -c psmore -n '__fish_use_subcommand' -a fd -d 'Rank file-descriptor pressure'
 complete -c psmore -n '__fish_use_subcommand' -a top -d 'Rank CPU, memory, and disk I/O hotspots'
 complete -c psmore -n '__fish_use_subcommand' -a oom -d 'Diagnose Linux memory pressure and OOM priority'
+complete -c psmore -n '__fish_use_subcommand' -a doctor -d 'Run conservative host and process triage'
 complete -c psmore -n '__fish_use_subcommand' -a diff -d 'Compare process snapshot files'
 complete -c psmore -n '__fish_use_subcommand' -a completion -d 'Generate shell completion'
 
 complete -c psmore -n '__fish_seen_subcommand_from completion' -a 'bash zsh fish'
-complete -c psmore -n 'not __fish_seen_subcommand_from check inspect port listen net tree watch trace deleted fd top oom diff completion' -s q -l query -r -d 'Initial TUI or snapshot query'
-complete -c psmore -n 'not __fish_seen_subcommand_from check inspect port listen net tree watch trace deleted fd top oom diff completion' -l table -d 'Print table snapshot'
-complete -c psmore -n 'not __fish_seen_subcommand_from check inspect port listen net tree watch trace deleted fd top oom diff completion' -l json -d 'Print JSON snapshot'
-complete -c psmore -n 'not __fish_seen_subcommand_from check inspect port listen net tree watch trace deleted fd top oom diff completion' -l sample-ms -r -d 'Sampling milliseconds'
+complete -c psmore -n 'not __fish_seen_subcommand_from check inspect port listen net tree watch trace deleted fd top oom doctor diff completion' -s q -l query -r -d 'Initial TUI or snapshot query'
+complete -c psmore -n 'not __fish_seen_subcommand_from check inspect port listen net tree watch trace deleted fd top oom doctor diff completion' -l table -d 'Print table snapshot'
+complete -c psmore -n 'not __fish_seen_subcommand_from check inspect port listen net tree watch trace deleted fd top oom doctor diff completion' -l json -d 'Print JSON snapshot'
+complete -c psmore -n 'not __fish_seen_subcommand_from check inspect port listen net tree watch trace deleted fd top oom doctor diff completion' -l sample-ms -r -d 'Sampling milliseconds'
 complete -c psmore -n '__fish_seen_subcommand_from check port listen net deleted fd oom' -l expect -xa 'none any'
 complete -c psmore -n '__fish_seen_subcommand_from port' -l protocol -xa 'any tcp udp'
 complete -c psmore -n '__fish_seen_subcommand_from listen' -l protocol -xa 'any tcp udp unix'
@@ -168,20 +175,25 @@ complete -c psmore -n '__fish_seen_subcommand_from top' -l scope -xa 'process tr
 complete -c psmore -n '__fish_seen_subcommand_from top' -l limit -xa all
 complete -c psmore -n '__fish_seen_subcommand_from oom' -l min-score -r
 complete -c psmore -n '__fish_seen_subcommand_from oom' -l limit -xa all
+complete -c psmore -n '__fish_seen_subcommand_from doctor' -l limit -xa all
+complete -c psmore -n '__fish_seen_subcommand_from doctor' -l fail-on -xa 'never warning critical'
+complete -c psmore -n '__fish_seen_subcommand_from doctor' -l deep -d 'Scan exposure, FD pressure, deleted files, and Linux OOM'
+complete -c psmore -n '__fish_seen_subcommand_from doctor' -l output -r -F -d 'Atomically write private JSON'
+complete -c psmore -n '__fish_seen_subcommand_from doctor' -l force -d 'Replace an existing output file'
 complete -c psmore -n '__fish_seen_subcommand_from tree' -l depth -xa all
 complete -c psmore -n '__fish_seen_subcommand_from port' -l all -d 'Include non-listening connections'
 complete -c psmore -n '__fish_seen_subcommand_from listen' -l exposed -d 'Wildcard and non-loopback binds only'
 complete -c psmore -n '__fish_seen_subcommand_from watch trace' -l interval-ms -r
 complete -c psmore -n '__fish_seen_subcommand_from watch trace' -l count -r
-complete -c psmore -n '__fish_seen_subcommand_from inspect tree check top oom' -l sample-ms -r
+complete -c psmore -n '__fish_seen_subcommand_from inspect tree check top oom doctor' -l sample-ms -r
 complete -c psmore -n '__fish_seen_subcommand_from deleted' -l min-size -r
 complete -c psmore -n '__fish_seen_subcommand_from fd' -l min-count -r
 complete -c psmore -n '__fish_seen_subcommand_from fd' -l min-percent -r
-complete -c psmore -n '__fish_seen_subcommand_from listen net watch top oom' -s q -l query -r
-complete -c psmore -n '__fish_seen_subcommand_from check inspect port listen net tree deleted fd top oom diff' -l table
-complete -c psmore -n '__fish_seen_subcommand_from check inspect port listen net tree deleted fd top oom diff' -l json
+complete -c psmore -n '__fish_seen_subcommand_from listen net watch top oom doctor' -s q -l query -r
+complete -c psmore -n '__fish_seen_subcommand_from check inspect port listen net tree deleted fd top oom doctor diff' -l table
+complete -c psmore -n '__fish_seen_subcommand_from check inspect port listen net tree deleted fd top oom doctor diff' -l json
 complete -c psmore -n '__fish_seen_subcommand_from watch trace' -l jsonl
-complete -c psmore -n '__fish_seen_subcommand_from check port listen net deleted fd oom' -l quiet
+complete -c psmore -n '__fish_seen_subcommand_from check port listen net deleted fd oom doctor' -l quiet
 complete -c psmore -l redact -d 'Mask common secret values in command lines'
 complete -c psmore -s h -l help -d 'Print help'
 complete -c psmore -s V -l version -d 'Print version'
@@ -206,6 +218,7 @@ mod tests {
             "fd",
             "top",
             "oom",
+            "doctor",
             "diff",
             "completion",
         ];
@@ -243,9 +256,21 @@ mod tests {
                     shell.label()
                 );
             }
+            for value in ["never", "warning", "critical"] {
+                assert!(
+                    script.contains(value),
+                    "{} completion is missing {value}",
+                    shell.label()
+                );
+            }
             assert!(
                 script.contains("--redact") || script.contains("-l redact"),
                 "{} completion is missing --redact",
+                shell.label()
+            );
+            assert!(
+                script.contains("--deep") || script.contains("-l deep"),
+                "{} completion is missing doctor --deep",
                 shell.label()
             );
         }
