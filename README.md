@@ -4,6 +4,14 @@
 
 当前支持 macOS 和 Linux。两端共用同一套进程模型与交互，数据层结合 `sysinfo` 和系统原生 `ps`，兼顾资源指标、准确的父子关系以及完整启动参数。
 
+## 项目信息
+
+- 当前构建版本：运行 `psmore --version` 查看
+- 作者：wzfukui（fukui@wuzhi-ai.com）
+- GitHub：[github.com/wzfukui/psmore](https://github.com/wzfukui/psmore)
+
+CLI 的 `--help` 和 TUI 内按 `?` 打开的现场手册也会展示这些信息；版本号始终取自构建时的 `Cargo.toml`，避免界面与二进制版本不一致。
+
 ## 特性
 
 当前原型验证的产品靶子：

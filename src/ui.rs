@@ -2805,6 +2805,13 @@ fn guidance_page_en(page: usize) -> Vec<Line<'static>> {
                 " CLI companions: doctor, explain, inspect, memory, exe, service, logs, tree, net, trace, diff",
                 Style::default().fg(Color::Yellow),
             )),
+            Line::from(""),
+            guidance_section("ABOUT PSMORE"),
+            Line::from(format!(
+                " v{} · wzfukui · fukui@wuzhi-ai.com",
+                env!("CARGO_PKG_VERSION")
+            )),
+            Line::from(" https://github.com/wzfukui/psmore"),
         ],
     }
 }
@@ -2878,6 +2885,13 @@ fn guidance_page_zh(page: usize) -> Vec<Line<'static>> {
                 " CLI 工具：doctor、explain、inspect、memory、exe、service、logs、tree、net、trace、diff",
                 Style::default().fg(Color::Yellow),
             )),
+            Line::from(""),
+            guidance_section("关于 PSMORE"),
+            Line::from(format!(
+                " v{} · wzfukui · fukui@wuzhi-ai.com",
+                env!("CARGO_PKG_VERSION")
+            )),
+            Line::from(" https://github.com/wzfukui/psmore"),
         ],
     }
 }
@@ -3438,6 +3452,14 @@ mod tests {
         let second_page = buffer_text(&terminal);
         assert!(second_page.contains("MOVE FROM SYMPTOM TO EVIDENCE"));
         assert!(second_page.contains("page 2/3"));
+
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let third_page = buffer_text(&terminal);
+        assert!(third_page.contains("ABOUT PSMORE"));
+        assert!(third_page.contains(env!("CARGO_PKG_VERSION")));
+        assert!(third_page.contains("github.com/wzfukui/psmore"));
+        assert!(third_page.contains("fukui@wuzhi-ai.com"));
 
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!app.guidance.is_open());

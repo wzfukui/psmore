@@ -3925,6 +3925,10 @@ GLOBAL OPTIONS:
   -h, --help          Print help
   -V, --version       Print version
 
+PROJECT:
+  Repository          https://github.com/wzfukui/psmore
+  Author              wzfukui <fukui@wuzhi-ai.com>
+
 Run 'psmore COMMAND --help' for command-specific options and examples.
 Query examples: 'name:python cpu>20'  'user:deploy mem>500m'  'tree.procs>=10'
 "
@@ -5458,6 +5462,8 @@ mod tests {
         let global = help_text(None);
         assert!(global.contains("psmore COMMAND [OPTIONS]"));
         assert!(global.contains("psmore COMMAND --help"));
+        assert!(global.contains("https://github.com/wzfukui/psmore"));
+        assert!(global.contains("wzfukui <fukui@wuzhi-ai.com>"));
         for (topic, command) in [
             (HelpTopic::Check, "check"),
             (HelpTopic::Inspect, "inspect"),
