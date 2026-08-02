@@ -56,6 +56,18 @@ Resolve a process to its Linux systemd unit or macOS launchd job. Report
 manager state, restart evidence, configuration origin, resource context, and
 read-only suggested commands without changing the service.
 .TP
+.B logs PID
+Read a bounded window of native logs for one process instance or its service.
+Linux reads journald and can correlate a PID with its systemd unit; macOS reads
+Unified Logging for the exact PID. Collection is read-only and revalidates the
+process identity. Use
+.BR --scope " auto|process|service" ,
+.BR --since " DURATION" ,
+.BR --priority " error|warning|info|debug" ,
+and
+.BR --limit " COUNT"
+to control the evidence boundary.
+.TP
 .B port PORT
 Find processes and socket references associated with a local TCP or UDP port.
 .TP
@@ -168,6 +180,18 @@ command lines. Always review output before sharing it.
 .BI --sample-ms " MILLISECONDS"
 Set the resource sampling interval where supported.
 .TP
+.BI --scope " auto|process|service"
+For logs, choose an exact process instance, an owning systemd unit, or automatic
+selection. Automatic mode broadens only to an actual .service, not a generic
+login scope. macOS supports process and auto scope but refuses service scope.
+.TP
+.BI --since " DURATION"
+For logs, select a recent window from 1 second through 7 days. Durations accept
+s, m, h, or d. Process-scoped windows are clamped to the target start time.
+.TP
+.BI --priority " error|warning|info|debug"
+For logs, select the maximum native-log verbosity. The default is info.
+.TP
 .BI --wait " DURATION"
 For
 .BR check ,
@@ -226,7 +250,7 @@ Show the psmore version.
 .BR Up / Down , " j / k"
 Move the selection. The viewport follows the selected row.
 .TP
-.BR Left / Right , " h / l"
+.BR Left / Right
 Reveal parent context or expand/collapse the selected process subtree.
 .TP
 .B /
@@ -245,8 +269,14 @@ closes the workspace.
 .B v
 Open the selected process executable-image workspace. Verify image identity,
 disk drift, package ownership, hashes, and signing in the background. Enter or
-r refreshes, h toggles SHA-256 collection, m switches to service context, and v
-or Escape closes the workspace.
+r refreshes, h toggles SHA-256 collection, m switches to service context, l
+switches to native logs, and v or Escape closes the workspace.
+.TP
+.B l
+Open bounded native logs for the selected process in the background. Enter or r
+refreshes; s cycles auto, process, and service scope; p changes the maximum
+priority; w changes the time window; m and v switch to related context; l or
+Escape closes the workspace.
 .TP
 .BR n ,
 .BR d ,
@@ -343,7 +373,21 @@ and queries machine-readable systemd properties. macOS maps the process ancestor
 chain through the current launchd bootstrap namespace and only emits an
 allowlist of job fields; launchd environment dictionaries are not copied into
 the report. Suggested commands are printed, not executed.
+.PP
+The
+.B logs
+command bounds both its time window and retained entry count. Linux derives a
+systemd selector from
+.I /proc/PID/cgroup
+and reads journal JSON. Process scope is clamped to the current PID start time;
+service scope can include earlier restart generations. macOS uses
+.B log show
+for the exact PID and refuses unsupported service-wide attribution. Log messages
+may contain business data or secrets; redaction is best effort and output must
+be reviewed before sharing.
 .SH SEE ALSO
 .BR ps (1),
 .BR lsof (8),
-.BR top (1)
+.BR top (1),
+.BR journalctl (1),
+.BR log (1)

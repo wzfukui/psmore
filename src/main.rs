@@ -13,6 +13,7 @@ mod headless_fd;
 mod headless_file;
 mod headless_inspect;
 mod headless_listen;
+mod headless_logs;
 mod headless_net;
 mod headless_oom;
 mod headless_port;
@@ -77,6 +78,7 @@ use crate::{
     headless_listen::{
         ListenPolicyStatus, capture_listeners, render_listeners_json, render_listeners_table,
     },
+    headless_logs::{capture_logs, render_logs_json, render_logs_table},
     headless_net::{
         NetPolicyStatus, capture_network_connections, render_network_json, render_network_table,
     },
@@ -424,6 +426,31 @@ fn main() -> ExitCode {
                     LaunchMode::ServiceTable => render_service_table(&captured),
                     LaunchMode::ServiceJson => {
                         render_service_json(&captured).map_err(io::Error::other)?
+                    }
+                    _ => unreachable!(),
+                };
+                write_stdout(&output)?;
+                Ok(())
+            })();
+            runtime_result(result)
+        }
+        LaunchMode::LogsTable | LaunchMode::LogsJson => {
+            let Some(pid) = cli.logs_pid else {
+                return usage_error("logs requires exactly one PID");
+            };
+            let result = (|| -> Result<(), Box<dyn Error>> {
+                let captured = capture_logs(
+                    pid,
+                    cli.logs_scope,
+                    cli.logs_priority,
+                    cli.logs_since_seconds,
+                    cli.logs_limit,
+                )
+                .map_err(io::Error::other)?;
+                let output = match cli.mode {
+                    LaunchMode::LogsTable => render_logs_table(&captured),
+                    LaunchMode::LogsJson => {
+                        render_logs_json(&captured).map_err(io::Error::other)?
                     }
                     _ => unreachable!(),
                 };
@@ -2008,6 +2035,17 @@ Max address space         unlimited            unlimited            bytes\n";
             },
             "hashing_enabled": true
         });
+        let logs_context = serde_json::json!({
+            "schema": "psmore.process-logs",
+            "schema_version": 1,
+            "process": { "pid": 42, "name": "worker" },
+            "source": {
+                "backend": "journald",
+                "effective_scope": "service",
+                "selector": "_SYSTEMD_UNIT=worker.service"
+            },
+            "entries": [{ "priority": "error", "message": "request failed" }]
+        });
 
         let path = export_report(
             ReportInput {
@@ -2032,6 +2070,8 @@ Max address space         unlimited            unlimited            bytes\n";
                 service_context_in_progress: false,
                 executable_context: Some(&executable_context),
                 executable_context_in_progress: false,
+                logs_context: Some(&logs_context),
+                logs_context_in_progress: false,
                 action_history: &action_history,
                 baseline: None,
             },
@@ -2043,7 +2083,7 @@ Max address space         unlimited            unlimited            bytes\n";
                 .expect("parse exported report");
 
         assert_eq!(report["schema"], "psmore.diagnostic-report");
-        assert_eq!(report["schema_version"], 5);
+        assert_eq!(report["schema_version"], 6);
         assert_eq!(report["tool"]["name"], "psmore");
         assert_eq!(report["platform"], platform_name());
         assert_eq!(report["selected_pid"], 42);
@@ -2061,6 +2101,10 @@ Max address space         unlimited            unlimited            bytes\n";
         );
         assert_eq!(
             report["collection_status"]["executable_context_in_progress"],
+            false
+        );
+        assert_eq!(
+            report["collection_status"]["logs_context_in_progress"],
             false
         );
         assert_eq!(report["process_count"], 2);
@@ -2111,6 +2155,14 @@ Max address space         unlimited            unlimited            bytes\n";
         assert_eq!(
             report["selected_executable_context"]["comparison"]["status"],
             "same_image"
+        );
+        assert_eq!(
+            report["selected_logs_context"]["schema"],
+            "psmore.process-logs"
+        );
+        assert_eq!(
+            report["selected_logs_context"]["entries"][0]["message"],
+            "request failed"
         );
         assert!(report["baseline"].is_null());
         #[cfg(unix)]

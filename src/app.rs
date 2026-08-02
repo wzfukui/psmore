@@ -14,7 +14,9 @@ use crate::{
         ProcessActionDialog, ProcessActionKind, ProcessActionRecord, ProcessActionTarget,
         execute_process_action,
     },
+    cli::{LogPriority, LogScope},
     headless_exe::{capture_executable, render_executable_json, render_executable_table},
+    headless_logs::{capture_logs, render_logs_json, render_logs_table},
     headless_service::{capture_service_context, render_service_json, render_service_table},
     history::ResourceHistory,
     inspection::inspect_process,
@@ -467,6 +469,13 @@ struct ExecutableContextTask {
     start_time: u64,
 }
 
+struct LogsContextTask {
+    receiver: Receiver<Result<(String, serde_json::Value), String>>,
+    started_at: Instant,
+    pid: Pid,
+    start_time: u64,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ServiceContextPanel {
     pub(crate) pid: Pid,
@@ -484,6 +493,19 @@ pub(crate) struct ExecutableContextPanel {
     pub(crate) report: Option<serde_json::Value>,
     pub(crate) warning: Option<String>,
     pub(crate) hash: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct LogsContextPanel {
+    pub(crate) pid: Pid,
+    pub(crate) name: String,
+    pub(crate) content: String,
+    pub(crate) report: Option<serde_json::Value>,
+    pub(crate) warning: Option<String>,
+    pub(crate) scope: LogScope,
+    pub(crate) priority: LogPriority,
+    pub(crate) since_seconds: u64,
+    pub(crate) limit: usize,
 }
 
 pub(crate) struct App {
@@ -541,6 +563,9 @@ pub(crate) struct App {
     pub(crate) executable_context: Option<ExecutableContextPanel>,
     executable_context_task: Option<ExecutableContextTask>,
     pub(crate) executable_context_scroll: u16,
+    pub(crate) logs_context: Option<LogsContextPanel>,
+    logs_context_task: Option<LogsContextTask>,
+    pub(crate) logs_context_scroll: u16,
     pub(crate) process_action: Option<ProcessActionDialog>,
     pub(crate) action_history: Vec<ProcessActionRecord>,
     pub(crate) guidance: Guidance,
@@ -614,6 +639,9 @@ impl App {
             executable_context: None,
             executable_context_task: None,
             executable_context_scroll: 0,
+            logs_context: None,
+            logs_context_task: None,
+            logs_context_scroll: 0,
             process_action: None,
             action_history: Vec::new(),
             guidance,
@@ -859,6 +887,53 @@ impl App {
             }
             Some(Err(TryRecvError::Empty)) | None => {}
         }
+
+        let logs_result = self
+            .logs_context_task
+            .as_ref()
+            .map(|task| task.receiver.try_recv());
+        match logs_result {
+            Some(Ok(result)) => {
+                let task = self.logs_context_task.take();
+                let same_instance = task
+                    .as_ref()
+                    .map(|task| {
+                        self.processes
+                            .get(&task.pid)
+                            .map(|process| {
+                                task.start_time == 0
+                                    || process.start_time == 0
+                                    || process.start_time == task.start_time
+                            })
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if let Some(panel) = &mut self.logs_context {
+                    match result {
+                        Ok((content, report)) => {
+                            panel.content = content;
+                            panel.report = Some(report);
+                            panel.warning = (!same_instance).then(|| {
+                                "process exited or changed after collection; showing the bounded report for the originally selected process instance".into()
+                            });
+                        }
+                        Err(error) => {
+                            panel.content.clear();
+                            panel.report = None;
+                            panel.warning = Some(error);
+                        }
+                    }
+                }
+                self.logs_context_scroll = 0;
+            }
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.logs_context_task = None;
+                if let Some(panel) = &mut self.logs_context {
+                    panel.warning = Some("native log background worker stopped".into());
+                }
+            }
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
     }
 
     pub(crate) fn network_is_scanning(&self) -> bool {
@@ -900,6 +975,17 @@ impl App {
 
     pub(crate) fn executable_context_elapsed(&self) -> Duration {
         self.executable_context_task
+            .as_ref()
+            .map(|task| task.started_at.elapsed())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn logs_context_is_scanning(&self) -> bool {
+        self.logs_context_task.is_some()
+    }
+
+    pub(crate) fn logs_context_elapsed(&self) -> Duration {
+        self.logs_context_task
             .as_ref()
             .map(|task| task.started_at.elapsed())
             .unwrap_or_default()
@@ -1080,6 +1166,9 @@ impl App {
         self.executable_context = None;
         self.executable_context_task = None;
         self.executable_context_scroll = 0;
+        self.logs_context = None;
+        self.logs_context_task = None;
+        self.logs_context_scroll = 0;
         self.show_events = false;
         self.start_service_context(process, true);
     }
@@ -1174,6 +1263,9 @@ impl App {
         self.service_context = None;
         self.service_context_task = None;
         self.service_context_scroll = 0;
+        self.logs_context = None;
+        self.logs_context_task = None;
+        self.logs_context_scroll = 0;
         self.show_events = false;
         self.start_executable_context(process, true, true);
     }
@@ -1209,6 +1301,167 @@ impl App {
             panel.report = None;
         }
         self.refresh_executable_context();
+    }
+
+    fn start_logs_context(
+        &mut self,
+        process: ProcessInfo,
+        scope: LogScope,
+        priority: LogPriority,
+        since_seconds: u64,
+        limit: usize,
+        clear_previous: bool,
+    ) {
+        if self.logs_context_task.is_some() {
+            return;
+        }
+        if clear_previous {
+            self.logs_context = Some(LogsContextPanel {
+                pid: process.pid,
+                name: process.name.clone(),
+                content: String::new(),
+                report: None,
+                warning: None,
+                scope,
+                priority,
+                since_seconds,
+                limit,
+            });
+            self.logs_context_scroll = 0;
+        } else if let Some(panel) = &mut self.logs_context {
+            panel.content.clear();
+            panel.report = None;
+            panel.warning = None;
+        }
+        let pid = process.pid;
+        let start_time = process.start_time;
+        let (sender, receiver) = mpsc::channel();
+        match thread::Builder::new()
+            .name(format!("psmore-native-logs-{}", pid.as_u32()))
+            .spawn(move || {
+                let result = capture_logs(pid.as_u32(), scope, priority, since_seconds, limit)
+                    .and_then(|captured| {
+                        let table = render_logs_table(&captured);
+                        let json = render_logs_json(&captured)
+                            .map_err(|error| format!("cannot serialize native logs: {error}"))?;
+                        let report = serde_json::from_str(&json)
+                            .map_err(|error| format!("cannot parse native log JSON: {error}"))?;
+                        Ok((table, report))
+                    });
+                let _ = sender.send(result);
+            }) {
+            Ok(_) => {
+                self.logs_context_task = Some(LogsContextTask {
+                    receiver,
+                    started_at: Instant::now(),
+                    pid,
+                    start_time,
+                });
+            }
+            Err(error) => {
+                if let Some(panel) = &mut self.logs_context {
+                    panel.warning = Some(format!("cannot start native log collection: {error}"));
+                }
+            }
+        }
+    }
+
+    fn open_logs_context(&mut self) {
+        let Some(process) = self
+            .selected_pid()
+            .and_then(|pid| self.processes.get(&pid))
+            .cloned()
+        else {
+            return;
+        };
+        self.show_attention = false;
+        self.attention_selected = None;
+        self.show_hotspots = false;
+        self.hotspot_selected = None;
+        self.show_network = false;
+        self.network_filter.clear();
+        self.network_searching = false;
+        self.show_snapshot_diff = false;
+        self.trend_pid = None;
+        self.inspection = None;
+        self.inspection_task = None;
+        self.service_context = None;
+        self.service_context_task = None;
+        self.service_context_scroll = 0;
+        self.executable_context = None;
+        self.executable_context_task = None;
+        self.executable_context_scroll = 0;
+        self.show_events = false;
+        self.start_logs_context(
+            process,
+            LogScope::Auto,
+            LogPriority::Info,
+            15 * 60,
+            100,
+            true,
+        );
+    }
+
+    fn refresh_logs_context(&mut self) {
+        if self.logs_context_task.is_some() {
+            return;
+        }
+        let Some((pid, scope, priority, since_seconds, limit)) =
+            self.logs_context.as_ref().map(|panel| {
+                (
+                    panel.pid,
+                    panel.scope,
+                    panel.priority,
+                    panel.since_seconds,
+                    panel.limit,
+                )
+            })
+        else {
+            self.open_logs_context();
+            return;
+        };
+        let Some(process) = self.processes.get(&pid).cloned() else {
+            if let Some(panel) = &mut self.logs_context {
+                panel.warning = Some("process has exited since this snapshot".into());
+            }
+            return;
+        };
+        self.start_logs_context(process, scope, priority, since_seconds, limit, false);
+    }
+
+    fn cycle_logs_scope(&mut self) {
+        if self.logs_context_task.is_some() {
+            return;
+        }
+        if let Some(panel) = &mut self.logs_context {
+            panel.scope = panel.scope.next();
+        }
+        self.refresh_logs_context();
+    }
+
+    fn cycle_logs_priority(&mut self) {
+        if self.logs_context_task.is_some() {
+            return;
+        }
+        if let Some(panel) = &mut self.logs_context {
+            panel.priority = panel.priority.next();
+        }
+        self.refresh_logs_context();
+    }
+
+    fn cycle_logs_window(&mut self) {
+        if self.logs_context_task.is_some() {
+            return;
+        }
+        if let Some(panel) = &mut self.logs_context {
+            panel.since_seconds = match panel.since_seconds {
+                0..=300 => 15 * 60,
+                301..=900 => 60 * 60,
+                901..=3_600 => 6 * 60 * 60,
+                _ => 5 * 60,
+            };
+        }
+        self.refresh_logs_context();
     }
 
     fn rebuild_visible(&mut self) {
@@ -1600,6 +1853,11 @@ impl App {
                         .as_ref()
                         .and_then(|panel| panel.report.as_ref()),
                     executable_context_in_progress: self.executable_context_is_scanning(),
+                    logs_context: self
+                        .logs_context
+                        .as_ref()
+                        .and_then(|panel| panel.report.as_ref()),
+                    logs_context_in_progress: self.logs_context_is_scanning(),
                     action_history: &self.action_history,
                     baseline: self.baseline.as_ref(),
                 },
@@ -2285,6 +2543,48 @@ impl App {
             }
             return false;
         }
+        if self.logs_context.is_some() {
+            match key.code {
+                KeyCode::Char('q') => return true,
+                KeyCode::Esc | KeyCode::Char('l') => {
+                    self.logs_context = None;
+                    self.logs_context_task = None;
+                    self.logs_context_scroll = 0;
+                }
+                KeyCode::Char('m') => {
+                    self.logs_context = None;
+                    self.logs_context_task = None;
+                    self.logs_context_scroll = 0;
+                    self.open_service_context();
+                }
+                KeyCode::Char('v') => {
+                    self.logs_context = None;
+                    self.logs_context_task = None;
+                    self.logs_context_scroll = 0;
+                    self.open_executable_context();
+                }
+                KeyCode::Enter | KeyCode::Char('r') => self.refresh_logs_context(),
+                KeyCode::Char('s') => self.cycle_logs_scope(),
+                KeyCode::Char('p') => self.cycle_logs_priority(),
+                KeyCode::Char('w') => self.cycle_logs_window(),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.logs_context_scroll = self.logs_context_scroll.saturating_add(1);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.logs_context_scroll = self.logs_context_scroll.saturating_sub(1);
+                }
+                KeyCode::PageDown => {
+                    self.logs_context_scroll = self.logs_context_scroll.saturating_add(10);
+                }
+                KeyCode::PageUp => {
+                    self.logs_context_scroll = self.logs_context_scroll.saturating_sub(10);
+                }
+                KeyCode::Char(' ') => self.toggle_paused(),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
+                _ => {}
+            }
+            return false;
+        }
         if self.service_context.is_some() {
             match key.code {
                 KeyCode::Char('q') => return true,
@@ -2298,6 +2598,12 @@ impl App {
                     self.service_context_task = None;
                     self.service_context_scroll = 0;
                     self.open_executable_context();
+                }
+                KeyCode::Char('l') => {
+                    self.service_context = None;
+                    self.service_context_task = None;
+                    self.service_context_scroll = 0;
+                    self.open_logs_context();
                 }
                 KeyCode::Enter | KeyCode::Char('r') => self.refresh_service_context(),
                 KeyCode::Down | KeyCode::Char('j') => {
@@ -2331,6 +2637,12 @@ impl App {
                     self.executable_context_task = None;
                     self.executable_context_scroll = 0;
                     self.open_service_context();
+                }
+                KeyCode::Char('l') => {
+                    self.executable_context = None;
+                    self.executable_context_task = None;
+                    self.executable_context_scroll = 0;
+                    self.open_logs_context();
                 }
                 KeyCode::Enter | KeyCode::Char('r') => self.refresh_executable_context(),
                 KeyCode::Char('h') => self.toggle_executable_hash(),
@@ -2488,6 +2800,7 @@ impl App {
             KeyCode::Char('a') => self.open_attention(),
             KeyCode::Char('m') => self.open_service_context(),
             KeyCode::Char('v') => self.open_executable_context(),
+            KeyCode::Char('l') => self.open_logs_context(),
             KeyCode::Char('p') => self.open_selected_process_action(),
             KeyCode::Char('?') => self.guidance.open_help(),
             KeyCode::Enter => self.open_inspection(),

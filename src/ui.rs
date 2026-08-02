@@ -706,7 +706,7 @@ fn draw_service_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         ""
     };
     let title = format!(
-        " manager {} [{}]{}  Enter/r refresh  ↑↓ scroll  v verify  m/Esc close ",
+        " manager {} [{}]{}  Enter/r refresh  ↑↓ scroll  v verify  l logs  m/Esc close ",
         panel.name, panel.pid, scanning
     );
     frame.render_widget(Clear, popup);
@@ -806,7 +806,7 @@ fn draw_executable_context_overlay(frame: &mut Frame, app: &mut App, area: Rect)
     };
     let hash = if panel.hash { "hash on" } else { "hash off" };
     let title = format!(
-        " verify image {} [{}]{}  {}  Enter/r refresh  h hash  m manager  v/Esc close ",
+        " verify image {} [{}]{}  {}  Enter/r refresh  h hash  m manager  l logs  v/Esc close ",
         panel.name, panel.pid, scanning, hash
     );
     frame.render_widget(Clear, popup);
@@ -814,6 +814,114 @@ fn draw_executable_context_overlay(frame: &mut Frame, app: &mut App, area: Rect)
         Paragraph::new(lines)
             .block(Block::default().borders(Borders::ALL).title(title))
             .scroll((app.executable_context_scroll, 0))
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
+fn compact_duration(seconds: u64) -> String {
+    if seconds % 3_600 == 0 {
+        format!("{}h", seconds / 3_600)
+    } else if seconds % 60 == 0 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn draw_logs_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
+    let Some(panel) = app.logs_context.clone() else {
+        return;
+    };
+    let width = area.width.saturating_sub(2).clamp(1, 160);
+    let height = area.height.saturating_sub(2).max(1);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let mut lines = Vec::new();
+    if app.logs_context_is_scanning() {
+        let elapsed = app.logs_context_elapsed();
+        lines.push(Line::from(Span::styled(
+            format!(
+                " {} reading bounded native logs in the background ({:.1}s)",
+                activity_spinner(elapsed),
+                elapsed.as_secs_f64()
+            ),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+    }
+    if let Some(warning) = panel.warning.as_deref() {
+        lines.push(Line::from(Span::styled(
+            format!(" WARNING  {warning}"),
+            Style::default().fg(Color::LightRed),
+        )));
+        lines.push(Line::from(""));
+    }
+    for line in panel.content.lines() {
+        let style = if line.starts_with("source ") || line.starts_with("service ") {
+            Style::default()
+                .fg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD)
+        } else if line.starts_with("window ") {
+            Style::default().fg(Color::LightCyan)
+        } else if line.starts_with("warning ") {
+            Style::default().fg(Color::LightRed)
+        } else if line.starts_with("TIME ") || line.starts_with("context ") {
+            Style::default().fg(Color::DarkGray)
+        } else if line.contains(" critical ")
+            || line.contains(" emergency ")
+            || line.contains(" alert ")
+            || line.contains(" error ")
+        {
+            Style::default().fg(Color::LightRed)
+        } else if line.contains(" warning ") {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(Span::styled(line.to_owned(), style)));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " No native log evidence available",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    let content_height = height.saturating_sub(2) as usize;
+    let content_width = width.saturating_sub(2).max(1) as usize;
+    let visual_lines = lines
+        .iter()
+        .map(|line| line.width().max(1).div_ceil(content_width))
+        .sum::<usize>();
+    let max_scroll = visual_lines
+        .saturating_sub(content_height)
+        .min(u16::MAX as usize) as u16;
+    app.logs_context_scroll = app.logs_context_scroll.min(max_scroll);
+    let scanning = if app.logs_context_is_scanning() {
+        "  scanning"
+    } else {
+        ""
+    };
+    let title = format!(
+        " logs {} [{}]{}  scope {}  <= {}  {}  r refresh  s scope  p level  w window  m/v context  l/Esc close ",
+        panel.name,
+        panel.pid,
+        scanning,
+        panel.scope.label(),
+        panel.priority.label(),
+        compact_duration(panel.since_seconds),
+    );
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .scroll((app.logs_context_scroll, 0))
             .wrap(Wrap { trim: false }),
         popup,
     );
@@ -1964,11 +2072,12 @@ fn guidance_page(page: usize) -> Vec<Line<'static>> {
                 "m",
                 "systemd or launchd ownership, state, config, and next commands",
             ),
+            guidance_key("l", "bounded native logs for this process or service"),
             guidance_key("b / d / x", "capture baseline, compare, and clear"),
             guidance_key("Space / r", "freeze the scene; sample manually"),
             Line::from(""),
             Line::from(Span::styled(
-                " Tip: inside manager/image panels, m and v switch ownership and provenance.",
+                " Tip: m, v, and l switch manager, executable, and native-log evidence.",
                 Style::default().fg(Color::Yellow),
             )),
         ],
@@ -1988,7 +2097,7 @@ fn guidance_page(page: usize) -> Vec<Line<'static>> {
             guidance_key("q / Ctrl-C", "leave psmore"),
             Line::from(""),
             Line::from(Span::styled(
-                " CLI companions: doctor, inspect, exe, service, tree, net, trace, diff",
+                " CLI companions: doctor, inspect, exe, service, logs, tree, net, trace, diff",
                 Style::default().fg(Color::Yellow),
             )),
         ],
@@ -2320,7 +2429,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     } else if !app.search.is_empty() {
         " filter active | / new search or clear | ↑↓/jk move | Enter inspect | q quit ".into()
     } else {
-        " ↑↓/jk move | ←/→ tree | / find | a attention | h hot | m manager | v image | p actions | t trend | n network | b base | d diff | o report | ? help ".into()
+        " ↑↓/jk move | ←/→ tree | / find | a attention | h hot | m manager | v image | l logs | p actions | t trend | n network | b base | d diff | o report | ? help ".into()
     };
     let footer = Paragraph::new(vec![
         Line::from(format!(
@@ -2354,6 +2463,8 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         draw_snapshot_diff_overlay(frame, app, area);
     } else if app.trend_pid.is_some() {
         draw_trend_overlay(frame, app, area);
+    } else if app.logs_context.is_some() {
+        draw_logs_context_overlay(frame, app, area);
     } else if app.executable_context.is_some() {
         draw_executable_context_overlay(frame, app, area);
     } else if app.service_context.is_some() {
@@ -2377,8 +2488,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        app::{ExecutableContextPanel, ServiceContextPanel},
-        onboarding::Guidance,
+        app::{ExecutableContextPanel, LogsContextPanel, ServiceContextPanel},
+        cli::{LogPriority, LogScope},
+        onboarding::{Guidance, TIPS},
     };
 
     fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
@@ -2418,12 +2530,13 @@ mod tests {
         app.guidance = Guidance::tip_for_test(0);
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let tip = buffer_text(&terminal);
-        assert!(tip.contains("PSMORE TIP 1/11"));
+        let tip_title = format!("PSMORE TIP 1/{}", TIPS.len());
+        assert!(tip.contains(&tip_title));
         assert!(tip.contains("Reveal the real parent chain"));
         assert!(tip.contains("Any other key continues"));
         let tip_row = tip
             .lines()
-            .position(|line| line.contains("PSMORE TIP 1/11"))
+            .position(|line| line.contains(&tip_title))
             .unwrap();
         assert!(
             tip_row >= 14,
@@ -2566,6 +2679,79 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.executable_context.is_none());
         assert!(!app.executable_context_is_scanning());
+    }
+
+    #[test]
+    fn logs_context_overlay_renders_controls_and_closes() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        let current_pid = sysinfo::get_current_pid().unwrap();
+        app.logs_context = Some(LogsContextPanel {
+            pid: current_pid,
+            name: "worker".into(),
+            content: [
+                "PSMORE PROCESS LOGS",
+                "source journald  scope auto -> service  selector _SYSTEMD_UNIT=worker.service",
+                "window 10..20  priority <= info  rows 1/100  truncated no  coverage complete",
+                "service worker.service  scope system",
+                "TIME                         LEVEL     SOURCE[PID]            MESSAGE",
+                "2026-08-02T00:00:00.000Z error     worker[4321]           request failed",
+            ]
+            .join("\n"),
+            report: None,
+            warning: None,
+            scope: LogScope::Auto,
+            priority: LogPriority::Info,
+            since_seconds: 900,
+            limit: 100,
+        });
+        let backend = TestBackend::new(130, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let output = buffer_text(&terminal);
+        assert!(output.contains(&format!("logs worker [{current_pid}]")));
+        assert!(output.contains("worker.service"));
+        assert!(output.contains("request failed"));
+        assert!(output.contains("scope auto"));
+
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.logs_context_scroll, 1);
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert_eq!(
+            app.logs_context.as_ref().unwrap().priority,
+            LogPriority::Debug
+        );
+        assert!(app.logs_context_is_scanning());
+        app.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert!(app.logs_context.is_none());
+        assert!(!app.logs_context_is_scanning());
+    }
+
+    #[test]
+    fn logs_key_opens_context_for_the_selected_process() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        let current_pid = sysinfo::get_current_pid().unwrap();
+        app.selected = app
+            .visible
+            .iter()
+            .position(|row| row.pid == current_pid)
+            .expect("current test process should be visible");
+
+        app.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        let panel = app
+            .logs_context
+            .as_ref()
+            .expect("logs key should open native log context");
+        assert_eq!(panel.pid, current_pid);
+        assert_eq!(panel.scope, LogScope::Auto);
+        assert_eq!(panel.priority, LogPriority::Info);
+        assert_eq!(panel.since_seconds, 900);
+        assert!(app.logs_context_is_scanning());
+
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.logs_context.is_none());
+        assert!(!app.logs_context_is_scanning());
     }
 
     #[test]

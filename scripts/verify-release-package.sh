@@ -105,9 +105,9 @@ grep -q 'exe' "$prefix/share/fish/vendor_completions.d/psmore.fish" || fail 'fis
 grep -q 'stale' "$prefix/share/bash-completion/completions/psmore" || fail 'bash completion is missing the stale command'
 grep -q 'stale' "$prefix/share/zsh/site-functions/_psmore" || fail 'zsh completion is missing the stale command'
 grep -q 'stale' "$prefix/share/fish/vendor_completions.d/psmore.fish" || fail 'fish completion is missing the stale command'
-grep -q 'stale' "$prefix/share/bash-completion/completions/psmore" || fail 'bash completion is missing the stale command'
-grep -q 'stale' "$prefix/share/zsh/site-functions/_psmore" || fail 'zsh completion is missing the stale command'
-grep -q 'stale' "$prefix/share/fish/vendor_completions.d/psmore.fish" || fail 'fish completion is missing the stale command'
+grep -q 'logs' "$prefix/share/bash-completion/completions/psmore" || fail 'bash completion is missing the logs command'
+grep -q 'logs' "$prefix/share/zsh/site-functions/_psmore" || fail 'zsh completion is missing the logs command'
+grep -q 'logs' "$prefix/share/fish/vendor_completions.d/psmore.fish" || fail 'fish completion is missing the logs command'
 file_report="$temp_dir/file-report.json"
 "$prefix/bin/psmore" file "$prefix/bin/psmore" --json --limit 1 > "$file_report"
 grep -q '"schema": "psmore.file-usage"' "$file_report" || fail 'installed file command returned an unexpected schema'
@@ -119,6 +119,10 @@ grep -q '"schema": "psmore.service-context"' "$service_report" || fail 'installe
 exe_report="$temp_dir/exe-report.json"
 "$prefix/bin/psmore" exe "$$" --json --no-hash > "$exe_report"
 grep -q '"schema": "psmore.executable-image"' "$exe_report" || fail 'installed exe command returned an unexpected schema'
+
+logs_report="$temp_dir/logs-report.json"
+"$prefix/bin/psmore" logs "$$" --scope process --since 1s --limit 1 --json > "$logs_report"
+grep -q '"schema": "psmore.process-logs"' "$logs_report" || fail 'installed logs command returned an unexpected schema'
 
 if [ "$(uname -s)" = Linux ]; then
     cgroup_report="$temp_dir/cgroup-report.json"

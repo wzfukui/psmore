@@ -15,6 +15,8 @@ pub(crate) enum LaunchMode {
     StaleJson,
     ServiceTable,
     ServiceJson,
+    LogsTable,
+    LogsJson,
     PortTable,
     PortJson,
     ListenTable,
@@ -57,6 +59,7 @@ pub(crate) enum HelpTopic {
     Exe,
     Stale,
     Service,
+    Logs,
     Port,
     Listen,
     Tree,
@@ -108,6 +111,90 @@ pub(crate) enum ListenProtocol {
     Tcp,
     Udp,
     Unix,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum LogScope {
+    #[default]
+    Auto,
+    Process,
+    Service,
+}
+
+impl LogScope {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Process => "process",
+            Self::Service => "service",
+        }
+    }
+
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::Auto => Self::Process,
+            Self::Process => Self::Service,
+            Self::Service => Self::Auto,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum LogPriority {
+    Error,
+    Warning,
+    #[default]
+    Info,
+    Debug,
+}
+
+impl LogPriority {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warning => "warning",
+            Self::Info => "info",
+            Self::Debug => "debug",
+        }
+    }
+
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::Error => Self::Warning,
+            Self::Warning => Self::Info,
+            Self::Info => Self::Debug,
+            Self::Debug => Self::Error,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn syslog_max(self) -> u8 {
+        match self {
+            Self::Error => 3,
+            Self::Warning => 4,
+            Self::Info => 6,
+            Self::Debug => 7,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn includes_macos(self, priority: &str) -> bool {
+        let rank = match priority.to_ascii_lowercase().as_str() {
+            "fault" => 0,
+            "error" => 1,
+            "default" => 2,
+            "info" => 3,
+            "debug" => 4,
+            _ => 2,
+        };
+        let maximum = match self {
+            Self::Error => 1,
+            Self::Warning => 2,
+            Self::Info => 3,
+            Self::Debug => 4,
+        };
+        rank <= maximum
+    }
 }
 
 impl ListenProtocol {
@@ -245,6 +332,11 @@ pub(crate) struct Cli {
     pub(crate) stale_limit: Option<usize>,
     pub(crate) stale_expectation: Option<CheckExpectation>,
     pub(crate) service_pid: Option<u32>,
+    pub(crate) logs_pid: Option<u32>,
+    pub(crate) logs_scope: LogScope,
+    pub(crate) logs_priority: LogPriority,
+    pub(crate) logs_since_seconds: u64,
+    pub(crate) logs_limit: usize,
     pub(crate) port: Option<u16>,
     pub(crate) port_protocol: PortProtocol,
     pub(crate) port_all: bool,
@@ -320,6 +412,11 @@ impl Default for Cli {
             stale_limit: Some(100),
             stale_expectation: None,
             service_pid: None,
+            logs_pid: None,
+            logs_scope: LogScope::Auto,
+            logs_priority: LogPriority::Info,
+            logs_since_seconds: 15 * 60,
+            logs_limit: 100,
             port: None,
             port_protocol: PortProtocol::Any,
             port_all: false,
@@ -405,6 +502,7 @@ impl Cli {
                 "exe" => Some((parse_exe(&arguments[1..]), HelpTopic::Exe)),
                 "stale" => Some((parse_stale(&arguments[1..]), HelpTopic::Stale)),
                 "service" => Some((parse_service(&arguments[1..]), HelpTopic::Service)),
+                "logs" => Some((parse_logs(&arguments[1..]), HelpTopic::Logs)),
                 "port" => Some((parse_port(&arguments[1..]), HelpTopic::Port)),
                 "tree" => Some((parse_tree(&arguments[1..]), HelpTopic::Tree)),
                 "diff" => Some((parse_diff(&arguments[1..]), HelpTopic::Diff)),
@@ -480,7 +578,7 @@ impl Cli {
 }
 
 fn extract_secret_redaction(arguments: &mut Vec<String>) -> Result<bool, String> {
-    const VALUE_OPTIONS: [&str; 20] = [
+    const VALUE_OPTIONS: [&str; 23] = [
         "-q",
         "--query",
         "--sample-ms",
@@ -501,6 +599,9 @@ fn extract_secret_redaction(arguments: &mut Vec<String>) -> Result<bool, String>
         "--fail-on",
         "--wait",
         "--stable",
+        "--since",
+        "--priority",
+        "--scope",
     ];
     let mut enabled = false;
     let mut expects_value = false;
@@ -2886,6 +2987,201 @@ fn set_service_output_mode(
     Ok(())
 }
 
+fn parse_logs(arguments: &[String]) -> Result<Cli, String> {
+    let mut cli = Cli {
+        mode: LaunchMode::LogsTable,
+        ..Cli::default()
+    };
+    let mut output_mode = None;
+    let mut scope_set = false;
+    let mut priority_set = false;
+    let mut since_set = false;
+    let mut limit_set = false;
+    let mut pids = Vec::new();
+    let mut arguments = arguments.iter().cloned().peekable();
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "-h" | "--help" => cli.mode = LaunchMode::Help,
+            "-V" | "--version" => cli.mode = LaunchMode::Version,
+            "--table" => {
+                set_logs_output_mode(&mut cli.mode, &mut output_mode, LaunchMode::LogsTable)?
+            }
+            "--json" => {
+                set_logs_output_mode(&mut cli.mode, &mut output_mode, LaunchMode::LogsJson)?
+            }
+            "--scope" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "logs --scope requires auto, process, or service".to_string())?;
+                set_logs_scope(&mut cli, &mut scope_set, &value)?;
+            }
+            "--priority" => {
+                let value = arguments.next().ok_or_else(|| {
+                    "logs --priority requires error, warning, info, or debug".to_string()
+                })?;
+                set_logs_priority(&mut cli, &mut priority_set, &value)?;
+            }
+            "--since" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "logs --since requires a duration".to_string())?;
+                set_logs_since(&mut cli, &mut since_set, &value)?;
+            }
+            "--limit" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "logs --limit requires an integer".to_string())?;
+                set_logs_limit(&mut cli, &mut limit_set, &value)?;
+            }
+            _ if argument.starts_with("--scope=") => set_logs_scope(
+                &mut cli,
+                &mut scope_set,
+                argument.trim_start_matches("--scope="),
+            )?,
+            _ if argument.starts_with("--priority=") => set_logs_priority(
+                &mut cli,
+                &mut priority_set,
+                argument.trim_start_matches("--priority="),
+            )?,
+            _ if argument.starts_with("--since=") => set_logs_since(
+                &mut cli,
+                &mut since_set,
+                argument.trim_start_matches("--since="),
+            )?,
+            _ if argument.starts_with("--limit=") => set_logs_limit(
+                &mut cli,
+                &mut limit_set,
+                argument.trim_start_matches("--limit="),
+            )?,
+            _ if argument.starts_with('-') => {
+                return Err(format!("unknown logs option: {argument}"));
+            }
+            _ => pids.push(argument),
+        }
+    }
+    if matches!(cli.mode, LaunchMode::Help | LaunchMode::Version) {
+        return Ok(cli);
+    }
+    if pids.len() != 1 {
+        return Err(format!(
+            "logs requires exactly one PID; received {}",
+            pids.len()
+        ));
+    }
+    let pid = pids[0]
+        .parse::<u32>()
+        .map_err(|_| format!("invalid PID: {}", pids[0]))?;
+    if pid == 0 {
+        return Err("logs requires a real process PID greater than 0".into());
+    }
+    if pid > i32::MAX as u32 {
+        return Err(format!("PID {pid} exceeds the supported system PID range"));
+    }
+    cli.logs_pid = Some(pid);
+    Ok(cli)
+}
+
+fn set_logs_output_mode(
+    mode: &mut LaunchMode,
+    output_mode: &mut Option<LaunchMode>,
+    requested: LaunchMode,
+) -> Result<(), String> {
+    if output_mode.is_some_and(|existing| existing != requested) {
+        return Err("logs --table and --json cannot be used together".into());
+    }
+    *output_mode = Some(requested);
+    if !matches!(mode, LaunchMode::Help | LaunchMode::Version) {
+        *mode = requested;
+    }
+    Ok(())
+}
+
+fn set_logs_scope(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+    if *value_set {
+        return Err("logs --scope may only be specified once".into());
+    }
+    cli.logs_scope = match value.to_ascii_lowercase().as_str() {
+        "auto" => LogScope::Auto,
+        "process" | "pid" => LogScope::Process,
+        "service" | "unit" => LogScope::Service,
+        _ => {
+            return Err(format!(
+                "invalid logs scope: {value}; use auto, process, or service"
+            ));
+        }
+    };
+    *value_set = true;
+    Ok(())
+}
+
+fn set_logs_priority(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+    if *value_set {
+        return Err("logs --priority may only be specified once".into());
+    }
+    cli.logs_priority = match value.to_ascii_lowercase().as_str() {
+        "error" | "err" => LogPriority::Error,
+        "warning" | "warn" => LogPriority::Warning,
+        "info" => LogPriority::Info,
+        "debug" => LogPriority::Debug,
+        _ => {
+            return Err(format!(
+                "invalid logs priority: {value}; use error, warning, info, or debug"
+            ));
+        }
+    };
+    *value_set = true;
+    Ok(())
+}
+
+fn set_logs_since(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+    if *value_set {
+        return Err("logs --since may only be specified once".into());
+    }
+    cli.logs_since_seconds = parse_logs_duration_seconds(value)?;
+    *value_set = true;
+    Ok(())
+}
+
+fn parse_logs_duration_seconds(value: &str) -> Result<u64, String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    let (number, multiplier) = if let Some(number) = normalized.strip_suffix('s') {
+        (number, 1.0)
+    } else if let Some(number) = normalized.strip_suffix('m') {
+        (number, 60.0)
+    } else if let Some(number) = normalized.strip_suffix('h') {
+        (number, 3_600.0)
+    } else if let Some(number) = normalized.strip_suffix('d') {
+        (number, 86_400.0)
+    } else {
+        return Err(format!(
+            "invalid logs --since duration: {value}; include s, m, h, or d"
+        ));
+    };
+    let amount = number
+        .parse::<f64>()
+        .map_err(|_| format!("invalid logs --since duration: {value}"))?;
+    let seconds = amount * multiplier;
+    if !seconds.is_finite() || !(1.0..=604_800.0).contains(&seconds) {
+        return Err("logs --since must be between 1s and 7d".into());
+    }
+    Ok(seconds.ceil() as u64)
+}
+
+fn set_logs_limit(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+    if *value_set {
+        return Err("logs --limit may only be specified once".into());
+    }
+    let limit = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid logs --limit value: {value}"))?;
+    if !(1..=1_000).contains(&limit) {
+        return Err("logs --limit must be between 1 and 1000".into());
+    }
+    cli.logs_limit = limit;
+    *value_set = true;
+    Ok(())
+}
+
 fn parse_check(arguments: &[String]) -> Result<Cli, String> {
     let mut cli = Cli {
         mode: LaunchMode::CheckTable,
@@ -3274,6 +3570,7 @@ COMMANDS:
   exe         Verify a process executable, disk drift, package, and signing
   stale       Find Linux processes still holding deleted or replaced executables
   service     Resolve a PID to its systemd or launchd service context
+  logs        Read bounded native logs for one process or service instance
   port        Find the process and socket using a local port
   listen      Inventory listeners and classify non-loopback exposure
   net         Search all listeners and peer connections with process context
@@ -3418,6 +3715,35 @@ bootstrap namespace. Collection is read-only and PID identity is revalidated.
 EXAMPLES:
   psmore service 1234
   psmore service 1234 --json > service-1234.json
+"
+        }
+        Some(HelpTopic::Logs) => {
+            "psmore logs - read bounded native logs for one process or service
+
+USAGE:
+  psmore logs PID [--scope auto|process|service] [--since DURATION]
+                  [--priority error|warning|info|debug] [--limit N]
+                  [--table|--json]
+
+OPTIONS:
+      --scope SCOPE    Linux auto selects a systemd unit when available; process
+                       forces exact PID logs; service requires a managed unit
+                       [default: auto]
+      --since DURATION Recent time window, 1s-7d [default: 15m]
+      --priority LEVEL Maximum verbosity [default: info]
+      --limit N        Newest entries to retain, 1-1000 [default: 100]
+      --table          Human-readable newest-first log context [default]
+      --json           psmore.process-logs JSON
+      --redact         Best-effort masking of common secret values in messages
+
+Linux reads journald and auto-correlates the PID's cgroup with its systemd unit,
+so restarts inside the selected window remain visible. macOS reads Unified
+Logging for the exact PID and clamps the window to the process start time.
+Collection is read-only, bounded, and revalidates PID identity afterward.
+EXAMPLES:
+  psmore logs 1234
+  psmore logs 1234 --scope process --since 2m --priority debug
+  psmore logs 1234 --json --redact > logs-1234.safe.json
 "
         }
         Some(HelpTopic::Port) => {
@@ -3843,6 +4169,11 @@ mod tests {
                 stale_limit: Some(100),
                 stale_expectation: None,
                 service_pid: None,
+                logs_pid: None,
+                logs_scope: LogScope::Auto,
+                logs_priority: LogPriority::Info,
+                logs_since_seconds: 900,
+                logs_limit: 100,
                 port: None,
                 port_protocol: PortProtocol::Any,
                 port_all: false,
@@ -4170,6 +4501,30 @@ mod tests {
             }
         );
         assert_eq!(
+            Cli::parse([
+                "logs",
+                "4321",
+                "--scope=process",
+                "--since",
+                "2.5m",
+                "--priority=debug",
+                "--limit=250",
+                "--json",
+                "--redact",
+            ])
+            .unwrap(),
+            Cli {
+                mode: LaunchMode::LogsJson,
+                logs_pid: Some(4_321),
+                logs_scope: LogScope::Process,
+                logs_priority: LogPriority::Debug,
+                logs_since_seconds: 150,
+                logs_limit: 250,
+                redact_secrets: true,
+                ..Cli::default()
+            }
+        );
+        assert_eq!(
             Cli::parse(["exe", "4321", "--json", "--no-hash", "--redact"]).unwrap(),
             Cli {
                 mode: LaunchMode::ExeJson,
@@ -4390,6 +4745,7 @@ mod tests {
             ("exe", HelpTopic::Exe),
             ("stale", HelpTopic::Stale),
             ("service", HelpTopic::Service),
+            ("logs", HelpTopic::Logs),
             ("port", HelpTopic::Port),
             ("listen", HelpTopic::Listen),
             ("tree", HelpTopic::Tree),
@@ -4494,6 +4850,17 @@ mod tests {
         assert!(Cli::parse(["service", "nope"]).is_err());
         assert!(Cli::parse(["service", "1", "2"]).is_err());
         assert!(Cli::parse(["service", "1", "--table", "--json"]).is_err());
+        assert!(Cli::parse(["logs"]).is_err());
+        assert!(Cli::parse(["logs", "0"]).is_err());
+        assert!(Cli::parse(["logs", "nope"]).is_err());
+        assert!(Cli::parse(["logs", "1", "2"]).is_err());
+        assert!(Cli::parse(["logs", "1", "--table", "--json"]).is_err());
+        assert!(Cli::parse(["logs", "1", "--scope=host"]).is_err());
+        assert!(Cli::parse(["logs", "1", "--priority=trace"]).is_err());
+        assert!(Cli::parse(["logs", "1", "--since=0s"]).is_err());
+        assert!(Cli::parse(["logs", "1", "--since=8d"]).is_err());
+        assert!(Cli::parse(["logs", "1", "--limit=0"]).is_err());
+        assert!(Cli::parse(["logs", "1", "--limit=1001"]).is_err());
         assert!(Cli::parse(["exe"]).is_err());
         assert!(Cli::parse(["exe", "0"]).is_err());
         assert!(Cli::parse(["exe", "nope"]).is_err());

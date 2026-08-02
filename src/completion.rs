@@ -21,10 +21,12 @@ _psmore_completion() {
         --protocol)
             if [[ "$cmd" == "listen" || "$cmd" == "net" ]]; then words="any tcp udp unix"; else words="any tcp udp"; fi ;;
         --depth) words="all" ;;
-        --limit) words="all" ;;
+        --limit) if [[ "$cmd" == "logs" ]]; then words=""; else words="all"; fi ;;
         --by)
             if [[ "$cmd" == "cgroup" ]]; then words="cpu memory pressure processes"; else words="cpu memory read write"; fi ;;
-        --scope) words="process tree" ;;
+        --scope)
+            if [[ "$cmd" == "logs" ]]; then words="auto process service"; else words="process tree"; fi ;;
+        --priority) words="error warning info debug" ;;
         --state) words="ESTABLISHED LISTEN TIME_WAIT CLOSE_WAIT SYN_SENT SYN_RECV CONNECTED CONNECTING BOUND OPEN" ;;
         --fail-on)
             if [[ "$cmd" == "diff" ]]; then words="never regression"; else words="never warning critical"; fi ;;
@@ -38,7 +40,7 @@ _psmore_completion() {
     fi
 
     if (( COMP_CWORD == 1 )); then
-        words="check inspect exe stale service port listen net tree watch trace run deleted file fd top oom cgroup doctor diff completion --table --json --query --no-tips --sample-ms --redact --help --version"
+        words="check inspect exe stale service logs port listen net tree watch trace run deleted file fd top oom cgroup doctor diff completion --table --json --query --no-tips --sample-ms --redact --help --version"
         COMPREPLY=( $(compgen -W "$words" -- "$cur") )
         return
     fi
@@ -54,6 +56,7 @@ _psmore_completion() {
         exe) words="--table --json --no-hash --help --version" ;;
         stale) words="--query --limit --table --json --expect --quiet --sample-ms --help --version" ;;
         service) words="--table --json --help --version" ;;
+        logs) words="--scope --since --priority --limit --table --json --help --version" ;;
         port) words="--protocol --all --table --json --expect --quiet --help --version" ;;
         listen) words="--query --protocol --exposed --limit --table --json --expect --quiet --help --version" ;;
         tree) words="--depth --table --json --sample-ms --help --version" ;;
@@ -89,6 +92,7 @@ _psmore() {
     'exe:verify a process executable image and provenance'
     'stale:find Linux processes holding obsolete executables'
     'service:resolve a PID to systemd or launchd context'
+    'logs:read bounded native logs for a process or service'
     'port:find the owner of one local port'
     'listen:inventory listeners and exposure'
     'net:search all sockets peer endpoints and owners'
@@ -128,7 +132,9 @@ _psmore() {
       if [[ "$cmd" == listen || "$cmd" == net ]]; then _values 'protocol' any tcp udp unix
       else _values 'protocol' any tcp udp; fi
       return ;;
-    --depth|--limit) _values 'value' all; return ;;
+    --depth) _values 'value' all; return ;;
+    --limit)
+      if [[ "$cmd" != logs ]]; then _values 'value' all; return; fi ;;
     --by)
       if [[ "$cmd" == cgroup ]]; then _values 'metric' cpu memory pressure processes
       else _values 'metric' cpu memory read write; fi
@@ -137,6 +143,11 @@ _psmore() {
       if [[ "$cmd" == diff ]]; then _values 'policy' never regression
       else _values 'severity' never warning critical; fi
       return ;;
+    --scope)
+      if [[ "$cmd" == logs ]]; then _values 'scope' auto process service
+      else _values 'scope' process tree; fi
+      return ;;
+    --priority) _values 'priority' error warning info debug; return ;;
   esac
   if [[ "$cmd" == completion && CURRENT == 3 ]]; then
     _values 'shell' bash zsh fish
@@ -149,6 +160,7 @@ _psmore() {
     exe) options=( '--table[table output]' '--json[JSON output]' '--no-hash[skip SHA-256 reads]' ) ;;
     stale) options=( '--query[process query]:query:' '--limit[maximum stale processes]:rows:(all)' '--table[table output]' '--json[JSON output]' '--expect[policy]:mode:(none any)' '--quiet[suppress output]' '--sample-ms[sampling milliseconds]:milliseconds:' ) ;;
     service) options=( '--table[table output]' '--json[JSON output]' ) ;;
+    logs) options=( '--scope[process or service boundary]:scope:(auto process service)' '--since[recent time window]:duration:' '--priority[maximum verbosity]:priority:(error warning info debug)' '--limit[newest entries]:rows:' '--table[table output]' '--json[JSON output]' ) ;;
     port) options=( '--protocol[protocol]:protocol:(any tcp udp)' '--all[include connections]' '--table[table output]' '--json[JSON output]' '--expect[policy]:mode:(none any)' '--quiet[suppress output]' ) ;;
     listen) options=( '--query[filter text]:filter:' '--protocol[protocol]:protocol:(any tcp udp unix)' '--exposed[non-loopback binds only]' '--limit[maximum rows]:rows:(all)' '--table[table output]' '--json[JSON output]' '--expect[policy]:mode:(none any)' '--quiet[suppress output]' ) ;;
     net) options=( '--query[filter text]:filter:' '--protocol[protocol]:protocol:(any tcp udp unix)' '--connected[peer or connected sockets only]' '--state[exact socket state]:state:(ESTABLISHED LISTEN TIME_WAIT CLOSE_WAIT SYN_SENT SYN_RECV CONNECTED CONNECTING BOUND OPEN)' '--limit[maximum rows]:rows:(all)' '--table[table output]' '--json[JSON output]' '--expect[policy]:mode:(none any)' '--quiet[suppress output]' ) ;;
@@ -180,6 +192,7 @@ complete -c psmore -n '__fish_use_subcommand' -a inspect -d 'Deep inspection for
 complete -c psmore -n '__fish_use_subcommand' -a exe -d 'Verify a process executable image and provenance'
 complete -c psmore -n '__fish_use_subcommand' -a stale -d 'Find Linux processes holding obsolete executables'
 complete -c psmore -n '__fish_use_subcommand' -a service -d 'Resolve a PID to systemd or launchd context'
+complete -c psmore -n '__fish_use_subcommand' -a logs -d 'Read bounded native logs for a process or service'
 complete -c psmore -n '__fish_use_subcommand' -a port -d 'Find the owner of one local port'
 complete -c psmore -n '__fish_use_subcommand' -a listen -d 'Inventory listeners and exposure'
 complete -c psmore -n '__fish_use_subcommand' -a net -d 'Search all sockets, peers, and owners'
@@ -198,11 +211,11 @@ complete -c psmore -n '__fish_use_subcommand' -a diff -d 'Compare snapshots or d
 complete -c psmore -n '__fish_use_subcommand' -a completion -d 'Generate shell completion'
 
 complete -c psmore -n '__fish_seen_subcommand_from completion' -a 'bash zsh fish'
-complete -c psmore -n 'not __fish_seen_subcommand_from check inspect exe stale service port listen net tree watch trace run deleted file fd top oom cgroup doctor diff completion' -s q -l query -r -d 'Initial TUI or snapshot query'
-complete -c psmore -n 'not __fish_seen_subcommand_from check inspect exe stale service port listen net tree watch trace run deleted file fd top oom cgroup doctor diff completion' -l no-tips -d 'Skip startup guidance for this TUI run'
-complete -c psmore -n 'not __fish_seen_subcommand_from check inspect exe stale service port listen net tree watch trace run deleted file fd top oom cgroup doctor diff completion' -l table -d 'Print table snapshot'
-complete -c psmore -n 'not __fish_seen_subcommand_from check inspect exe stale service port listen net tree watch trace run deleted file fd top oom cgroup doctor diff completion' -l json -d 'Print JSON snapshot'
-complete -c psmore -n 'not __fish_seen_subcommand_from check inspect exe stale service port listen net tree watch trace run deleted file fd top oom cgroup doctor diff completion' -l sample-ms -r -d 'Sampling milliseconds'
+complete -c psmore -n 'not __fish_seen_subcommand_from check inspect exe stale service logs port listen net tree watch trace run deleted file fd top oom cgroup doctor diff completion' -s q -l query -r -d 'Initial TUI or snapshot query'
+complete -c psmore -n 'not __fish_seen_subcommand_from check inspect exe stale service logs port listen net tree watch trace run deleted file fd top oom cgroup doctor diff completion' -l no-tips -d 'Skip startup guidance for this TUI run'
+complete -c psmore -n 'not __fish_seen_subcommand_from check inspect exe stale service logs port listen net tree watch trace run deleted file fd top oom cgroup doctor diff completion' -l table -d 'Print table snapshot'
+complete -c psmore -n 'not __fish_seen_subcommand_from check inspect exe stale service logs port listen net tree watch trace run deleted file fd top oom cgroup doctor diff completion' -l json -d 'Print JSON snapshot'
+complete -c psmore -n 'not __fish_seen_subcommand_from check inspect exe stale service logs port listen net tree watch trace run deleted file fd top oom cgroup doctor diff completion' -l sample-ms -r -d 'Sampling milliseconds'
 complete -c psmore -n '__fish_seen_subcommand_from check stale port listen net deleted file fd oom' -l expect -xa 'none any'
 complete -c psmore -n '__fish_seen_subcommand_from check' -l wait -r -d 'Retry until policy passes or duration expires'
 complete -c psmore -n '__fish_seen_subcommand_from check' -l interval-ms -r -d 'Evaluation cadence while waiting'
@@ -215,6 +228,10 @@ complete -c psmore -n '__fish_seen_subcommand_from net' -l state -xa 'ESTABLISHE
 complete -c psmore -n '__fish_seen_subcommand_from stale listen net fd' -l limit -xa all
 complete -c psmore -n '__fish_seen_subcommand_from top' -l by -xa 'cpu memory read write'
 complete -c psmore -n '__fish_seen_subcommand_from top' -l scope -xa 'process tree'
+complete -c psmore -n '__fish_seen_subcommand_from logs' -l scope -xa 'auto process service'
+complete -c psmore -n '__fish_seen_subcommand_from logs' -l since -r -d 'Recent time window such as 15m or 2h'
+complete -c psmore -n '__fish_seen_subcommand_from logs' -l priority -xa 'error warning info debug'
+complete -c psmore -n '__fish_seen_subcommand_from logs' -l limit -r
 complete -c psmore -n '__fish_seen_subcommand_from cgroup' -l by -xa 'cpu memory pressure processes'
 complete -c psmore -n '__fish_seen_subcommand_from cgroup' -l limit -xa all
 complete -c psmore -n '__fish_seen_subcommand_from top' -l limit -xa all
@@ -246,8 +263,8 @@ complete -c psmore -n '__fish_seen_subcommand_from file' -F
 complete -c psmore -n '__fish_seen_subcommand_from fd' -l min-count -r
 complete -c psmore -n '__fish_seen_subcommand_from fd' -l min-percent -r
 complete -c psmore -n '__fish_seen_subcommand_from stale listen net watch top oom cgroup doctor' -s q -l query -r
-complete -c psmore -n '__fish_seen_subcommand_from check inspect exe stale service port listen net tree run deleted file fd top oom cgroup doctor diff' -l table
-complete -c psmore -n '__fish_seen_subcommand_from check inspect exe stale service port listen net tree run deleted file fd top oom cgroup doctor diff' -l json
+complete -c psmore -n '__fish_seen_subcommand_from check inspect exe stale service logs port listen net tree run deleted file fd top oom cgroup doctor diff' -l table
+complete -c psmore -n '__fish_seen_subcommand_from check inspect exe stale service logs port listen net tree run deleted file fd top oom cgroup doctor diff' -l json
 complete -c psmore -n '__fish_seen_subcommand_from watch trace' -l jsonl
 complete -c psmore -n '__fish_seen_subcommand_from check stale port listen net deleted file fd oom doctor diff' -l quiet
 complete -c psmore -l redact -d 'Mask common secret values in command lines'
@@ -267,6 +284,7 @@ mod tests {
             "exe",
             "stale",
             "service",
+            "logs",
             "port",
             "listen",
             "net",
@@ -297,7 +315,9 @@ mod tests {
                     shell.label()
                 );
             }
-            for value in ["none", "any", "tcp", "udp", "unix", "all"] {
+            for value in [
+                "none", "any", "tcp", "udp", "unix", "all", "auto", "service", "error", "debug",
+            ] {
                 assert!(
                     script.contains(value),
                     "{} completion is missing {value}",

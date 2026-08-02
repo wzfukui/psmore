@@ -309,8 +309,23 @@ fn redact_token_ranges(value: &str, ranges: Vec<(usize, usize)>) -> String {
         output.push_str(&value[previous_end..start]);
         let token = &value[start..end];
         let rendered = if redact_next {
-            redact_next = false;
-            redacted_token(token)
+            if let Some(redacted) = redact_assignment(token) {
+                redact_next = false;
+                redacted
+            } else {
+                let flag = unquoted(token);
+                if flag.starts_with('-') && !flag.contains('=') && is_secret_key(flag) {
+                    // A prose token such as `AUTH_TOKEN` can look like a bare
+                    // secret key. If the next token is itself an explicit
+                    // secret option, keep that option and redact its value;
+                    // otherwise the option would be hidden while its real
+                    // value remained visible.
+                    token.to_string()
+                } else {
+                    redact_next = false;
+                    redacted_token(token)
+                }
+            }
         } else if let Some(redacted) = redact_assignment(token) {
             redacted
         } else {
@@ -435,6 +450,17 @@ mod terminal_text_tests {
         assert!(redacted.contains("access_token=[REDACTED]&mode=fast"));
         assert!(redacted.contains("Authorization:[REDACTED]"));
         assert!(redacted.contains("--port 8080"));
+    }
+
+    #[test]
+    fn adjacent_secret_like_labels_never_expose_the_actual_option_value() {
+        let redacted = redact_command_secrets("PSMORE_TOKEN --token supersecret");
+        assert_eq!(redacted, "PSMORE_TOKEN --token [REDACTED]");
+        assert!(!redacted.contains("supersecret"));
+
+        let assigned = redact_command_secrets("AUTH_TOKEN --token=supersecret");
+        assert_eq!(assigned, "AUTH_TOKEN --token=[REDACTED]");
+        assert!(!assigned.contains("supersecret"));
     }
 
     #[test]

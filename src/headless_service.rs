@@ -360,7 +360,6 @@ fn optional_u64(properties: &BTreeMap<String, String>, key: &str) -> Option<u64>
 }
 
 #[cfg(target_os = "linux")]
-#[cfg(target_os = "linux")]
 fn optional_i32(properties: &BTreeMap<String, String>, key: &str) -> Option<i32> {
     properties.get(key).and_then(|value| value.parse().ok())
 }
@@ -600,6 +599,17 @@ fn collect_systemd_context(pid: u32) -> ManagerContext {
         },
         suggested_commands: commands,
     }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn systemd_unit_for_pid(pid: u32) -> Result<Option<(String, &'static str)>, String> {
+    let source = format!("/proc/{pid}/cgroup");
+    let content =
+        fs::read_to_string(&source).map_err(|error| format!("cannot read {source}: {error}"))?;
+    Ok(
+        select_systemd_unit(&parse_cgroup_paths(&content))
+            .map(|(unit, scope, _path)| (unit, scope)),
+    )
 }
 
 #[cfg(any(target_os = "macos", test))]

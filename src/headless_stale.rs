@@ -6,7 +6,7 @@ use std::{cmp::Ordering, collections::HashMap, fs, os::unix::fs::MetadataExt, pa
 use serde::Serialize;
 use sysinfo::System;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 use sysinfo::Pid;
 
 use crate::{
@@ -18,10 +18,13 @@ use crate::{
 use crate::{
     headless::CurrentProcessExclusion,
     headless_exe::detect_package,
-    model::{ProcessInfo, process_command_for_output, sanitize_terminal_text},
+    model::{process_command_for_output, sanitize_terminal_text},
     provider::{NativeProcessProvider, ProcessProvider},
     query::ProcessQuery,
 };
+
+#[cfg(any(target_os = "linux", test))]
+use crate::model::ProcessInfo;
 
 const STALE_SCHEMA: &str = "psmore.stale-executables";
 const STALE_SCHEMA_VERSION: u32 = 1;
@@ -249,6 +252,11 @@ pub(crate) fn capture_stale(
             coverage.racing_process_count = coverage.racing_process_count.saturating_add(1);
             continue;
         };
+        if is_linux_kernel_thread(process) {
+            coverage.process_without_executable_count =
+                coverage.process_without_executable_count.saturating_add(1);
+            continue;
+        }
         match inspect_image(pid.as_u32()) {
             Ok(Some(evidence)) => {
                 coverage.scanned_executable_count =
@@ -341,7 +349,11 @@ fn inspect_image(pid: u32) -> Result<Option<ImageEvidence>, ScanError> {
     let running_target = match fs::read_link(&proc_exe) {
         Ok(target) => target.to_string_lossy().to_string(),
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            return Err(ScanError::Unreadable);
+            return if fs::read(format!("{proc_dir}/cmdline")).is_ok_and(|value| value.is_empty()) {
+                Err(ScanError::NoExecutable)
+            } else {
+                Err(ScanError::Unreadable)
+            };
         }
         Err(_) if Path::new(&proc_dir).exists() => return Err(ScanError::NoExecutable),
         Err(_) => return Err(ScanError::Exited),
@@ -398,6 +410,12 @@ fn same_process_instance(before: &ProcessInfo, after: &ProcessInfo) -> bool {
         before.name == after.name
             && process_command_for_output(before) == process_command_for_output(after)
     }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn is_linux_kernel_thread(process: &ProcessInfo) -> bool {
+    let command = process.command.trim();
+    process.executable.is_empty() && command.starts_with('[') && command.ends_with(']')
 }
 
 #[cfg(target_os = "linux")]
@@ -584,6 +602,35 @@ pub(crate) fn render_stale_table(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn process(command: &str, executable: &str) -> ProcessInfo {
+        ProcessInfo {
+            pid: Pid::from_u32(2),
+            parent: Some(Pid::from_u32(0)),
+            name: "kthreadd".into(),
+            command: command.into(),
+            executable: executable.into(),
+            user: "root".into(),
+            cwd: String::new(),
+            cpu: 0.0,
+            memory: 0,
+            read_rate: 0,
+            write_rate: 0,
+            start_time: 1,
+            runtime: 1,
+            status: "Sleep".into(),
+        }
+    }
+
+    #[test]
+    fn kernel_thread_detection_does_not_hide_permission_sensitive_user_processes() {
+        assert!(is_linux_kernel_thread(&process("[kthreadd]", "")));
+        assert!(!is_linux_kernel_thread(&process("sshd: root@pts/0", "")));
+        assert!(!is_linux_kernel_thread(&process(
+            "[ordinary-name]",
+            "/usr/bin/app"
+        )));
+    }
 
     #[test]
     fn policy_never_claims_clean_when_zero_match_collection_is_partial() {

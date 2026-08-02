@@ -72,6 +72,11 @@ pub(crate) const TIPS: &[Tip] = &[
         keys: "v verify image  |  h hash on/off  |  m service context",
     },
     Tip {
+        title: "Read the evidence the process emitted",
+        body: "Open bounded native logs without losing process ownership. Linux follows the systemd unit when available; macOS stays inside the current PID lifetime.",
+        keys: "l logs  |  s scope  |  p priority  |  w window",
+    },
+    Tip {
         title: "Export the context you already collected",
         body: "The report includes the current tree, query, attention findings, events, actions, and any opened diagnostic panels.",
         keys: "o private JSON report",

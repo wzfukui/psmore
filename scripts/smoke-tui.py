@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise psmore's image and manager workspaces through a real PTY."""
+"""Exercise psmore's image, manager, and native-log workspaces in a real PTY."""
 
 from __future__ import annotations
 
@@ -77,6 +77,13 @@ def main() -> int:
         read_until(b"PSMORE SERVICE CONTEXT", 25.0)
         read_until(b"coverage ", 5.0)
 
+        os.write(master, b"l")
+        read_until(b"PSMORE PROCESS LOGS", 25.0)
+        read_until(b"source ", 5.0)
+
+        os.write(master, b"m")
+        read_until(b"PSMORE SERVICE CONTEXT", 25.0)
+
         os.write(master, b"q")
         process.wait(timeout=5.0)
         if process.returncode != 0:
@@ -94,7 +101,7 @@ def main() -> int:
     finally:
         os.close(master)
 
-    print(f"Verified TUI image -> manager workflow for PID {pid}")
+    print(f"Verified TUI image -> manager -> logs -> manager workflow for PID {pid}")
     return 0
 
 
