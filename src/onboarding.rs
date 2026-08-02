@@ -5,7 +5,11 @@ use std::os::unix::fs::DirBuilderExt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::secure_output::write_secure_atomic;
+use crate::{
+    filters::ProcessFilterRule,
+    i18n::{UiLanguage, detect_system_language},
+    secure_output::write_secure_atomic,
+};
 
 const STATE_SCHEMA_VERSION: u32 = 1;
 const STATE_FILE_NAME: &str = "ui-state.json";
@@ -33,8 +37,8 @@ pub(crate) const TIPS: &[Tip] = &[
     },
     Tip {
         title: "Query the whole service tree",
-        body: "Filters understand aggregated descendants. Try tree.mem>2g or tree.procs>=20 to find heavyweight service boundaries.",
-        keys: "/ input  |  Enter apply query  |  Esc clear result",
+        body: "Use F for persistent allow/deny rules, then / for a temporary query. Both understand fields, regex, and descendant aggregates.",
+        keys: "F persistent filters  |  / temporary search  |  Enter apply",
     },
     Tip {
         title: "Find evidence before guessing",
@@ -98,12 +102,89 @@ pub(crate) const TIPS: &[Tip] = &[
     },
 ];
 
+const TIPS_ZH: &[Tip] = &[
+    Tip {
+        title: "还原真实父进程链",
+        body: "选中任意进程并按左方向键。psmore 会显示其父进程和兄弟进程，但不会展开无关分支。",
+        keys: "← 显示父进程  |  → 展开或折叠",
+    },
+    Tip {
+        title: "查询完整服务树",
+        body: "用 F 管理持久包含/排除规则，再用 / 临时搜索；两层都支持字段、正则和后代聚合指标。",
+        keys: "F 持久过滤  |  / 临时搜索  |  Enter 应用",
+    },
+    Tip {
+        title: "先找证据，再作判断",
+        body: "关注事项工作台汇总异常状态、进程抖动、持续 CPU/I/O 和内存增长，形成可复核线索。",
+        keys: "a 关注事项  |  Enter 跳到进程",
+    },
+    Tip {
+        title: "按完整服务排名",
+        body: "热点工作台可在单个进程与完整后代树之间切换，同时保留进程归属上下文。",
+        keys: "h 热点  |  v 进程/子树口径",
+    },
+    Tip {
+        title: "捕获前后基线",
+        body: "在发布或复现前保存基线，再直接比较生命周期和资源变化。",
+        keys: "b 基线  |  d 对比  |  x 清除",
+    },
+    Tip {
+        title: "定位连接背后的进程",
+        body: "网络工作台把监听和对端连接关联到 PID、FD、命名空间、用户和命令。",
+        keys: "n 网络  |  v 监听/全部  |  Enter 跳转",
+    },
+    Tip {
+        title: "冻结现场但保留导航",
+        body: "调查快速变化的进程树时可暂停自动刷新，导航和手工刷新仍然可用。",
+        keys: "Space 暂停/恢复  |  r 立即采样",
+    },
+    Tip {
+        title: "跟踪进程趋势",
+        body: "psmore 保存进程自身和子树的近期样本，识别 PID 复用，并短暂保留退出进程证据。",
+        keys: "t 趋势  |  i CPU/内存或 I/O",
+    },
+    Tip {
+        title: "验证实际运行映像",
+        body: "发布后核对运行映像与磁盘路径、软件包、哈希和代码签名。",
+        keys: "v 验证映像  |  h 哈希开关  |  m 服务上下文",
+    },
+    Tip {
+        title: "读取进程产生的证据",
+        body: "在不丢失进程归属的前提下读取有界原生日志。Linux 可跟随 systemd 单元，macOS 限定在当前 PID 生命周期。",
+        keys: "l 日志  |  s 范围  |  p 等级  |  w 时间窗",
+    },
+    Tip {
+        title: "归因内存，而不是猜测",
+        body: "区分 RSS、PSS、physical footprint、匿名/文件/共享页、Swap 和虚拟映射。",
+        keys: "M 内存  |  r 刷新  |  ↑/↓ 滚动",
+    },
+    Tip {
+        title: "建立单进程事故档案",
+        body: "并行采集进程、服务管理器、运行映像和有界日志证据，再按优先级复核。",
+        keys: "D 档案  |  r 刷新  |  L 日志开关  |  h 哈希",
+    },
+    Tip {
+        title: "导出已经取得的上下文",
+        body: "报告包含当前进程树、查询、关注事项、事件、操作以及已经打开的诊断面板。",
+        keys: "o 私有 JSON 报告",
+    },
+    Tip {
+        title: "进程操作校验实例身份",
+        body: "k 打开 TERM/KILL 专用弹窗，p 打开全部操作。每次发送都需要独立确认并重新核对 PID 启动时间。",
+        keys: "k 结束  |  p 操作  |  y 确认  |  Esc 取消",
+    },
+];
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct StoredState {
     schema_version: u32,
     first_run_completed: bool,
     tips_enabled: bool,
     next_tip_index: usize,
+    #[serde(default)]
+    language: Option<UiLanguage>,
+    #[serde(default)]
+    filters: Vec<ProcessFilterRule>,
 }
 
 impl Default for StoredState {
@@ -113,6 +194,8 @@ impl Default for StoredState {
             first_run_completed: false,
             tips_enabled: true,
             next_tip_index: 0,
+            language: None,
+            filters: Vec::new(),
         }
     }
 }
@@ -123,12 +206,15 @@ pub(crate) struct Guidance {
     state: StoredState,
     path: Option<PathBuf>,
     warning: Option<String>,
+    language: UiLanguage,
 }
 
 impl Guidance {
     #[cfg(test)]
     pub(crate) fn welcome_for_test() -> Self {
-        Self::from_state(StoredState::default(), None, false)
+        let mut guidance = Self::from_state(StoredState::default(), None, false);
+        guidance.language = UiLanguage::English;
+        guidance
     }
 
     #[cfg(test)]
@@ -144,6 +230,7 @@ impl Guidance {
             },
             path: None,
             warning: None,
+            language: UiLanguage::English,
         }
     }
 
@@ -207,12 +294,14 @@ impl Guidance {
         } else {
             None
         };
+        let language = state.language.unwrap_or_else(detect_system_language);
         let mut guidance = Self {
             overlay,
             page: 0,
             state,
             path,
             warning: None,
+            language,
         };
         if matches!(overlay, Some(GuidanceOverlay::Tip(_))) {
             if let Err(error) = guidance.persist() {
@@ -233,9 +322,32 @@ impl Guidance {
 
     pub(crate) fn tip(&self) -> Option<Tip> {
         match self.overlay {
-            Some(GuidanceOverlay::Tip(index)) => TIPS.get(index).copied(),
+            Some(GuidanceOverlay::Tip(index)) => match self.language {
+                UiLanguage::Chinese => TIPS_ZH.get(index).copied(),
+                UiLanguage::English => TIPS.get(index).copied(),
+            },
             _ => None,
         }
+    }
+
+    pub(crate) fn language(&self) -> UiLanguage {
+        self.language
+    }
+
+    pub(crate) fn toggle_language(&mut self) -> io::Result<UiLanguage> {
+        self.language = self.language.next();
+        self.state.language = Some(self.language);
+        self.persist()?;
+        Ok(self.language)
+    }
+
+    pub(crate) fn filters(&self) -> &[ProcessFilterRule] {
+        &self.state.filters
+    }
+
+    pub(crate) fn save_filters(&mut self, filters: &[ProcessFilterRule]) -> io::Result<()> {
+        self.state.filters = filters.to_vec();
+        self.persist()
     }
 
     pub(crate) fn open_help(&mut self) {
@@ -368,6 +480,48 @@ mod tests {
                 0o600
             );
         }
+
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn chinese_and_english_tip_catalogs_stay_in_sync() {
+        assert_eq!(TIPS_ZH.len(), TIPS.len());
+    }
+
+    #[test]
+    fn manual_language_choice_is_persisted() {
+        let directory = test_directory("language");
+        let path = directory.join(STATE_FILE_NAME);
+        let mut guidance = Guidance::load_from_path(path.clone(), true);
+        let initial = guidance.language();
+        let selected = guidance.toggle_language().unwrap();
+        assert_eq!(selected, initial.next());
+
+        let reloaded = Guidance::load_from_path(path.clone(), true);
+        assert_eq!(reloaded.language(), selected);
+
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn process_filters_are_persisted_with_private_ui_preferences() {
+        use crate::filters::FilterAction;
+
+        let directory = test_directory("filters");
+        let path = directory.join(STATE_FILE_NAME);
+        let filters = vec![ProcessFilterRule {
+            action: FilterAction::Exclude,
+            expression: "path~^/System/Library/".into(),
+            enabled: true,
+        }];
+        let mut guidance = Guidance::load_from_path(path.clone(), true);
+        guidance.save_filters(&filters).unwrap();
+
+        let reloaded = Guidance::load_from_path(path.clone(), true);
+        assert_eq!(reloaded.filters(), filters);
 
         fs::remove_file(path).unwrap();
         fs::remove_dir(directory).unwrap();

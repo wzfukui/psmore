@@ -2,6 +2,7 @@ mod actions;
 mod app;
 mod cli;
 mod completion;
+mod filters;
 mod headless;
 mod headless_cgroup;
 mod headless_deleted;
@@ -27,6 +28,7 @@ mod headless_trace;
 mod headless_tree;
 mod headless_watch;
 mod history;
+mod i18n;
 mod inspection;
 mod model;
 mod network;
@@ -2133,6 +2135,9 @@ Max address space         unlimited            unlimited            bytes\n";
                 query_editing: true,
                 query_error: None,
                 query_matches: 1,
+                process_filters: &[],
+                filter_error: None,
+                filtered_processes: 1,
                 paused: true,
                 sort_mode: SortMode::Stable,
                 processes: &processes,
@@ -2165,13 +2170,16 @@ Max address space         unlimited            unlimited            bytes\n";
                 .expect("parse exported report");
 
         assert_eq!(report["schema"], "psmore.diagnostic-report");
-        assert_eq!(report["schema_version"], 8);
+        assert_eq!(report["schema_version"], 9);
         assert_eq!(report["tool"]["name"], "psmore");
         assert_eq!(report["platform"], platform_name());
         assert_eq!(report["selected_pid"], 42);
         assert_eq!(report["active_query"]["input"], "mem>1k !name:service");
         assert_eq!(report["active_query"]["valid"], true);
         assert_eq!(report["active_query"]["matched_process_count"], 1);
+        assert_eq!(report["process_filters"]["valid"], true);
+        assert_eq!(report["process_filters"]["passing_process_count"], 1);
+        assert_eq!(report["process_filters"]["rules"], serde_json::json!([]));
         assert_eq!(report["paused"], true);
         assert_eq!(
             report["collection_status"]["network_scan_in_progress"],

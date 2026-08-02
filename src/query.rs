@@ -1,3 +1,4 @@
+use regex::Regex;
 use sysinfo::Pid;
 
 use crate::model::{ProcessInfo, ResourceAggregate, process_path};
@@ -50,11 +51,15 @@ impl Comparator {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 enum QueryPredicate {
     Text {
         field: TextField,
         value: String,
+    },
+    Regex {
+        field: TextField,
+        pattern: Regex,
     },
     Numeric {
         field: NumericField,
@@ -63,13 +68,13 @@ enum QueryPredicate {
     },
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 struct QueryTerm {
     negated: bool,
     predicate: QueryPredicate,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct ProcessQuery {
     terms: Vec<QueryTerm>,
 }
@@ -77,11 +82,11 @@ pub(crate) struct ProcessQuery {
 impl ProcessQuery {
     pub(crate) fn parse(input: &str) -> Result<Self, String> {
         let mut terms = Vec::new();
-        for raw in input.split_whitespace() {
+        for raw in split_query_terms(input)? {
             let (negated, token) = raw
                 .strip_prefix('!')
                 .map(|token| (true, token))
-                .unwrap_or((false, raw));
+                .unwrap_or((false, raw.as_str()));
             if token.is_empty() {
                 return Err("missing condition after !".into());
             }
@@ -104,6 +109,9 @@ impl ProcessQuery {
                 QueryPredicate::Text { field, value } => {
                     text_value(*field, process).contains(value)
                 }
+                QueryPredicate::Regex { field, pattern } => {
+                    pattern.is_match(&raw_text_value(*field, process))
+                }
                 QueryPredicate::Numeric {
                     field,
                     comparator,
@@ -118,18 +126,65 @@ impl ProcessQuery {
     }
 }
 
+fn split_query_terms(input: &str) -> Result<Vec<String>, String> {
+    let mut terms = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    for character in input.chars() {
+        match quote {
+            Some(active) if character == active => quote = None,
+            Some(_) => current.push(character),
+            None if matches!(character, '\'' | '"')
+                && (current.is_empty()
+                    || current == "!"
+                    || current.ends_with(':')
+                    || current.ends_with('~')) =>
+            {
+                quote = Some(character);
+            }
+            None if character.is_whitespace() => {
+                if !current.is_empty() {
+                    terms.push(std::mem::take(&mut current));
+                }
+            }
+            None => current.push(character),
+        }
+    }
+    if let Some(quote) = quote {
+        return Err(format!("unterminated {quote} quote"));
+    }
+    if !current.is_empty() {
+        terms.push(current);
+    }
+    Ok(terms)
+}
+
+fn text_field(name: &str) -> Option<TextField> {
+    match name.to_ascii_lowercase().as_str() {
+        "" | "any" => Some(TextField::Any),
+        "name" => Some(TextField::Name),
+        "cmd" | "command" => Some(TextField::Command),
+        "path" | "exe" => Some(TextField::Path),
+        "user" => Some(TextField::User),
+        "state" | "status" => Some(TextField::State),
+        _ => None,
+    }
+}
+
 fn parse_predicate(token: &str) -> Result<QueryPredicate, String> {
+    if let Some((field, pattern)) = token
+        .split_once('~')
+        .and_then(|(field, pattern)| text_field(field).map(|field| (field, pattern)))
+    {
+        if pattern.is_empty() {
+            return Err("regex requires a pattern after ~".into());
+        }
+        let pattern = Regex::new(pattern).map_err(|error| format!("invalid regex: {error}"))?;
+        return Ok(QueryPredicate::Regex { field, pattern });
+    }
     if let Some((field, value)) = token.split_once(':') {
         let normalized = field.to_ascii_lowercase();
-        let text_field = match normalized.as_str() {
-            "name" => Some(TextField::Name),
-            "cmd" | "command" => Some(TextField::Command),
-            "path" | "exe" => Some(TextField::Path),
-            "user" => Some(TextField::User),
-            "state" | "status" => Some(TextField::State),
-            _ => None,
-        };
-        if let Some(field) = text_field {
+        if let Some(field) = text_field(&normalized).filter(|field| *field != TextField::Any) {
             if value.is_empty() {
                 return Err(format!("{normalized}: requires a value"));
             }
@@ -281,6 +336,10 @@ fn parse_duration(value: &str) -> Result<f64, String> {
 }
 
 fn text_value(field: TextField, process: &ProcessInfo) -> String {
+    raw_text_value(field, process).to_lowercase()
+}
+
+fn raw_text_value(field: TextField, process: &ProcessInfo) -> String {
     match field {
         TextField::Any => format!(
             "{} {} {} {} {} {} {}",
@@ -298,7 +357,6 @@ fn text_value(field: TextField, process: &ProcessInfo) -> String {
         TextField::User => process.user.clone(),
         TextField::State => process.status.clone(),
     }
-    .to_lowercase()
 }
 
 fn numeric_value(
@@ -385,6 +443,32 @@ mod tests {
                 .expect("parse negation")
                 .matches(&process(), subtree(), 3)
         );
+    }
+
+    #[test]
+    fn supports_quoted_text_and_field_scoped_regular_expressions() {
+        let mut candidate = process();
+        candidate.executable = "/Applications/Example Worker.app/Contents/MacOS/worker".into();
+        candidate.command = format!("{} --serve", candidate.executable);
+
+        assert!(
+            ProcessQuery::parse("path:\"/Applications/Example Worker.app\"")
+                .unwrap()
+                .matches(&candidate, subtree(), 3)
+        );
+        assert!(
+            ProcessQuery::parse(r"path~^/Applications/.+\.app/Contents/MacOS/worker$")
+                .unwrap()
+                .matches(&candidate, subtree(), 3)
+        );
+        assert!(
+            ProcessQuery::parse(r"!name~^worker$")
+                .unwrap()
+                .matches(&candidate, subtree(), 3)
+        );
+        assert!(ProcessQuery::parse("path~[").is_err());
+        assert!(ProcessQuery::parse("path:'unterminated").is_err());
+        assert!(ProcessQuery::parse("name:Bob's").is_ok());
     }
 
     #[test]

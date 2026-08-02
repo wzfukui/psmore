@@ -14,11 +14,14 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     actions::{ProcessActionKind, ProcessActionOutcome, ProcessActionRecord},
     app::App,
+    filters::FilterAction,
+    i18n::{UiLanguage, text},
     model::{
         AttentionSeverity, HotspotMetric, HotspotScope, InspectionField, ProcessChange,
-        ProcessEvent, ProcessInspection, TreeRow, TrendView, process_command_line, process_path,
+        ProcessEvent, ProcessInspection, SortMode, TreeRow, TrendView, process_command_line,
+        process_path,
     },
-    network::NetworkEndpoint,
+    network::{NetworkEndpoint, NetworkScope},
     onboarding::{GUIDANCE_PAGE_COUNT, GuidanceOverlay, TIPS},
     provider::platform_name,
     snapshot::{ProcessSnapshotEntry, SnapshotDiff},
@@ -222,6 +225,7 @@ fn action_line(record: &ProcessActionRecord) -> Line<'static> {
 }
 
 fn draw_event_overlay(frame: &mut Frame, app: &App, area: Rect) {
+    let language = app.language();
     let width = area.width.saturating_sub(2).clamp(1, 100);
     let height = area.height.saturating_sub(2).clamp(1, 18);
     let popup = Rect::new(
@@ -234,7 +238,7 @@ fn draw_event_overlay(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines = Vec::with_capacity(line_limit);
     if !app.action_history.is_empty() && line_limit > 0 {
         lines.push(Line::from(Span::styled(
-            " ACTIONS",
+            text(language, " ACTIONS", " 操作记录"),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -250,7 +254,7 @@ fn draw_event_overlay(frame: &mut Frame, app: &App, area: Rect) {
     }
     if !app.events.is_empty() && lines.len() < line_limit {
         lines.push(Line::from(Span::styled(
-            " PROCESS CHANGES",
+            text(language, " PROCESS CHANGES", " 进程变化"),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -259,13 +263,24 @@ fn draw_event_overlay(frame: &mut Frame, app: &App, area: Rect) {
         lines.extend(app.events.iter().rev().take(remaining).map(event_line));
     }
     if lines.is_empty() {
-        lines.push(Line::from(" No process changes or actions captured yet "));
+        lines.push(Line::from(text(
+            language,
+            " No process changes or actions captured yet ",
+            " 尚未捕获进程变化或人工操作 ",
+        )));
     }
-    let title = format!(
-        " activity  changes {} / actions {}  Esc/e close ",
-        app.events.len(),
-        app.action_history.len()
-    );
+    let title = match language {
+        UiLanguage::English => format!(
+            " activity  changes {} / actions {}  Esc/e close ",
+            app.events.len(),
+            app.action_history.len()
+        ),
+        UiLanguage::Chinese => format!(
+            " 活动审计  变化 {} / 操作 {}  Esc/e 关闭 ",
+            app.events.len(),
+            app.action_history.len()
+        ),
+    };
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines)
@@ -284,6 +299,17 @@ fn process_action_color(action: ProcessActionKind) -> Color {
     }
 }
 
+fn process_action_description(language: UiLanguage, action: ProcessActionKind) -> &'static str {
+    match action {
+        ProcessActionKind::Terminate => {
+            text(language, "request a graceful shutdown", "请求进程正常退出")
+        }
+        ProcessActionKind::Kill => text(language, "force immediate termination", "强制立即终止"),
+        ProcessActionKind::Stop => text(language, "suspend process execution", "暂停进程执行"),
+        ProcessActionKind::Continue => text(language, "resume a stopped process", "恢复已暂停进程"),
+    }
+}
+
 fn draw_process_action_overlay(frame: &mut Frame, app: &App, area: Rect) {
     let Some(dialog) = &app.process_action else {
         return;
@@ -297,6 +323,7 @@ fn draw_process_action_overlay(frame: &mut Frame, app: &App, area: Rect) {
         height,
     );
     let target = &dialog.target;
+    let language = app.language();
     let mut lines = vec![
         Line::from(vec![
             Span::styled(
@@ -316,7 +343,12 @@ fn draw_process_action_overlay(frame: &mut Frame, app: &App, area: Rect) {
     let title;
     if dialog.confirming {
         let action = dialog.selected_action();
-        title = format!(" confirm {}  Esc back ", action.label());
+        title = format!(
+            " {} {}  Esc {} ",
+            text(language, "confirm", "确认"),
+            action.label(),
+            text(language, "back", "返回")
+        );
         lines.extend([
             Line::from(vec![
                 Span::styled(
@@ -325,36 +357,60 @@ fn draw_process_action_overlay(frame: &mut Frame, app: &App, area: Rect) {
                         .fg(process_action_color(action))
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(action.description()),
+                Span::raw(process_action_description(language, action)),
             ]),
             Line::from(""),
             Line::from(Span::styled(
                 if action == ProcessActionKind::Kill {
-                    "KILL cannot be handled or cleaned up by the target process."
+                    text(
+                        language,
+                        "KILL cannot be handled or cleaned up by the target process.",
+                        "KILL 无法被目标进程捕获，也不会给它清理资源的机会。",
+                    )
                 } else {
-                    "This changes the live process and may affect its complete service tree."
+                    text(
+                        language,
+                        "This changes the live process and may affect its complete service tree.",
+                        "该操作会改变正在运行的进程，并可能影响其完整服务树。",
+                    )
                 },
                 Style::default().fg(Color::LightRed),
             )),
-            Line::from(
+            Line::from(text(
+                language,
                 "Before sending, psmore will re-check the PID start time and refuse PID reuse.",
-            ),
+                "发送前 psmore 会重新核对 PID 启动时间，发现 PID 复用时拒绝操作。",
+            )),
             Line::from(""),
             Line::from(vec![
                 Span::styled(
-                    "Press y to send the signal",
+                    text(language, "Press y to send the signal", "按 y 发送信号"),
                     Style::default()
                         .fg(Color::LightYellow)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw("  ·  Esc returns without changing the process"),
+                Span::raw(text(
+                    language,
+                    "  ·  Esc returns without changing the process",
+                    "  ·  Esc 返回且不改变进程",
+                )),
             ]),
         ]);
     } else {
         title = if dialog.is_termination_only() {
-            " end process  ↑↓/Tab choose  Enter review  Esc close ".into()
+            text(
+                language,
+                " end process  ↑↓/Tab choose  Enter review  Esc close ",
+                " 结束进程  ↑↓/Tab 选择  Enter 复核  Esc 关闭 ",
+            )
+            .into()
         } else {
-            " process actions  ↑↓/Tab choose  Enter review  Esc/p close ".into()
+            text(
+                language,
+                " process actions  ↑↓/Tab choose  Enter review  Esc/p close ",
+                " 进程操作  ↑↓/Tab 选择  Enter 复核  Esc/p 关闭 ",
+            )
+            .into()
         };
         for (index, action) in dialog.actions().iter().copied().enumerate() {
             let marker = if index == dialog.selected { "▸" } else { " " };
@@ -371,7 +427,7 @@ fn draw_process_action_overlay(frame: &mut Frame, app: &App, area: Rect) {
                     " {marker} [{}] {:<5}  {}",
                     action.shortcut(),
                     action.label(),
-                    action.description()
+                    process_action_description(language, action)
                 ),
                 style,
             )));
@@ -379,7 +435,11 @@ fn draw_process_action_overlay(frame: &mut Frame, app: &App, area: Rect) {
         lines.extend([
             Line::from(""),
             Line::from(Span::styled(
-                "No signal is sent here: review the next screen, then press y to confirm.",
+                text(
+                    language,
+                    "No signal is sent here: review the next screen, then press y to confirm.",
+                    "此处不会发送信号：请在下一页复核，然后按 y 确认。",
+                ),
                 Style::default().fg(Color::DarkGray),
             )),
         ]);
@@ -390,6 +450,193 @@ fn draw_process_action_overlay(frame: &mut Frame, app: &App, area: Rect) {
             .block(Block::default().borders(Borders::ALL).title(title))
             .wrap(Wrap { trim: false }),
         popup,
+    );
+}
+
+fn filter_action_label(language: UiLanguage, action: FilterAction) -> &'static str {
+    match action {
+        FilterAction::Include => text(language, "ALLOW", "包含"),
+        FilterAction::Exclude => text(language, "DENY", "排除"),
+    }
+}
+
+fn draw_filter_manager_overlay(frame: &mut Frame, app: &App, area: Rect) {
+    let language = app.language();
+    let width = area.width.saturating_sub(2).clamp(1, 132);
+    let height = area.height.saturating_sub(2).clamp(1, 22);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+
+    if let Some(editor) = &app.filter_editor {
+        let operation = if editor.editing_index.is_some() {
+            text(language, "edit", "编辑")
+        } else {
+            text(language, "add", "新增")
+        };
+        let title = format!(
+            " {} {} {}  Tab {}  Enter {}  Esc {} ",
+            operation,
+            filter_action_label(language, editor.action),
+            text(language, "filter", "规则"),
+            text(language, "allow/deny", "包含/排除"),
+            text(language, "save", "保存"),
+            text(language, "cancel", "取消")
+        );
+        let mut lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                text(
+                    language,
+                    "One rule is an AND expression. Multiple ALLOW rules are OR; any DENY rule wins.",
+                    "单条规则内部为 AND；多条包含规则之间为 OR；任一排除规则命中即隐藏。",
+                ),
+                Style::default().fg(Color::LightCyan),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(
+                    format!(" {}  ", filter_action_label(language, editor.action)),
+                    Style::default()
+                        .fg(if editor.action == FilterAction::Include {
+                            Color::LightGreen
+                        } else {
+                            Color::LightRed
+                        })
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!("{}▏", editor.input)),
+            ]),
+            Line::from(""),
+            Line::from(text(
+                language,
+                " Text: path:/System/Library  ·  combined: path:/opt name:python",
+                " 文本：path:/System/Library  ·  组合：path:/opt name:python",
+            )),
+            Line::from(text(
+                language,
+                r" Regex: path~^/Applications/(ChatGPT|Otty)\.app/  (case-sensitive; (?i) supported)",
+                r" 正则：path~^/Applications/(ChatGPT|Otty)\.app/（区分大小写；支持 (?i)）",
+            )),
+            Line::from(text(
+                language,
+                " Spaces: path:\"/Applications/Google Chrome.app\"  ·  fields: any/name/cmd/path/user/state",
+                " 空格：path:\"/Applications/Google Chrome.app\"  ·  字段：any/name/cmd/path/user/state",
+            )),
+        ];
+        if let Some(error) = &editor.error {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!(" {}: {error}", text(language, "error", "错误")),
+                Style::default().fg(Color::LightRed),
+            )));
+        }
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(Block::default().borders(Borders::ALL).title(title))
+                .wrap(Wrap { trim: false }),
+            popup,
+        );
+        return;
+    }
+
+    let footer_height = 5;
+    let chunks =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(footer_height)]).split(popup);
+    let items: Vec<ListItem> = if app.process_filters.is_empty() {
+        vec![
+            ListItem::new(text(
+                language,
+                " No filters. Press a to add an ALLOW rule or x to add a DENY rule.",
+                " 暂无过滤规则。按 a 新增包含规则，或按 x 新增排除规则。",
+            ))
+            .style(Style::default().fg(Color::DarkGray)),
+        ]
+    } else {
+        app.process_filters
+            .iter()
+            .enumerate()
+            .map(|(index, rule)| {
+                let enabled = if rule.enabled { "●" } else { "○" };
+                let style = if rule.enabled {
+                    Style::default().fg(if rule.action == FilterAction::Include {
+                        Color::LightGreen
+                    } else {
+                        Color::LightRed
+                    })
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                ListItem::new(format!(
+                    " {:>2}. {enabled} {:<5}  {}",
+                    index + 1,
+                    filter_action_label(language, rule.action),
+                    rule.expression
+                ))
+                .style(style)
+            })
+            .collect()
+    };
+    let title = format!(
+        " {}  {} {}/{}  {} {}/{} ",
+        text(language, "process filters", "进程过滤器"),
+        text(language, "active", "启用"),
+        app.active_filter_count(),
+        app.process_filters.len(),
+        text(language, "passing", "通过"),
+        app.filtered_processes,
+        app.processes.len().saturating_sub(1)
+    );
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
+    let mut state = ListState::default();
+    if !app.process_filters.is_empty() {
+        state.select(Some(app.filter_selected));
+    }
+    frame.render_stateful_widget(list, chunks[0], &mut state);
+
+    let error_style = if app.filter_error.is_some() {
+        Style::default().fg(Color::LightRed)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let error = app
+        .filter_error
+        .as_ref()
+        .map(|error| format!(" {}: {error}", text(language, "error", "错误")))
+        .unwrap_or_else(|| {
+            text(
+                language,
+                " Rules run before / search; parent rows may remain as relationship context.",
+                " 规则先于 / 搜索执行；父进程行可能作为关系上下文保留。",
+            )
+            .into()
+        });
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(text(
+                language,
+                " a allow  x deny  Enter/e edit  Space enable  d delete  ↑↓ move  F/Esc close",
+                " a 包含  x 排除  Enter/e 编辑  Space 启停  d 删除  ↑↓ 移动  F/Esc 关闭",
+            )),
+            Line::from(Span::styled(error, error_style)),
+            Line::from(text(
+                language,
+                " Text matching is case-insensitive. Regex is case-sensitive unless it uses (?i).",
+                " 文本匹配不区分大小写；正则默认区分大小写，可使用 (?i)。",
+            )),
+        ]),
+        chunks[1],
     );
 }
 
@@ -589,6 +836,7 @@ fn draw_inspection_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         width,
         height,
     );
+    let language = app.language();
     let mut lines = inspection_lines(inspection);
     let inspection_status = if app.inspection_is_scanning() {
         let elapsed = app.inspection_elapsed();
@@ -596,17 +844,24 @@ fn draw_inspection_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         lines.insert(
             0,
             Line::from(Span::styled(
-                format!(
-                    " {} collecting process context in the background ({:.1}s)",
-                    activity_spinner(elapsed),
-                    elapsed.as_secs_f64()
-                ),
+                match language {
+                    UiLanguage::English => format!(
+                        " {} collecting process context in the background ({:.1}s)",
+                        activity_spinner(elapsed),
+                        elapsed.as_secs_f64()
+                    ),
+                    UiLanguage::Chinese => format!(
+                        " {} 正在后台采集进程上下文（{:.1}s）",
+                        activity_spinner(elapsed),
+                        elapsed.as_secs_f64()
+                    ),
+                },
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             )),
         );
-        "  scanning"
+        text(language, "  scanning", "  采集中")
     } else {
         ""
     };
@@ -620,10 +875,16 @@ fn draw_inspection_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         .saturating_sub(content_height)
         .min(u16::MAX as usize) as u16;
     app.inspection_scroll = app.inspection_scroll.min(max_scroll);
-    let title = format!(
-        " inspect {} [{}]{}  Enter/r refresh  ↑↓ scroll  M memory  D dossier  Esc close ",
-        inspection.name, inspection.pid, inspection_status
-    );
+    let title = match language {
+        UiLanguage::English => format!(
+            " inspect {} [{}]{}  Enter/r refresh  ↑↓ scroll  M memory  D dossier  Esc close ",
+            inspection.name, inspection.pid, inspection_status
+        ),
+        UiLanguage::Chinese => format!(
+            " 深度检查 {} [{}]{}  Enter/r 刷新  ↑↓ 滚动  M 内存  D 档案  Esc 关闭 ",
+            inspection.name, inspection.pid, inspection_status
+        ),
+    };
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines)
@@ -646,15 +907,23 @@ fn draw_dossier_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         width,
         height,
     );
+    let language = app.language();
     let mut lines = Vec::new();
     if app.dossier_context_is_scanning() {
         let elapsed = app.dossier_context_elapsed();
         lines.push(Line::from(Span::styled(
-            format!(
-                " {} collecting process dossier in parallel ({:.1}s)",
-                activity_spinner(elapsed),
-                elapsed.as_secs_f64()
-            ),
+            match language {
+                UiLanguage::English => format!(
+                    " {} collecting process dossier in parallel ({:.1}s)",
+                    activity_spinner(elapsed),
+                    elapsed.as_secs_f64()
+                ),
+                UiLanguage::Chinese => format!(
+                    " {} 正在并行采集进程档案（{:.1}s）",
+                    activity_spinner(elapsed),
+                    elapsed.as_secs_f64()
+                ),
+            },
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -709,7 +978,7 @@ fn draw_dossier_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
-            " No process dossier available",
+            text(language, " No process dossier available", " 暂无进程档案"),
             Style::default().fg(Color::DarkGray),
         )));
     }
@@ -724,7 +993,7 @@ fn draw_dossier_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         .min(u16::MAX as usize) as u16;
     app.dossier_context_scroll = app.dossier_context_scroll.min(max_scroll);
     let scanning = if app.dossier_context_is_scanning() {
-        " scanning"
+        text(language, " scanning", " 采集中")
     } else {
         ""
     };
@@ -739,10 +1008,16 @@ fn draw_dossier_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         "logs off".into()
     };
     let hash = if panel.hash { "hash on" } else { "hash off" };
-    let title = format!(
-        " dossier {} [{}]{}  {}  {}  r refresh  s/p/w logs  h hash  L logs  i/M/m/v/l evidence  D/Esc close ",
-        panel.name, panel.pid, scanning, logs, hash
-    );
+    let title = match language {
+        UiLanguage::English => format!(
+            " dossier {} [{}]{}  {}  {}  r refresh  s/p/w logs  h hash  L logs  i/M/m/v/l evidence  D/Esc close ",
+            panel.name, panel.pid, scanning, logs, hash
+        ),
+        UiLanguage::Chinese => format!(
+            " 进程档案 {} [{}]{}  {}  {}  r 刷新  s/p/w 日志  h 哈希  L 日志开关  i/M/m/v/l 证据  D/Esc 关闭 ",
+            panel.name, panel.pid, scanning, logs, hash
+        ),
+    };
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines)
@@ -765,15 +1040,23 @@ fn draw_memory_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         width,
         height,
     );
+    let language = app.language();
     let mut lines = Vec::new();
     if app.memory_context_is_scanning() {
         let elapsed = app.memory_context_elapsed();
         lines.push(Line::from(Span::styled(
-            format!(
-                " {} attributing process memory in the background ({:.1}s)",
-                activity_spinner(elapsed),
-                elapsed.as_secs_f64()
-            ),
+            match language {
+                UiLanguage::English => format!(
+                    " {} attributing process memory in the background ({:.1}s)",
+                    activity_spinner(elapsed),
+                    elapsed.as_secs_f64()
+                ),
+                UiLanguage::Chinese => format!(
+                    " {} 正在后台归因进程内存（{:.1}s）",
+                    activity_spinner(elapsed),
+                    elapsed.as_secs_f64()
+                ),
+            },
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -820,7 +1103,11 @@ fn draw_memory_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
-            " No process memory evidence available",
+            text(
+                language,
+                " No process memory evidence available",
+                " 暂无进程内存证据",
+            ),
             Style::default().fg(Color::DarkGray),
         )));
     }
@@ -835,14 +1122,20 @@ fn draw_memory_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         .min(u16::MAX as usize) as u16;
     app.memory_context_scroll = app.memory_context_scroll.min(max_scroll);
     let scanning = if app.memory_context_is_scanning() {
-        "  scanning"
+        text(language, "  scanning", "  采集中")
     } else {
         ""
     };
-    let title = format!(
-        " memory {} [{}]{}  Enter/r refresh  ↑↓ scroll  D dossier  i/m/v/l evidence  M/Esc close ",
-        panel.name, panel.pid, scanning
-    );
+    let title = match language {
+        UiLanguage::English => format!(
+            " memory {} [{}]{}  Enter/r refresh  ↑↓ scroll  D dossier  i/m/v/l evidence  M/Esc close ",
+            panel.name, panel.pid, scanning
+        ),
+        UiLanguage::Chinese => format!(
+            " 内存归因 {} [{}]{}  Enter/r 刷新  ↑↓ 滚动  D 档案  i/m/v/l 证据  M/Esc 关闭 ",
+            panel.name, panel.pid, scanning
+        ),
+    };
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines)
@@ -865,15 +1158,23 @@ fn draw_service_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         width,
         height,
     );
+    let language = app.language();
     let mut lines = Vec::new();
     if app.service_context_is_scanning() {
         let elapsed = app.service_context_elapsed();
         lines.push(Line::from(Span::styled(
-            format!(
-                " {} resolving systemd/launchd ownership in the background ({:.1}s)",
-                activity_spinner(elapsed),
-                elapsed.as_secs_f64()
-            ),
+            match language {
+                UiLanguage::English => format!(
+                    " {} resolving systemd/launchd ownership in the background ({:.1}s)",
+                    activity_spinner(elapsed),
+                    elapsed.as_secs_f64()
+                ),
+                UiLanguage::Chinese => format!(
+                    " {} 正在后台解析 systemd/launchd 归属（{:.1}s）",
+                    activity_spinner(elapsed),
+                    elapsed.as_secs_f64()
+                ),
+            },
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -909,7 +1210,11 @@ fn draw_service_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
-            " No service context available",
+            text(
+                language,
+                " No service context available",
+                " 暂无服务管理上下文",
+            ),
             Style::default().fg(Color::DarkGray),
         )));
     }
@@ -924,14 +1229,20 @@ fn draw_service_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         .min(u16::MAX as usize) as u16;
     app.service_context_scroll = app.service_context_scroll.min(max_scroll);
     let scanning = if app.service_context_is_scanning() {
-        "  scanning"
+        text(language, "  scanning", "  采集中")
     } else {
         ""
     };
-    let title = format!(
-        " manager {} [{}]{}  Enter/r refresh  ↑↓ scroll  M memory  D dossier  v verify  l logs  m/Esc close ",
-        panel.name, panel.pid, scanning
-    );
+    let title = match language {
+        UiLanguage::English => format!(
+            " manager {} [{}]{}  Enter/r refresh  ↑↓ scroll  M memory  D dossier  v verify  l logs  m/Esc close ",
+            panel.name, panel.pid, scanning
+        ),
+        UiLanguage::Chinese => format!(
+            " 服务管理 {} [{}]{}  Enter/r 刷新  ↑↓ 滚动  M 内存  D 档案  v 映像  l 日志  m/Esc 关闭 ",
+            panel.name, panel.pid, scanning
+        ),
+    };
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines)
@@ -954,15 +1265,23 @@ fn draw_executable_context_overlay(frame: &mut Frame, app: &mut App, area: Rect)
         width,
         height,
     );
+    let language = app.language();
     let mut lines = Vec::new();
     if app.executable_context_is_scanning() {
         let elapsed = app.executable_context_elapsed();
         lines.push(Line::from(Span::styled(
-            format!(
-                " {} verifying executable image and provenance in the background ({:.1}s)",
-                activity_spinner(elapsed),
-                elapsed.as_secs_f64()
-            ),
+            match language {
+                UiLanguage::English => format!(
+                    " {} verifying executable image and provenance in the background ({:.1}s)",
+                    activity_spinner(elapsed),
+                    elapsed.as_secs_f64()
+                ),
+                UiLanguage::Chinese => format!(
+                    " {} 正在后台验证运行映像及来源（{:.1}s）",
+                    activity_spinner(elapsed),
+                    elapsed.as_secs_f64()
+                ),
+            },
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -1008,7 +1327,11 @@ fn draw_executable_context_overlay(frame: &mut Frame, app: &mut App, area: Rect)
     }
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
-            " No executable image evidence available",
+            text(
+                language,
+                " No executable image evidence available",
+                " 暂无运行映像证据",
+            ),
             Style::default().fg(Color::DarkGray),
         )));
     }
@@ -1023,15 +1346,21 @@ fn draw_executable_context_overlay(frame: &mut Frame, app: &mut App, area: Rect)
         .min(u16::MAX as usize) as u16;
     app.executable_context_scroll = app.executable_context_scroll.min(max_scroll);
     let scanning = if app.executable_context_is_scanning() {
-        "  scanning"
+        text(language, "  scanning", "  采集中")
     } else {
         ""
     };
     let hash = if panel.hash { "hash on" } else { "hash off" };
-    let title = format!(
-        " verify image {} [{}]{}  {}  Enter/r refresh  h hash  M memory  D dossier  m manager  l logs  v/Esc close ",
-        panel.name, panel.pid, scanning, hash
-    );
+    let title = match language {
+        UiLanguage::English => format!(
+            " verify image {} [{}]{}  {}  Enter/r refresh  h hash  M memory  D dossier  m manager  l logs  v/Esc close ",
+            panel.name, panel.pid, scanning, hash
+        ),
+        UiLanguage::Chinese => format!(
+            " 验证映像 {} [{}]{}  {}  Enter/r 刷新  h 哈希  M 内存  D 档案  m 管理器  l 日志  v/Esc 关闭 ",
+            panel.name, panel.pid, scanning, hash
+        ),
+    };
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines)
@@ -1064,15 +1393,23 @@ fn draw_logs_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         width,
         height,
     );
+    let language = app.language();
     let mut lines = Vec::new();
     if app.logs_context_is_scanning() {
         let elapsed = app.logs_context_elapsed();
         lines.push(Line::from(Span::styled(
-            format!(
-                " {} reading bounded native logs in the background ({:.1}s)",
-                activity_spinner(elapsed),
-                elapsed.as_secs_f64()
-            ),
+            match language {
+                UiLanguage::English => format!(
+                    " {} reading bounded native logs in the background ({:.1}s)",
+                    activity_spinner(elapsed),
+                    elapsed.as_secs_f64()
+                ),
+                UiLanguage::Chinese => format!(
+                    " {} 正在后台读取有界原生日志（{:.1}s）",
+                    activity_spinner(elapsed),
+                    elapsed.as_secs_f64()
+                ),
+            },
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -1112,7 +1449,11 @@ fn draw_logs_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
-            " No native log evidence available",
+            text(
+                language,
+                " No native log evidence available",
+                " 暂无原生日志证据",
+            ),
             Style::default().fg(Color::DarkGray),
         )));
     }
@@ -1127,19 +1468,30 @@ fn draw_logs_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         .min(u16::MAX as usize) as u16;
     app.logs_context_scroll = app.logs_context_scroll.min(max_scroll);
     let scanning = if app.logs_context_is_scanning() {
-        "  scanning"
+        text(language, "  scanning", "  采集中")
     } else {
         ""
     };
-    let title = format!(
-        " logs {} [{}]{}  scope {}  <= {}  {}  r refresh  s scope  p level  w window  M memory  D dossier  m/v context  l/Esc close ",
-        panel.name,
-        panel.pid,
-        scanning,
-        panel.scope.label(),
-        panel.priority.label(),
-        compact_duration(panel.since_seconds),
-    );
+    let title = match language {
+        UiLanguage::English => format!(
+            " logs {} [{}]{}  scope {}  <= {}  {}  r refresh  s scope  p level  w window  M memory  D dossier  m/v context  l/Esc close ",
+            panel.name,
+            panel.pid,
+            scanning,
+            panel.scope.label(),
+            panel.priority.label(),
+            compact_duration(panel.since_seconds),
+        ),
+        UiLanguage::Chinese => format!(
+            " 日志 {} [{}]{}  范围 {}  <= {}  {}  r 刷新  s 范围  p 等级  w 窗口  M 内存  D 档案  m/v 上下文  l/Esc 关闭 ",
+            panel.name,
+            panel.pid,
+            scanning,
+            panel.scope.label(),
+            panel.priority.label(),
+            compact_duration(panel.since_seconds),
+        ),
+    };
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines)
@@ -1197,23 +1549,33 @@ fn draw_trend_overlay(frame: &mut Frame, app: &App, area: Rect) {
         width,
         height,
     );
+    let language = app.language();
     let name = app
         .processes
         .get(&pid)
         .map(|process| process.name.as_str())
         .or_else(|| app.history.name(pid))
-        .unwrap_or("exited process");
-    let title = format!(
-        " trends {name} [{pid}]  {}  i switch  t/Esc close  r sample ",
-        app.trend_view.label()
-    );
+        .unwrap_or(text(language, "exited process", "已退出进程"));
+    let title = match language {
+        UiLanguage::English => format!(
+            " trends {name} [{pid}]  {}  i switch  t/Esc close  r sample ",
+            app.trend_view.label()
+        ),
+        UiLanguage::Chinese => format!(
+            " 趋势 {name} [{pid}]  {}  i 切换  t/Esc 关闭  r 采样 ",
+            app.trend_view.label()
+        ),
+    };
     let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(popup);
     frame.render_widget(Clear, popup);
     frame.render_widget(block, popup);
 
     let Some(samples) = app.history.samples(pid) else {
-        frame.render_widget(Paragraph::new("No samples available"), inner);
+        frame.render_widget(
+            Paragraph::new(text(language, "No samples available", "暂无样本")),
+            inner,
+        );
         return;
     };
     if inner.height < 10 || inner.width < 10 {
@@ -1424,6 +1786,43 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.1} KB", bytes as f64 / 1024.0)
     } else {
         format!("{bytes} B")
+    }
+}
+
+fn sort_label(language: UiLanguage, mode: SortMode) -> &'static str {
+    match (language, mode) {
+        (UiLanguage::English, _) => mode.label(),
+        (UiLanguage::Chinese, SortMode::Stable) => "稳定",
+        (UiLanguage::Chinese, SortMode::SubtreeCpu) => "子树 CPU",
+        (UiLanguage::Chinese, SortMode::SubtreeMemory) => "子树内存",
+        (UiLanguage::Chinese, SortMode::SubtreeRead) => "子树读",
+        (UiLanguage::Chinese, SortMode::SubtreeWrite) => "子树写",
+    }
+}
+
+fn hotspot_metric_label(language: UiLanguage, metric: HotspotMetric) -> &'static str {
+    match (language, metric) {
+        (UiLanguage::English, _) => metric.label(),
+        (UiLanguage::Chinese, HotspotMetric::Cpu) => "CPU",
+        (UiLanguage::Chinese, HotspotMetric::Memory) => "内存",
+        (UiLanguage::Chinese, HotspotMetric::Read) => "磁盘读",
+        (UiLanguage::Chinese, HotspotMetric::Write) => "磁盘写",
+    }
+}
+
+fn hotspot_scope_label(language: UiLanguage, scope: HotspotScope) -> &'static str {
+    match (language, scope) {
+        (UiLanguage::English, _) => scope.label(),
+        (UiLanguage::Chinese, HotspotScope::Process) => "进程自身",
+        (UiLanguage::Chinese, HotspotScope::Subtree) => "服务子树",
+    }
+}
+
+fn network_scope_label(language: UiLanguage, scope: NetworkScope) -> &'static str {
+    match (language, scope) {
+        (UiLanguage::English, _) => scope.label(),
+        (UiLanguage::Chinese, NetworkScope::Listeners) => "监听",
+        (UiLanguage::Chinese, NetworkScope::All) => "全部连接",
     }
 }
 
@@ -1671,6 +2070,7 @@ fn draw_snapshot_diff_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         width,
         height,
     );
+    let language = app.language();
     let diff = baseline.diff(&app.processes, &app.resources);
     let lines = snapshot_diff_lines(&diff);
     let content_height = height.saturating_sub(4) as usize;
@@ -1695,13 +2095,22 @@ fn draw_snapshot_diff_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
             )
         })
         .unwrap_or_else(|| "system totals unavailable".into());
-    let title = format!(
-        " baseline diff {}s  {}→{} proc  {}  ↑↓ scroll  b reset  x clear  d/Esc close ",
-        age,
-        baseline.len(),
-        current_count,
-        system
-    );
+    let title = match language {
+        UiLanguage::English => format!(
+            " baseline diff {}s  {}→{} proc  {}  ↑↓ scroll  b reset  x clear  d/Esc close ",
+            age,
+            baseline.len(),
+            current_count,
+            system
+        ),
+        UiLanguage::Chinese => format!(
+            " 基线对比 {}s  {}→{} 进程  {}  ↑↓ 滚动  b 重置  x 清除  d/Esc 关闭 ",
+            age,
+            baseline.len(),
+            current_count,
+            system
+        ),
+    };
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines)
@@ -1739,6 +2148,7 @@ fn activity_spinner(elapsed: Duration) -> &'static str {
 }
 
 fn draw_network_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
+    let language = app.language();
     let width = area.width.saturating_sub(2).clamp(1, 150);
     let height = area.height.saturating_sub(2).max(1);
     let popup = Rect::new(
@@ -1755,24 +2165,34 @@ fn draw_network_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
             Paragraph::new(vec![
                 Line::from(""),
                 Line::from(Span::styled(
-                    format!(
-                        " {spinner} collecting TCP, UDP and Unix endpoints in the background ({:.1}s)",
-                        elapsed.as_secs_f64()
-                    ),
+                    match language {
+                        UiLanguage::English => format!(
+                            " {spinner} collecting TCP, UDP and Unix endpoints in the background ({:.1}s)",
+                            elapsed.as_secs_f64()
+                        ),
+                        UiLanguage::Chinese => format!(
+                            " {spinner} 正在后台采集 TCP、UDP 和 Unix 端点（{:.1}s）",
+                            elapsed.as_secs_f64()
+                        ),
+                    },
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    " The process tree remains live. Press n/Esc to close; the scan may finish in the background.",
+                    text(
+                        language,
+                        " The process tree remains live. Press n/Esc to close; the scan may finish in the background.",
+                        " 进程树仍保持实时。按 n/Esc 关闭；扫描可继续在后台完成。",
+                    ),
                     Style::default().fg(Color::DarkGray),
                 )),
             ])
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" network scan "),
+                    .title(text(language, " network scan ", " 网络扫描 ")),
             ),
             popup,
         );
@@ -1794,25 +2214,35 @@ fn draw_network_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect::<Vec<_>>();
     let mode = if app.network_searching {
-        format!(" find: {}_", app.network_filter)
+        format!(
+            " {}: {}_",
+            text(language, "find", "查找"),
+            app.network_filter
+        )
     } else if app.network_filter.is_empty() {
         String::new()
     } else {
-        format!(" filter: {}", app.network_filter)
+        format!(
+            " {}: {}",
+            text(language, "filter", "过滤"),
+            app.network_filter
+        )
     };
     let scanning = if app.network_is_scanning() {
         let elapsed = app.network_scan_elapsed();
         format!(
-            "  {} rescanning {:.1}s",
+            "  {} {} {:.1}s",
             activity_spinner(elapsed),
+            text(language, "rescanning", "重新扫描"),
             elapsed.as_secs_f64()
         )
     } else {
         String::new()
     };
     let title = format!(
-        " network {} {}/{}{}{} ",
-        app.network_scope.label(),
+        " {} {} {}/{}{}{} ",
+        text(language, "network", "网络"),
+        network_scope_label(language, app.network_scope),
         visible.len(),
         scan.endpoints.len(),
         mode,
@@ -1832,17 +2262,25 @@ fn draw_network_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     frame.render_stateful_widget(list, chunks[0], &mut state);
     let warning = if app.network_is_scanning() {
-        "showing the previous snapshot while a fresh scan runs"
+        text(
+            language,
+            "showing the previous snapshot while a fresh scan runs",
+            "新扫描运行期间显示上一份快照",
+        )
     } else {
-        scan.warning
-            .as_deref()
-            .unwrap_or("ownership complete for visible processes")
+        scan.warning.as_deref().unwrap_or(text(
+            language,
+            "ownership complete for visible processes",
+            "可见进程的归属信息完整",
+        ))
     };
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(
+            Line::from(text(
+                language,
                 " ↑↓/jk move | v listeners/all | / find | Enter jump | r rescan | x clear | n/Esc close ",
-            ),
+                " ↑↓/jk 移动 | v 监听/全部 | / 查找 | Enter 跳转 | r 重扫 | x 清除 | n/Esc 关闭 ",
+            )),
             Line::from(Span::styled(
                 format!(" {warning}"),
                 Style::default().fg(if scan.warning.is_some() || app.network_is_scanning() {
@@ -1874,6 +2312,7 @@ fn attention_color(severity: AttentionSeverity) -> Color {
 }
 
 fn draw_attention_overlay(frame: &mut Frame, app: &App, area: Rect) {
+    let language = app.language();
     let width = area.width.saturating_sub(2).clamp(1, 150);
     let height = area.height.saturating_sub(2).max(1);
     let popup = Rect::new(
@@ -1882,9 +2321,11 @@ fn draw_attention_overlay(frame: &mut Frame, app: &App, area: Rect) {
         width,
         height,
     );
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" attention cockpit ");
+    let block = Block::default().borders(Borders::ALL).title(text(
+        language,
+        " attention cockpit ",
+        " 关注事项 ",
+    ));
     let inner = block.inner(popup);
     let sections = Layout::vertical([
         Constraint::Length(2),
@@ -1911,10 +2352,12 @@ fn draw_attention_overlay(frame: &mut Frame, app: &App, area: Rect) {
         .unwrap_or(0);
     let items: Vec<ListItem> =
         if findings.is_empty() {
-            vec![ListItem::new(
-            " no current findings — no unhealthy state, churn, sustained load, or rapid growth",
-        )
-        .style(Style::default().fg(Color::DarkGray))]
+            vec![ListItem::new(text(
+                language,
+                " no current findings — no unhealthy state, churn, sustained load, or rapid growth",
+                " 当前没有发现异常状态、抖动、持续负载或快速增长",
+            ))
+            .style(Style::default().fg(Color::DarkGray))]
         } else {
             findings
                 .iter()
@@ -1976,9 +2419,17 @@ fn draw_attention_overlay(frame: &mut Frame, app: &App, area: Rect) {
         })
         .unwrap_or_else(|| {
             vec![
-                Line::from(" No process currently requires attention."),
+                Line::from(text(
+                    language,
+                    " No process currently requires attention.",
+                    " 当前没有需要关注的进程。",
+                )),
                 Line::from(Span::styled(
-                    " Findings are evidence-based hints, not a claim that a process is faulty.",
+                    text(
+                        language,
+                        " Findings are evidence-based hints, not a claim that a process is faulty.",
+                        " 这些发现是基于证据的线索，不代表进程已被认定有故障。",
+                    ),
                     Style::default().fg(Color::DarkGray),
                 )),
             ]
@@ -2000,18 +2451,28 @@ fn draw_attention_overlay(frame: &mut Frame, app: &App, area: Rect) {
                     format!(" WATCH {watch} "),
                     Style::default().fg(Color::LightBlue),
                 ),
-                Span::raw(" — explainable signals from state, lifecycle, resource history"),
+                Span::raw(text(
+                    language,
+                    " — explainable signals from state, lifecycle, resource history",
+                    " — 来自状态、生命周期和资源历史的可解释信号",
+                )),
             ]),
-            Line::from(
+            Line::from(text(
+                language,
                 " ↑↓/jk move | Enter jump | t trend | i inspect | p actions | r sample | Space pause | a/Esc close",
-            ),
+                " ↑↓/jk 移动 | Enter 跳转 | t 趋势 | i 深检 | p 操作 | r 采样 | Space 暂停 | a/Esc 关闭",
+            )),
         ]),
         sections[0],
     );
     frame.render_stateful_widget(list, sections[1], &mut state);
     frame.render_widget(
         Paragraph::new(detail)
-            .block(Block::default().borders(Borders::TOP).title(" evidence "))
+            .block(Block::default().borders(Borders::TOP).title(text(
+                language,
+                " evidence ",
+                " 证据 ",
+            )))
             .wrap(Wrap { trim: false }),
         sections[2],
     );
@@ -2070,6 +2531,7 @@ fn hotspot_is_active(app: &App, pid: Pid, metric: HotspotMetric) -> bool {
 }
 
 fn draw_hotspot_panel(frame: &mut Frame, app: &App, area: Rect, metric: HotspotMetric) {
+    let language = app.language();
     let ranked = app.hotspot_ranked(metric);
     let active = app.hotspot_metric == metric;
     let selected_rank = if active {
@@ -2110,14 +2572,22 @@ fn draw_hotspot_panel(frame: &mut Frame, app: &App, area: Rect, metric: HotspotM
     let color = hotspot_color(metric);
     if items.is_empty() {
         items.push(
-            ListItem::new(" no activity in the current sample")
-                .style(Style::default().fg(Color::DarkGray)),
+            ListItem::new(text(
+                language,
+                " no activity in the current sample",
+                " 当前样本没有活动",
+            ))
+            .style(Style::default().fg(Color::DarkGray)),
         );
     }
     let title = if active {
-        format!(" {}  ACTIVE ", metric.label())
+        format!(
+            " {}  {} ",
+            hotspot_metric_label(language, metric),
+            text(language, "ACTIVE", "当前")
+        )
     } else {
-        format!(" {} ", metric.label())
+        format!(" {} ", hotspot_metric_label(language, metric))
     };
     let list = List::new(items)
         .block(
@@ -2143,6 +2613,7 @@ fn draw_hotspot_panel(frame: &mut Frame, app: &App, area: Rect, metric: HotspotM
 }
 
 fn draw_hotspot_overlay(frame: &mut Frame, app: &App, area: Rect) {
+    let language = app.language();
     let width = area.width.saturating_sub(2).clamp(1, 150);
     let height = area.height.saturating_sub(2).max(1);
     let popup = Rect::new(
@@ -2151,9 +2622,11 @@ fn draw_hotspot_overlay(frame: &mut Frame, app: &App, area: Rect) {
         width,
         height,
     );
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" hotspot cockpit ");
+    let block = Block::default().borders(Borders::ALL).title(text(
+        language,
+        " hotspot cockpit ",
+        " 热点工作台 ",
+    ));
     let inner = block.inner(popup);
     let rows = Layout::vertical([
         Constraint::Length(2),
@@ -2170,22 +2643,26 @@ fn draw_hotspot_overlay(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(vec![
-                Span::raw(" scope: "),
+                Span::raw(text(language, " scope: ", " 范围：")),
                 Span::styled(
-                    app.hotspot_scope.label(),
+                    hotspot_scope_label(language, app.hotspot_scope),
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw("  | selected panel: "),
+                Span::raw(text(language, "  | selected panel: ", "  | 当前面板：")),
                 Span::styled(
-                    app.hotspot_metric.label(),
+                    hotspot_metric_label(language, app.hotspot_metric),
                     Style::default()
                         .fg(hotspot_color(app.hotspot_metric))
                         .add_modifier(Modifier::BOLD),
                 ),
             ]),
-            Line::from(" ↑↓ rank | ←→ metric | v self/tree | Enter jump | r sample | Esc close"),
+            Line::from(text(
+                language,
+                " ↑↓ rank | ←→ metric | v self/tree | Enter jump | r sample | Esc close",
+                " ↑↓ 排名 | ←→ 指标 | v 自身/子树 | Enter 跳转 | r 采样 | Esc 关闭",
+            )),
         ]),
         rows[0],
     );
@@ -2245,7 +2722,7 @@ fn guidance_section(title: &'static str) -> Line<'static> {
     ))
 }
 
-fn guidance_page(page: usize) -> Vec<Line<'static>> {
+fn guidance_page_en(page: usize) -> Vec<Line<'static>> {
     match page % GUIDANCE_PAGE_COUNT {
         0 => vec![
             Line::from(""),
@@ -2262,6 +2739,7 @@ fn guidance_page(page: usize) -> Vec<Line<'static>> {
                 "/",
                 "type a query, then Enter to apply it and select results",
             ),
+            guidance_key("F", "manage persistent allow/deny filters before search"),
             guidance_key("f", "focus the selected parent chain and service subtree"),
             guidance_key(
                 "Enter",
@@ -2331,11 +2809,92 @@ fn guidance_page(page: usize) -> Vec<Line<'static>> {
     }
 }
 
+fn guidance_page_zh(page: usize) -> Vec<Line<'static>> {
+    match page % GUIDANCE_PAGE_COUNT {
+        0 => vec![
+            Line::from(""),
+            guidance_section("理解进程树"),
+            Line::from(Span::styled(
+                " 看清谁启动了进程、它拥有什么，以及完整服务的资源成本。",
+                Style::default().fg(Color::Gray),
+            )),
+            Line::from(""),
+            guidance_key("↑ / ↓", "在稳定排序的进程行之间移动"),
+            guidance_key("← / →", "显示父进程；展开或折叠子进程"),
+            guidance_key("0-9", "直接输入 PID，再按 Enter 精确定位"),
+            guidance_key("/", "输入查询，按 Enter 后应用并选择结果"),
+            guidance_key("F", "管理先于搜索执行的持久包含/排除规则"),
+            guidance_key("f", "聚焦选中进程的父链和服务子树"),
+            guidance_key("Enter", "检查线程、套接字、文件和运行上下文"),
+            Line::from(""),
+            Line::from(Span::styled(
+                " 查询示例：user:deploy tree.mem>2g !state:zombie",
+                Style::default().fg(Color::Yellow),
+            )),
+        ],
+        1 => vec![
+            Line::from(""),
+            guidance_section("从症状走向证据"),
+            Line::from(Span::styled(
+                " 每个诊断工作区都会保留进程归属关系。",
+                Style::default().fg(Color::Gray),
+            )),
+            Line::from(""),
+            guidance_key("a", "关注异常状态、抖动、压力和增长"),
+            guidance_key("h", "CPU、内存、读写热点工作台"),
+            guidance_key("t", "进程自身及完整子树的近期趋势"),
+            guidance_key("n", "监听、连接、对端、所有者和命名空间"),
+            guidance_key("v", "验证运行映像、软件包、哈希和代码签名"),
+            guidance_key("m", "systemd/launchd 归属、状态、配置和命令"),
+            guidance_key("l", "读取当前进程或服务的有界原生日志"),
+            guidance_key("M", "归因 RSS、PSS、Swap、区域和映射"),
+            guidance_key("D", "建立带优先级线索的单进程事故档案"),
+            guidance_key("b / d / x", "捕获基线、比较并清除"),
+            guidance_key("Space / r", "冻结现场；手工采样"),
+            Line::from(""),
+            Line::from(Span::styled(
+                " 提示：D 会并行采集管理器、映像、日志和进程证据。",
+                Style::default().fg(Color::Yellow),
+            )),
+        ],
+        _ => vec![
+            Line::from(""),
+            guidance_section("谨慎操作 · 有效分享"),
+            Line::from(Span::styled(
+                " 操作需要确认和身份校验；报告会保留当前调查上下文。",
+                Style::default().fg(Color::Gray),
+            )),
+            Line::from(""),
+            guidance_key("k", "通过两阶段弹窗结束选中进程"),
+            guidance_key("p", "经明确确认发送 TERM/KILL/STOP/CONT"),
+            guidance_key("e", "查看近期进程变化和操作审计"),
+            guidance_key("o", "导出私有、版本化诊断报告"),
+            guidance_key("s", "切换稳定排序和服务树热点排序"),
+            guidance_key("L / F2", "切换中文或英文界面"),
+            guidance_key("?", "随时打开本现场手册"),
+            guidance_key("q / Ctrl-C", "退出 psmore"),
+            Line::from(""),
+            Line::from(Span::styled(
+                " CLI 工具：doctor、explain、inspect、memory、exe、service、logs、tree、net、trace、diff",
+                Style::default().fg(Color::Yellow),
+            )),
+        ],
+    }
+}
+
+fn guidance_page(page: usize, language: UiLanguage) -> Vec<Line<'static>> {
+    match language {
+        UiLanguage::Chinese => guidance_page_zh(page),
+        UiLanguage::English => guidance_page_en(page),
+    }
+}
+
 fn draw_guidance_overlay(frame: &mut Frame, app: &App, area: Rect) {
     let Some(overlay) = app.guidance.overlay else {
         return;
     };
     let is_tip = matches!(overlay, GuidanceOverlay::Tip(_));
+    let language = app.language();
     let max_width = if is_tip { 72 } else { 100 };
     let max_height = if is_tip { 11 } else { 24 };
     let width = area.width.saturating_sub(2).min(max_width).max(1);
@@ -2363,10 +2922,19 @@ fn draw_guidance_overlay(frame: &mut Frame, app: &App, area: Rect) {
         Color::LightCyan
     };
     let title = match overlay {
-        GuidanceOverlay::Welcome => " WELCOME TO PSMORE · SEE THE SYSTEM THROUGH ITS PROCESSES ",
-        GuidanceOverlay::Help => " PSMORE FIELD GUIDE ",
+        GuidanceOverlay::Welcome => text(
+            language,
+            " WELCOME TO PSMORE · SEE THE SYSTEM THROUGH ITS PROCESSES ",
+            " 欢迎使用 PSMORE · 通过进程看清系统 ",
+        ),
+        GuidanceOverlay::Help => text(language, " PSMORE FIELD GUIDE ", " PSMORE 现场手册 "),
         GuidanceOverlay::Tip(index) => {
-            let title = format!(" PSMORE TIP {}/{} ", index + 1, TIPS.len());
+            let title = format!(
+                " PSMORE {} {}/{} ",
+                text(language, "TIP", "提示"),
+                index + 1,
+                TIPS.len()
+            );
             frame.render_widget(Clear, popup);
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -2399,12 +2967,17 @@ fn draw_guidance_overlay(frame: &mut Frame, app: &App, area: Rect) {
                 Line::from(""),
                 Line::from(Span::styled(
                     format!(
-                        " Any other key continues · ? guide · T future tips {} · D disable",
+                        " {} · ? {} · T {} {} · D {} · L {}",
+                        text(language, "Any other key continues", "按其他键继续"),
+                        text(language, "guide", "手册"),
+                        text(language, "future tips", "启动提示"),
                         if app.guidance.tips_enabled() {
-                            "ON"
+                            text(language, "ON", "开")
                         } else {
-                            "OFF"
-                        }
+                            text(language, "OFF", "关")
+                        },
+                        text(language, "disable", "停用"),
+                        text(language, "language", "语言")
                     ),
                     Style::default().fg(Color::DarkGray),
                 )),
@@ -2418,20 +2991,25 @@ fn draw_guidance_overlay(frame: &mut Frame, app: &App, area: Rect) {
             return;
         }
     };
-    let mut lines = guidance_page(app.guidance.page);
+    let mut lines = guidance_page(app.guidance.page, language);
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         format!(
-            " ←/→ page {}/{} · Enter/Esc close · T tips {} · D never show startup cards{}",
+            " ←/→ {} {}/{} · Enter/Esc {} · T {} {} · D {} · L/F2 {}{}",
+            text(language, "page", "页"),
             app.guidance.page + 1,
             GUIDANCE_PAGE_COUNT,
+            text(language, "close", "关闭"),
+            text(language, "tips", "提示"),
             if app.guidance.tips_enabled() {
-                "ON"
+                text(language, "ON", "开")
             } else {
-                "OFF"
+                text(language, "OFF", "关")
             },
+            text(language, "never show startup cards", "不再显示启动卡片"),
+            text(language, "language", "语言"),
             if matches!(overlay, GuidanceOverlay::Help) {
-                " · ? close"
+                text(language, " · ? close", " · ? 关闭")
             } else {
                 ""
             },
@@ -2462,6 +3040,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     if area.width == 0 || area.height == 0 {
         return;
     }
+    let language = app.language();
     let detail_height = detail_height(app, area);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -2473,34 +3052,82 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         .split(area);
     app.page_size = chunks[0].height.saturating_sub(2).max(1) as usize;
     let mut title = if let Some(pid_input) = &app.pid_input {
-        format!(" psmore  locate PID: {pid_input}")
+        format!(
+            " psmore  {} PID: {pid_input}",
+            text(language, "locate", "定位")
+        )
     } else {
         match (&app.focus, app.searching) {
             (Some(pid), true) => {
-                format!(" psmore  focus={}  search input: {}", pid, app.search_input)
+                format!(
+                    " psmore  {}={}  {}: {}",
+                    text(language, "focus", "聚焦"),
+                    pid,
+                    text(language, "search input", "搜索输入"),
+                    app.search_input
+                )
             }
             (Some(pid), false) if !app.search.is_empty() => {
-                format!(" psmore  focus={}  filter: {}", pid, app.search)
+                format!(
+                    " psmore  {}={}  {}: {}",
+                    text(language, "focus", "聚焦"),
+                    pid,
+                    text(language, "filter", "过滤"),
+                    app.search
+                )
             }
-            (Some(pid), false) => format!(" psmore  focus={} ", pid),
-            (None, true) => format!(" psmore  search input: {}", app.search_input),
-            (None, false) if !app.search.is_empty() => format!(" psmore  filter: {}", app.search),
-            (None, false) => format!(" psmore  {} process relationships ", platform_name()),
+            (Some(pid), false) => {
+                format!(" psmore  {}={} ", text(language, "focus", "聚焦"), pid)
+            }
+            (None, true) => format!(
+                " psmore  {}: {}",
+                text(language, "search input", "搜索输入"),
+                app.search_input
+            ),
+            (None, false) if !app.search.is_empty() => format!(
+                " psmore  {}: {}",
+                text(language, "filter", "过滤"),
+                app.search
+            ),
+            (None, false) => format!(
+                " psmore  {} {} ",
+                platform_name(),
+                text(language, "process relationships", "进程关系")
+            ),
         }
     };
     if let Some(error) = &app.pid_input_error {
         title.push_str(&format!("  {error} "));
     } else if !app.searching && !app.search.is_empty() {
         if let Some(error) = &app.search_error {
-            title.push_str(&format!("  query error: {error} "));
+            title.push_str(&format!(
+                "  {}: {error} ",
+                text(language, "query error", "查询错误")
+            ));
         } else {
-            title.push_str(&format!("  {} hits ", app.search_matches));
+            title.push_str(&format!(
+                "  {} {} ",
+                app.search_matches,
+                text(language, "hits", "个结果")
+            ));
         }
     }
     if app.paused {
-        title.push_str(" PAUSED ");
+        title.push_str(text(language, " PAUSED ", " 已暂停 "));
     }
-    title.push_str(&format!(" sort={} ", app.sort_mode.label()));
+    title.push_str(&format!(
+        " {}={} ",
+        text(language, "sort", "排序"),
+        sort_label(language, app.sort_mode)
+    ));
+    if app.active_filter_count() > 0 {
+        title.push_str(&format!(
+            " {}={}/{} ",
+            text(language, "filtered", "过滤"),
+            app.filtered_processes,
+            app.processes.len().saturating_sub(1)
+        ));
+    }
     let selected_pid = app.selected_pid();
     let selected_parent =
         selected_pid.and_then(|pid| app.processes.get(&pid).and_then(|p| p.parent));
@@ -2601,47 +3228,58 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!(
-                "  PPID {}  children {}  status {}  CPU {:.1}%  MEM {} MB  R {}  W {}  runtime {}s",
+                "  PPID {}  {} {}  {} {}  CPU {:.1}%  {} {} MB  {} {}  {} {}  {} {}s",
                 p.parent
                     .map(|p| p.to_string())
                     .unwrap_or_else(|| "-".into()),
+                text(language, "children", "子进程"),
                 children,
+                text(language, "status", "状态"),
                 p.status,
                 p.cpu,
+                text(language, "MEM", "内存"),
                 p.memory / 1024 / 1024,
+                text(language, "R", "读"),
                 format_bytes_rate(p.read_rate),
+                text(language, "W", "写"),
                 format_bytes_rate(p.write_rate),
+                text(language, "runtime", "运行"),
                 p.runtime
             )),
         ])];
         detail_lines.push(Line::from(vec![
             Span::styled(
-                "TREE",
+                text(language, "TREE", "子树"),
                 Style::default()
                     .fg(Color::LightMagenta)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!(
-                " {} proc (self + descendants)  CPU {:.1}%  MEM {} MB  R {}  W {}",
+                " {} {} ({})  CPU {:.1}%  {} {} MB  {} {}  {} {}",
                 subtree.process_count,
+                text(language, "proc", "进程"),
+                text(language, "self + descendants", "自身及后代"),
                 subtree.cpu,
+                text(language, "MEM", "内存"),
                 subtree.memory / 1024 / 1024,
+                text(language, "R", "读"),
                 format_bytes_rate(subtree.read_rate),
+                text(language, "W", "写"),
                 format_bytes_rate(subtree.write_rate)
             )),
         ]));
         detail_lines.push(Line::from(command));
         Text::from(detail_lines)
     } else {
-        Text::from("No processes found")
+        Text::from(text(language, "No processes found", "没有找到进程"))
     };
     frame.render_widget(
         Paragraph::new(detail)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" selected process "),
-            )
+            .block(Block::default().borders(Borders::ALL).title(text(
+                language,
+                " selected process ",
+                " 当前进程 ",
+            )))
             .wrap(Wrap { trim: false }),
         chunks[1],
     );
@@ -2649,33 +3287,53 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     let total_pages = app.visible.len().div_ceil(app.page_size);
     let total_pages = total_pages.max(1);
     let current_page = (app.selected / app.page_size + 1).min(total_pages);
-    let live_state = if app.paused { "PAUSED" } else { "LIVE" };
+    let live_state = if app.paused {
+        text(language, "PAUSED", "暂停")
+    } else {
+        text(language, "LIVE", "实时")
+    };
     let baseline_state = app
         .baseline
         .as_ref()
-        .map(|baseline| format!("base {}s", baseline.captured_at.elapsed().as_secs()))
-        .unwrap_or_else(|| "no base".into());
+        .map(|baseline| {
+            format!(
+                "{} {}s",
+                text(language, "base", "基线"),
+                baseline.captured_at.elapsed().as_secs()
+            )
+        })
+        .unwrap_or_else(|| text(language, "no base", "无基线").into());
     let shortcut_line: String = if app.pid_input.is_some() {
-        " PID: type digits | Enter locate | Backspace edit | Esc cancel ".into()
+        text(
+            language,
+            " PID: type digits | Enter locate | Backspace edit | Esc cancel ",
+            " PID：输入数字 | Enter 定位 | Backspace 编辑 | Esc 取消 ",
+        )
+        .into()
     } else if app.searching {
-        " search input (tree unchanged): words | name:/user:/state: | cpu>20 | mem>500m | tree.mem>2g | Enter apply | Esc cancel ".into()
+        text(language, " search input (tree unchanged): words | name:/user:/state: | cpu>20 | mem>500m | tree.mem>2g | Enter apply | Esc cancel ", " 搜索输入（进程树不变）：文字 | name:/user:/state: | cpu>20 | mem>500m | tree.mem>2g | Enter 应用 | Esc 取消 ").into()
     } else if !app.search.is_empty() {
-        " search active | ↑↓ move | k end selected | / new search | Esc clear | Enter inspect | q quit ".into()
+        text(language, " search active | ↑↓ move | k end selected | / new search | Esc clear | Enter inspect | q quit ", " 搜索已生效 | ↑↓ 移动 | k 结束选中进程 | / 新搜索 | Esc 清除 | Enter 深检 | q 退出 ").into()
     } else {
-        " ↑↓ move | ←/→ tree | digits PID | / find | k end | p actions | D dossier | M memory | a attention | h hot | m manager | v image | l logs | ? help ".into()
+        text(language, " ↑↓ move | ←/→ tree | digits PID | / find | F filters | k end | p actions | D dossier | M memory | a attention | h hot | m manager | v image | l logs | L language | ? help ", " ↑↓ 移动 | ←/→ 进程树 | 数字定位 PID | / 搜索 | F 过滤器 | k 结束 | p 操作 | D 档案 | M 内存 | a 关注 | h 热点 | m 管理器 | v 映像 | l 日志 | L 语言 | ? 帮助 ").into()
     };
     let footer = Paragraph::new(vec![
         Line::from(format!(
-            " {} proc | page {}/{} | {} | {} | sort {} | +{} -{} ↪{} | q quit ",
+            " {} {} | {} {}/{} | {} | {} | {} {} | +{} -{} ↪{} | F2 {} | q {} ",
             total_processes,
+            text(language, "proc", "进程"),
+            text(language, "page", "页"),
             current_page,
             total_pages,
             live_state,
             baseline_state,
-            app.sort_mode.label(),
+            text(language, "sort", "排序"),
+            sort_label(language, app.sort_mode),
             app.last_changes.started,
             app.last_changes.exited,
             app.last_changes.reparented,
+            language.label(),
+            text(language, "quit", "退出"),
         )),
         Line::from(shortcut_line),
     ])
@@ -2686,7 +3344,9 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     }));
     frame.render_widget(footer, chunks[2]);
 
-    if app.show_attention {
+    if app.show_filter_manager {
+        draw_filter_manager_overlay(frame, app, area);
+    } else if app.show_attention {
         draw_attention_overlay(frame, app, area);
     } else if app.show_hotspots {
         draw_hotspot_overlay(frame, app, area);
@@ -2801,6 +3461,80 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         assert!(buffer_text(&terminal).contains("PSMORE FIELD GUIDE"));
+    }
+
+    #[test]
+    fn f2_switches_the_complete_guidance_surface_between_languages() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        let backend = TestBackend::new(100, 28);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        app.on_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let chinese = buffer_text(&terminal);
+        let compact_chinese = chinese.replace(' ', "");
+        assert!(compact_chinese.contains("欢迎使用PSMORE"));
+        assert!(compact_chinese.contains("理解进程树"));
+        assert!(compact_chinese.contains("页1/3"));
+
+        app.on_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let english = buffer_text(&terminal);
+        assert!(english.contains("WELCOME TO PSMORE"));
+        assert!(english.contains("UNDERSTAND THE PROCESS TREE"));
+    }
+
+    #[test]
+    fn filter_manager_adds_toggles_edits_and_removes_rules() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        let backend = TestBackend::new(132, 26);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        app.on_key(KeyEvent::new(KeyCode::Char('F'), KeyModifiers::NONE));
+        assert!(app.show_filter_manager);
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        for character in "path~^/System/Library/original$".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.process_filters.len(), 1);
+        assert_eq!(app.process_filters[0].action, FilterAction::Exclude);
+        assert!(app.process_filters[0].enabled);
+        assert_eq!(
+            app.process_filters[0].expression,
+            "path~^/System/Library/original$"
+        );
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let output = buffer_text(&terminal);
+        assert!(output.contains("process filters"));
+        assert!(output.contains("path~^/System/Library/original$"));
+
+        app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(!app.process_filters[0].enabled);
+        app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        assert!(app.filter_editor.is_some());
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(
+            app.filter_editor.as_ref().unwrap().action,
+            FilterAction::Include
+        );
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert!(app.process_filters.is_empty());
+
+        app.on_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        let backend = TestBackend::new(132, 26);
+        let mut chinese_terminal = Terminal::new(backend).unwrap();
+        chinese_terminal
+            .draw(|frame| draw(frame, &mut app))
+            .unwrap();
+        assert!(
+            buffer_text(&chinese_terminal)
+                .replace(' ', "")
+                .contains("进程过滤器")
+        );
     }
 
     #[test]

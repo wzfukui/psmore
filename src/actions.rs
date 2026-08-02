@@ -25,15 +25,6 @@ impl ProcessActionKind {
         }
     }
 
-    pub(crate) fn description(self) -> &'static str {
-        match self {
-            Self::Terminate => "request a graceful shutdown",
-            Self::Kill => "force immediate termination",
-            Self::Stop => "suspend process execution",
-            Self::Continue => "resume a stopped process",
-        }
-    }
-
     pub(crate) fn shortcut(self) -> char {
         match self {
             Self::Terminate => 't',

@@ -10,6 +10,7 @@ import struct
 import subprocess
 import sys
 import termios
+import tempfile
 import time
 
 
@@ -32,6 +33,9 @@ def main() -> int:
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 160, 0, 0))
     environment = os.environ.copy()
     environment.setdefault("TERM", "xterm-256color")
+    config_directory = tempfile.TemporaryDirectory(prefix="psmore-tui-smoke-")
+    environment["PSMORE_CONFIG_DIR"] = config_directory.name
+    environment["PSMORE_LANG"] = "en_US.UTF-8"
     process = subprocess.Popen(
         [binary, "--no-tips"],
         stdin=slave,
@@ -68,6 +72,14 @@ def main() -> int:
 
     try:
         read_until(b"digits PID", 10.0)
+        os.write(master, b"F")
+        read_until(b"process filters", 5.0)
+        os.write(master, b"x")
+        read_until(b"add DENY filter", 5.0)
+        os.write(master, b"path~^/definitely-not-real$")
+        os.write(master, b"\r")
+        read_until(b"path~^/definitely-not-real$", 5.0)
+        os.write(master, b"F")
         os.write(master, f"{pid}".encode())
         time.sleep(0.2)
         os.write(master, b"\r")
@@ -127,9 +139,10 @@ def main() -> int:
         return 1
     finally:
         os.close(master)
+        config_directory.cleanup()
 
     print(
-        "Verified TUI PID locate -> delayed search apply -> dossier -> memory -> dossier -> image -> "
+        "Verified TUI persistent filter -> PID locate -> delayed search apply -> dossier -> memory -> dossier -> image -> "
         f"manager -> logs -> manager -> two-step end dialog for PID {pid}"
     )
     return 0

@@ -14,6 +14,7 @@ use sysinfo::{Pid, System};
 
 use crate::{
     actions::{ProcessActionOutcome, ProcessActionRecord},
+    filters::ProcessFilterRule,
     model::{
         AttentionFinding, InspectionField, OpenFileInfo, ProcessChange, ProcessEvent, ProcessInfo,
         ProcessInspection, ResourceAggregate, SocketInfo, SortMode, ThreadInfo,
@@ -24,7 +25,7 @@ use crate::{
 };
 
 const REPORT_SCHEMA: &str = "psmore.diagnostic-report";
-const REPORT_SCHEMA_VERSION: u32 = 8;
+const REPORT_SCHEMA_VERSION: u32 = 9;
 
 pub(crate) struct ReportInput<'a> {
     pub(crate) platform: &'static str,
@@ -33,6 +34,9 @@ pub(crate) struct ReportInput<'a> {
     pub(crate) query_editing: bool,
     pub(crate) query_error: Option<&'a str>,
     pub(crate) query_matches: usize,
+    pub(crate) process_filters: &'a [ProcessFilterRule],
+    pub(crate) filter_error: Option<&'a str>,
+    pub(crate) filtered_processes: usize,
     pub(crate) paused: bool,
     pub(crate) sort_mode: SortMode,
     pub(crate) processes: &'a HashMap<Pid, ProcessInfo>,
@@ -69,6 +73,7 @@ struct DiagnosticReport {
     hostname: Option<String>,
     selected_pid: Option<u32>,
     active_query: Option<QueryReport>,
+    process_filters: FilterReport,
     paused: bool,
     collection_status: CollectionStatusReport,
     sort_mode: &'static str,
@@ -112,6 +117,14 @@ struct QueryReport {
     valid: bool,
     error: Option<String>,
     matched_process_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct FilterReport {
+    valid: bool,
+    error: Option<String>,
+    passing_process_count: usize,
+    rules: Vec<ProcessFilterRule>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -614,6 +627,12 @@ fn build_report(input: ReportInput<'_>, generated_at: u64) -> DiagnosticReport {
             error: input.query_error.map(str::to_string),
             matched_process_count: input.query_matches,
         }),
+        process_filters: FilterReport {
+            valid: input.filter_error.is_none(),
+            error: input.filter_error.map(str::to_string),
+            passing_process_count: input.filtered_processes,
+            rules: input.process_filters.to_vec(),
+        },
         paused: input.paused,
         collection_status: CollectionStatusReport {
             network_scan_in_progress: input.network_scan_in_progress,

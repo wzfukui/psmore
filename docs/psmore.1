@@ -186,6 +186,13 @@ Prefix a condition with
 .B !
 to exclude it. Memory and I/O units accept k, m, g, and t; age accepts s, m, h,
 and d.
+.PP
+Text predicates use case-insensitive containment. Use
+.BI field~ regex
+for a Rust regular expression scoped to any, name, cmd, path, user, or state.
+Regular expressions are case-sensitive unless they include an inline flag such
+as (?i). Quote values containing spaces, for example
+.BR path:"/Applications/Google\ Chrome.app" .
 .SH COMMON OPTIONS
 .TP
 .BR -q , " --query " QUERY
@@ -303,6 +310,13 @@ Escape cancels input, or clears an already active search.
 .B Space
 Pause or resume live refresh.
 .TP
+.B F
+Open persistent process filters. Add ALLOW rules with a, DENY rules with x,
+edit with Enter or e, toggle with Space, and delete with d. Conditions inside
+one rule are AND; multiple ALLOW rules are OR; any matching DENY rule wins.
+Filters run before temporary slash search and retain necessary parent rows as
+relationship context.
+.TP
 .B k
 Open the focused end-process dialog for the selected process. Choose graceful
 TERM or immediate KILL, review the target, then press y on the second screen to
@@ -355,6 +369,14 @@ toggles future tips and
 .B D
 disables startup cards.
 .TP
+.B L
+Switch between Chinese and English from the main process tree or field guide.
+Inside the process dossier, L remains the log-collection toggle.
+.TP
+.B F2
+Switch between Chinese and English from any TUI workspace. The manual choice is
+saved and takes precedence over operating-system language on later starts.
+.TP
 .BR q
 Close the current panel or quit from the main process tree.
 .SH EXIT STATUS
@@ -386,6 +408,11 @@ diagnostic reports.
 .TP
 .B PSMORE_CONFIG_DIR
 Override the directory used for private TUI preference state.
+.TP
+.B PSMORE_LANG
+Select the initial TUI language before a manual preference has been saved.
+Values beginning with zh select Chinese; other recognized locales select
+English.
 .TP
 .B PSMORE_PREFIX
 Override the binary package install prefix. The default is

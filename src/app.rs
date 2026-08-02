@@ -11,10 +11,11 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     actions::{
-        ProcessActionDialog, ProcessActionDialogMode, ProcessActionKind, ProcessActionRecord,
-        ProcessActionTarget, execute_process_action,
+        ProcessActionDialog, ProcessActionDialogMode, ProcessActionKind, ProcessActionOutcome,
+        ProcessActionRecord, ProcessActionTarget, execute_process_action,
     },
     cli::{LogPriority, LogScope},
+    filters::{CompiledProcessFilters, FilterAction, ProcessFilterRule},
     headless_exe::{capture_executable, render_executable_json, render_executable_table},
     headless_explain::{
         ExplainOptions, capture_dossier, render_dossier_json, render_dossier_summary_table,
@@ -23,6 +24,7 @@ use crate::{
     headless_memory::{capture_memory, render_memory_json, render_memory_table},
     headless_service::{capture_service_context, render_service_json, render_service_table},
     history::ResourceHistory,
+    i18n::{UiLanguage, text},
     inspection::inspect_process,
     model::{
         AttentionFinding, AttentionSeverity, ChangeSummary, HotspotMetric, HotspotScope,
@@ -85,6 +87,103 @@ pub(crate) fn aggregate_resources(
         visit(pid, processes, children, &mut resources, &mut visiting);
     }
     resources
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+
+    fn process(pid: u32, parent: Option<u32>, name: &str, executable: &str) -> ProcessInfo {
+        ProcessInfo {
+            pid: Pid::from_u32(pid),
+            parent: parent.map(Pid::from_u32),
+            name: name.into(),
+            command: executable.into(),
+            executable: executable.into(),
+            user: "joe".into(),
+            cwd: "/".into(),
+            cpu: 0.0,
+            memory: 0,
+            read_rate: 0,
+            write_rate: 0,
+            start_time: 1,
+            runtime: 1,
+            status: "Sleep".into(),
+        }
+    }
+
+    #[test]
+    fn persistent_filters_run_before_search_and_keep_only_required_ancestors() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.processes = [
+            process(0, None, "kernel / system", ""),
+            process(1, Some(0), "launchd", "/sbin/launchd"),
+            process(
+                10,
+                Some(1),
+                "ChatGPT",
+                "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+            ),
+            process(
+                11,
+                Some(10),
+                "Helper",
+                "/Applications/ChatGPT.app/Contents/MacOS/Helper",
+            ),
+            process(12, Some(1), "node", "/opt/homebrew/bin/node"),
+        ]
+        .into_iter()
+        .map(|process| (process.pid, process))
+        .collect();
+        app.children.clear();
+        for process in app.processes.values() {
+            app.children
+                .entry(process.parent)
+                .or_default()
+                .push(process.pid);
+        }
+        app.resources = aggregate_resources(&app.processes, &app.children);
+        app.expanded = [0, 1, 10, 11, 12].into_iter().map(Pid::from_u32).collect();
+        app.process_filters = vec![
+            ProcessFilterRule {
+                action: FilterAction::Include,
+                expression: "path:/Applications".into(),
+                enabled: true,
+            },
+            ProcessFilterRule {
+                action: FilterAction::Exclude,
+                expression: "name~^Helper$".into(),
+                enabled: true,
+            },
+        ];
+        app.search.clear();
+        app.rebuild_visible();
+
+        assert_eq!(app.filtered_processes, 1);
+        assert_eq!(
+            app.visible
+                .iter()
+                .map(|row| row.pid.as_u32())
+                .collect::<Vec<_>>(),
+            vec![0, 1, 10]
+        );
+
+        app.search = "name:node".into();
+        app.rebuild_visible();
+        assert_eq!(app.search_matches, 0);
+        assert!(app.visible.is_empty());
+
+        app.search = "name:ChatGPT".into();
+        app.rebuild_visible();
+        assert_eq!(app.search_matches, 1);
+        assert_eq!(
+            app.visible
+                .iter()
+                .map(|row| row.pid.as_u32())
+                .collect::<Vec<_>>(),
+            vec![0, 1, 10]
+        );
+    }
 }
 
 pub(crate) fn sort_processes(
@@ -550,6 +649,23 @@ pub(crate) struct DossierContextPanel {
     pub(crate) limit: usize,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct FilterEditor {
+    pub(crate) action: FilterAction,
+    pub(crate) input: String,
+    pub(crate) error: Option<String>,
+    pub(crate) editing_index: Option<usize>,
+    enabled: bool,
+}
+
+struct TreeSelection<'a> {
+    matched: &'a HashSet<Pid>,
+    allowed: &'a HashSet<Pid>,
+    restricted: bool,
+    filter_applied: bool,
+    search_active: bool,
+}
+
 pub(crate) struct App {
     pub(crate) provider: NativeProcessProvider,
     pub(crate) processes: HashMap<Pid, ProcessInfo>,
@@ -584,6 +700,12 @@ pub(crate) struct App {
     pub(crate) search_input: String,
     pub(crate) search_error: Option<String>,
     pub(crate) search_matches: usize,
+    pub(crate) process_filters: Vec<ProcessFilterRule>,
+    pub(crate) show_filter_manager: bool,
+    pub(crate) filter_selected: usize,
+    pub(crate) filter_editor: Option<FilterEditor>,
+    pub(crate) filter_error: Option<String>,
+    pub(crate) filtered_processes: usize,
     pub(crate) pid_input: Option<String>,
     pub(crate) pid_input_error: Option<String>,
     pub(crate) focus: Option<Pid>,
@@ -632,9 +754,37 @@ impl App {
         Self::new_with_guidance(query, Guidance::load_default(suppress_guidance))
     }
 
+    pub(crate) fn language(&self) -> UiLanguage {
+        self.guidance.language()
+    }
+
+    fn toggle_language(&mut self) {
+        let result = self.guidance.toggle_language();
+        let language = self.guidance.language();
+        self.notice = Some(StatusNotice {
+            message: match &result {
+                Ok(_) => match language {
+                    UiLanguage::Chinese => "界面语言已切换为中文".into(),
+                    UiLanguage::English => "Interface language changed to English".into(),
+                },
+                Err(error) => format!(
+                    "{}: {error}",
+                    text(
+                        language,
+                        "language changed, but the preference could not be saved",
+                        "语言已切换，但无法保存偏好"
+                    )
+                ),
+            },
+            is_error: result.is_err(),
+            observed_at: Instant::now(),
+        });
+    }
+
     fn new_with_guidance(query: String, mut guidance: Guidance) -> Self {
         let has_initial_query = !query.is_empty();
         let guidance_warning = guidance.take_warning();
+        let process_filters = guidance.filters().to_vec();
         let mut app = Self {
             provider: NativeProcessProvider::new(),
             processes: HashMap::new(),
@@ -669,6 +819,12 @@ impl App {
             search_input: String::new(),
             search_error: None,
             search_matches: 0,
+            process_filters,
+            show_filter_manager: false,
+            filter_selected: 0,
+            filter_editor: None,
+            filter_error: None,
+            filtered_processes: 0,
             pid_input: None,
             pid_input_error: None,
             focus: None,
@@ -789,10 +945,16 @@ impl App {
                 let visible = self.network_visible_indices();
                 self.network_selected = self.network_selected.min(visible.len().saturating_sub(1));
                 self.notice = Some(StatusNotice {
-                    message: format!(
-                        "network scan complete: {endpoint_count} endpoints in {:.1}s",
-                        elapsed.as_secs_f64()
-                    ),
+                    message: match self.language() {
+                        UiLanguage::English => format!(
+                            "network scan complete: {endpoint_count} endpoints in {:.1}s",
+                            elapsed.as_secs_f64()
+                        ),
+                        UiLanguage::Chinese => format!(
+                            "网络扫描完成：{endpoint_count} 个端点，耗时 {:.1}s",
+                            elapsed.as_secs_f64()
+                        ),
+                    },
                     is_error: false,
                     observed_at: Instant::now(),
                 });
@@ -803,7 +965,12 @@ impl App {
                     self.show_network = false;
                 }
                 self.notice = Some(StatusNotice {
-                    message: "network scan failed: background worker stopped".into(),
+                    message: text(
+                        self.language(),
+                        "network scan failed: background worker stopped",
+                        "网络扫描失败：后台任务已停止",
+                    )
+                    .into(),
                     is_error: true,
                     observed_at: Instant::now(),
                 });
@@ -1994,12 +2161,54 @@ impl App {
     fn rebuild_visible(&mut self) {
         let old_pid = self.visible.get(self.selected).map(|row| row.pid);
         self.visible.clear();
+        let active_filters = self
+            .process_filters
+            .iter()
+            .filter(|rule| rule.enabled)
+            .count();
+        let compiled_filters = match CompiledProcessFilters::compile(&self.process_filters) {
+            Ok(filters) => {
+                self.filter_error = None;
+                Some(filters)
+            }
+            Err(error) => {
+                // Fail open: a malformed persisted rule must never hide the
+                // process table during an incident.
+                self.filter_error = Some(error);
+                None
+            }
+        };
+        let filter_applied = active_filters > 0 && compiled_filters.is_some();
+        let allowed: HashSet<Pid> = self
+            .processes
+            .values()
+            .filter(|process| {
+                let subtree = self
+                    .resources
+                    .get(&process.pid)
+                    .copied()
+                    .unwrap_or_default();
+                let direct_children = self
+                    .children
+                    .get(&Some(process.pid))
+                    .map(Vec::len)
+                    .unwrap_or(0);
+                compiled_filters
+                    .as_ref()
+                    .map(|filters| filters.matches(process, subtree, direct_children))
+                    .unwrap_or(true)
+            })
+            .map(|process| process.pid)
+            .collect();
+        self.filtered_processes = allowed.iter().filter(|pid| pid.as_u32() != 0).count();
+
         let query = ProcessQuery::parse(&self.search);
         let matched: HashSet<Pid> = match query {
             Ok(query) => {
                 self.search_error = None;
-                self.processes
-                    .values()
+                allowed
+                    .iter()
+                    .filter_map(|pid| self.processes.get(pid))
                     .filter(|process| {
                         let subtree = self
                             .resources
@@ -2026,6 +2235,15 @@ impl App {
         } else {
             matched.iter().filter(|pid| pid.as_u32() != 0).count()
         };
+        let restricted = filter_applied || !self.search.is_empty();
+        let search_active = !self.search.is_empty();
+        let tree_selection = TreeSelection {
+            matched: &matched,
+            allowed: &allowed,
+            restricted,
+            filter_applied,
+            search_active,
+        };
 
         if let Some(focus) = self.focus {
             let mut chain = Vec::new();
@@ -2043,11 +2261,16 @@ impl App {
                     is_last: depth == chain.len().saturating_sub(1),
                 });
             }
-            self.walk_children(focus, chain.len(), vec![false; chain.len()], &matched);
+            self.walk_children(
+                focus,
+                chain.len(),
+                vec![false; chain.len()],
+                &tree_selection,
+            );
         } else {
             let roots = [Pid::from_u32(0)];
             for (index, pid) in roots.iter().enumerate() {
-                self.walk(*pid, Vec::new(), index == roots.len() - 1, &matched);
+                self.walk(*pid, Vec::new(), index == roots.len() - 1, &tree_selection);
             }
         }
         if self.visible.is_empty() && !self.processes.is_empty() {
@@ -2069,13 +2292,19 @@ impl App {
             .unwrap_or(self.selected.min(self.visible.len().saturating_sub(1)));
     }
 
-    fn walk(&mut self, pid: Pid, last_path: Vec<bool>, is_last: bool, matched: &HashSet<Pid>) {
-        let has_match = matched.contains(&pid);
+    fn walk(
+        &mut self,
+        pid: Pid,
+        last_path: Vec<bool>,
+        is_last: bool,
+        selection: &TreeSelection<'_>,
+    ) {
+        let has_match = selection.matched.contains(&pid);
         let descendants = self.children.get(&Some(pid)).cloned().unwrap_or_default();
         let descendant_match = descendants
             .iter()
-            .any(|child| self.has_matching_descendant(*child, matched));
-        if has_match || descendant_match || self.search.is_empty() {
+            .any(|child| self.has_matching_descendant(*child, selection.matched));
+        if has_match || descendant_match || !selection.restricted {
             let depth = last_path.len();
             self.visible.push(TreeRow {
                 pid,
@@ -2084,15 +2313,37 @@ impl App {
                 is_last,
             });
             if self.expanded.contains(&pid)
-                || (!self.search.is_empty() && descendant_match && !self.collapsed.contains(&pid))
+                || (selection.restricted && descendant_match && !self.collapsed.contains(&pid))
             {
-                for (index, child) in descendants.iter().enumerate() {
+                let visible_children: Vec<Pid> = descendants
+                    .into_iter()
+                    .filter(|child| {
+                        if selection.search_active && has_match {
+                            !selection.filter_applied
+                                || self.has_matching_descendant(*child, selection.allowed)
+                        } else {
+                            !selection.restricted
+                                || self.has_matching_descendant(*child, selection.matched)
+                        }
+                    })
+                    .collect();
+                for (index, child) in visible_children.iter().enumerate() {
                     let mut child_path = last_path.clone();
                     child_path.push(is_last);
-                    if !self.search.is_empty() && has_match {
-                        self.walk_context(*child, child_path, index == descendants.len() - 1);
+                    if selection.search_active && has_match {
+                        self.walk_context(
+                            *child,
+                            child_path,
+                            index == visible_children.len() - 1,
+                            selection,
+                        );
                     } else {
-                        self.walk(*child, child_path, index == descendants.len() - 1, matched);
+                        self.walk(
+                            *child,
+                            child_path,
+                            index == visible_children.len() - 1,
+                            selection,
+                        );
                     }
                 }
             }
@@ -2102,8 +2353,17 @@ impl App {
     /// Once a search hit is visible, show its complete descendant context.
     /// Search still filters the ancestors and unrelated branches, but it must
     /// not hide the children that explain what the matched process owns.
-    fn walk_context(&mut self, pid: Pid, last_path: Vec<bool>, is_last: bool) {
+    fn walk_context(
+        &mut self,
+        pid: Pid,
+        last_path: Vec<bool>,
+        is_last: bool,
+        selection: &TreeSelection<'_>,
+    ) {
         let descendants = self.children.get(&Some(pid)).cloned().unwrap_or_default();
+        if selection.filter_applied && !self.has_matching_descendant(pid, selection.allowed) {
+            return;
+        }
         let depth = last_path.len();
         self.visible.push(TreeRow {
             pid,
@@ -2112,10 +2372,22 @@ impl App {
             is_last,
         });
         if self.expanded.contains(&pid) && !self.collapsed.contains(&pid) {
-            for (index, child) in descendants.iter().enumerate() {
+            let visible_children: Vec<Pid> = descendants
+                .into_iter()
+                .filter(|child| {
+                    !selection.filter_applied
+                        || self.has_matching_descendant(*child, selection.allowed)
+                })
+                .collect();
+            for (index, child) in visible_children.iter().enumerate() {
                 let mut child_path = last_path.clone();
                 child_path.push(is_last);
-                self.walk_context(*child, child_path, index == descendants.len() - 1);
+                self.walk_context(
+                    *child,
+                    child_path,
+                    index == visible_children.len() - 1,
+                    selection,
+                );
             }
         }
     }
@@ -2125,29 +2397,55 @@ impl App {
         pid: Pid,
         depth: usize,
         last_path: Vec<bool>,
-        matched: &HashSet<Pid>,
+        selection: &TreeSelection<'_>,
     ) {
         let descendants = self.children.get(&Some(pid)).cloned().unwrap_or_default();
-        for (index, child) in descendants.iter().enumerate() {
-            if matched.contains(child)
-                || self.search.is_empty()
-                || self.has_matching_descendant(*child, matched)
+        let visible_children: Vec<Pid> = descendants
+            .into_iter()
+            .filter(|child| {
+                !selection.restricted || self.has_matching_descendant(*child, selection.matched)
+            })
+            .collect();
+        for (index, child) in visible_children.iter().enumerate() {
+            let mut child_path = last_path.clone();
+            child_path.push(index == visible_children.len() - 1);
+            self.visible.push(TreeRow {
+                pid: *child,
+                depth,
+                last_path: child_path.clone(),
+                is_last: index == visible_children.len() - 1,
+            });
+            if self.expanded.contains(child)
+                || (!selection.restricted && !self.collapsed.contains(child))
+                || (selection.restricted
+                    && self.has_matching_descendant(*child, selection.matched)
+                    && !self.collapsed.contains(child))
             {
-                let mut child_path = last_path.clone();
-                child_path.push(index == descendants.len() - 1);
-                self.visible.push(TreeRow {
-                    pid: *child,
-                    depth,
-                    last_path: child_path.clone(),
-                    is_last: index == descendants.len() - 1,
-                });
-                if self.expanded.contains(child)
-                    || (self.search.is_empty() && !self.collapsed.contains(child))
-                    || (!self.search.is_empty()
-                        && self.has_matching_descendant(*child, matched)
-                        && !self.collapsed.contains(child))
-                {
-                    self.walk_children(*child, depth + 1, child_path, matched);
+                if selection.search_active && selection.matched.contains(child) {
+                    let grandchildren = self
+                        .children
+                        .get(&Some(*child))
+                        .cloned()
+                        .unwrap_or_default();
+                    let visible_grandchildren: Vec<Pid> = grandchildren
+                        .into_iter()
+                        .filter(|grandchild| {
+                            !selection.filter_applied
+                                || self.has_matching_descendant(*grandchild, selection.allowed)
+                        })
+                        .collect();
+                    for (grandchild_index, grandchild) in visible_grandchildren.iter().enumerate() {
+                        let mut grandchild_path = child_path.clone();
+                        grandchild_path.push(index == visible_children.len() - 1);
+                        self.walk_context(
+                            *grandchild,
+                            grandchild_path,
+                            grandchild_index == visible_grandchildren.len() - 1,
+                            selection,
+                        );
+                    }
+                } else {
+                    self.walk_children(*child, depth + 1, child_path, selection);
                 }
             }
         }
@@ -2229,6 +2527,7 @@ impl App {
         let Ok(query) = ProcessQuery::parse(&self.search) else {
             return;
         };
+        let filters = CompiledProcessFilters::compile(&self.process_filters).ok();
         if let Some(index) = self.visible.iter().position(|row| {
             self.processes
                 .get(&row.pid)
@@ -2243,7 +2542,11 @@ impl App {
                         .get(&Some(process.pid))
                         .map(Vec::len)
                         .unwrap_or(0);
-                    query.matches(process, subtree, direct_children)
+                    filters
+                        .as_ref()
+                        .map(|filters| filters.matches(process, subtree, direct_children))
+                        .unwrap_or(true)
+                        && query.matches(process, subtree, direct_children)
                 })
                 .unwrap_or(false)
         }) {
@@ -2340,6 +2643,130 @@ impl App {
         self.select_first_match();
     }
 
+    pub(crate) fn active_filter_count(&self) -> usize {
+        self.process_filters
+            .iter()
+            .filter(|rule| rule.enabled)
+            .count()
+    }
+
+    fn persist_process_filters(&mut self) {
+        if let Err(error) = self.guidance.save_filters(&self.process_filters) {
+            self.notice = Some(StatusNotice {
+                message: match self.language() {
+                    UiLanguage::English => {
+                        format!("filters changed, but the preference could not be saved: {error}")
+                    }
+                    UiLanguage::Chinese => format!("过滤规则已更改，但无法保存偏好：{error}"),
+                },
+                is_error: true,
+                observed_at: Instant::now(),
+            });
+        }
+    }
+
+    fn open_filter_manager(&mut self) {
+        self.show_filter_manager = true;
+        self.filter_editor = None;
+        self.filter_selected = self
+            .filter_selected
+            .min(self.process_filters.len().saturating_sub(1));
+    }
+
+    fn close_filter_manager(&mut self) {
+        self.show_filter_manager = false;
+        self.filter_editor = None;
+    }
+
+    fn start_filter_editor(&mut self, action: FilterAction) {
+        self.filter_editor = Some(FilterEditor {
+            action,
+            input: String::new(),
+            error: None,
+            editing_index: None,
+            enabled: true,
+        });
+    }
+
+    fn edit_selected_filter(&mut self) {
+        let Some(rule) = self.process_filters.get(self.filter_selected) else {
+            return;
+        };
+        self.filter_editor = Some(FilterEditor {
+            action: rule.action,
+            input: rule.expression.clone(),
+            error: None,
+            editing_index: Some(self.filter_selected),
+            enabled: rule.enabled,
+        });
+    }
+
+    fn apply_filter_editor(&mut self) {
+        let language = self.language();
+        let Some(editor) = &mut self.filter_editor else {
+            return;
+        };
+        let expression = editor.input.trim();
+        if expression.is_empty() {
+            editor.error = Some(
+                text(
+                    language,
+                    "filter expression cannot be empty",
+                    "过滤表达式不能为空",
+                )
+                .into(),
+            );
+            return;
+        }
+        if let Err(error) = ProcessQuery::parse(expression) {
+            editor.error = Some(error);
+            return;
+        }
+        let rule = ProcessFilterRule {
+            action: editor.action,
+            expression: expression.into(),
+            enabled: editor.enabled,
+        };
+        if let Some(index) = editor.editing_index {
+            self.process_filters[index] = rule;
+            self.filter_selected = index;
+        } else {
+            self.process_filters.push(rule);
+            self.filter_selected = self.process_filters.len() - 1;
+        }
+        self.filter_editor = None;
+        self.persist_process_filters();
+        self.rebuild_visible();
+    }
+
+    fn toggle_selected_filter(&mut self) {
+        let Some(rule) = self.process_filters.get_mut(self.filter_selected) else {
+            return;
+        };
+        rule.enabled = !rule.enabled;
+        if let Err(error) = CompiledProcessFilters::compile(&self.process_filters) {
+            if let Some(rule) = self.process_filters.get_mut(self.filter_selected) {
+                rule.enabled = !rule.enabled;
+            }
+            self.filter_error = Some(error);
+            return;
+        }
+        self.persist_process_filters();
+        self.rebuild_visible();
+    }
+
+    fn remove_selected_filter(&mut self) {
+        if self.process_filters.is_empty() {
+            return;
+        }
+        self.process_filters.remove(self.filter_selected);
+        self.filter_selected = self
+            .filter_selected
+            .min(self.process_filters.len().saturating_sub(1));
+        self.persist_process_filters();
+        self.rebuild_visible();
+    }
+
     fn capture_baseline(&mut self) {
         self.baseline = Some(BaselineSnapshot::capture(
             &self.processes,
@@ -2360,6 +2787,9 @@ impl App {
                     query_editing: self.searching,
                     query_error: self.search_error.as_deref(),
                     query_matches: self.search_matches,
+                    process_filters: &self.process_filters,
+                    filter_error: self.filter_error.as_deref(),
+                    filtered_processes: self.filtered_processes,
                     paused: self.paused,
                     sort_mode: self.sort_mode,
                     processes: &self.processes,
@@ -2404,12 +2834,18 @@ impl App {
         });
         self.notice = Some(match result {
             Ok(path) => StatusNotice {
-                message: format!("report saved: {}", path.display()),
+                message: match self.language() {
+                    UiLanguage::English => format!("report saved: {}", path.display()),
+                    UiLanguage::Chinese => format!("报告已保存：{}", path.display()),
+                },
                 is_error: false,
                 observed_at: Instant::now(),
             },
             Err(error) => StatusNotice {
-                message: format!("report export failed: {error}"),
+                message: match self.language() {
+                    UiLanguage::English => format!("report export failed: {error}"),
+                    UiLanguage::Chinese => format!("报告导出失败：{error}"),
+                },
                 is_error: true,
                 observed_at: Instant::now(),
             },
@@ -2439,7 +2875,10 @@ impl App {
             Err(error) => {
                 self.show_network = false;
                 self.notice = Some(StatusNotice {
-                    message: format!("cannot start network scan: {error}"),
+                    message: match self.language() {
+                        UiLanguage::English => format!("cannot start network scan: {error}"),
+                        UiLanguage::Chinese => format!("无法启动网络扫描：{error}"),
+                    },
                     is_error: true,
                     observed_at: Instant::now(),
                 });
@@ -2651,7 +3090,12 @@ impl App {
     fn open_process_action_for_mode(&mut self, pid: Pid, mode: ProcessActionDialogMode) {
         let Some(process) = self.processes.get(&pid) else {
             self.notice = Some(StatusNotice {
-                message: format!("cannot control PID {pid}: process is no longer visible"),
+                message: match self.language() {
+                    UiLanguage::English => {
+                        format!("cannot control PID {pid}: process is no longer visible")
+                    }
+                    UiLanguage::Chinese => format!("无法操作 PID {pid}：进程已不可见"),
+                },
                 is_error: true,
                 observed_at: Instant::now(),
             });
@@ -2659,10 +3103,15 @@ impl App {
         };
         if pid.as_u32() <= 1 || pid.as_u32() == std::process::id() {
             self.notice = Some(StatusNotice {
-                message: format!(
-                    "cannot control {} [{}]: protected process",
-                    process.name, pid
-                ),
+                message: match self.language() {
+                    UiLanguage::English => format!(
+                        "cannot control {} [{}]: protected process",
+                        process.name, pid
+                    ),
+                    UiLanguage::Chinese => {
+                        format!("无法操作 {} [{}]：受保护进程", process.name, pid)
+                    }
+                },
                 is_error: true,
                 observed_at: Instant::now(),
             });
@@ -2670,10 +3119,15 @@ impl App {
         }
         if process.start_time == 0 {
             self.notice = Some(StatusNotice {
-                message: format!(
-                    "cannot control {} [{}]: process instance identity is unavailable",
-                    process.name, pid
-                ),
+                message: match self.language() {
+                    UiLanguage::English => format!(
+                        "cannot control {} [{}]: process instance identity is unavailable",
+                        process.name, pid
+                    ),
+                    UiLanguage::Chinese => {
+                        format!("无法操作 {} [{}]：无法确认进程实例身份", process.name, pid)
+                    }
+                },
                 is_error: true,
                 observed_at: Instant::now(),
             });
@@ -2739,14 +3193,28 @@ impl App {
             .map(|detail| format!(": {detail}"))
             .unwrap_or_default();
         self.notice = Some(StatusNotice {
-            message: format!(
-                "{} {} to {} [{}]{}",
-                outcome.label(),
-                action.label(),
-                target.name,
-                target.pid,
-                detail
-            ),
+            message: match self.language() {
+                UiLanguage::English => format!(
+                    "{} {} to {} [{}]{}",
+                    outcome.label(),
+                    action.label(),
+                    target.name,
+                    target.pid,
+                    detail
+                ),
+                UiLanguage::Chinese => format!(
+                    "{} {} 至 {} [{}]{}",
+                    match &outcome {
+                        ProcessActionOutcome::Sent => "已发送",
+                        ProcessActionOutcome::Refused(_) => "已拒绝",
+                        ProcessActionOutcome::Failed(_) => "失败",
+                    },
+                    action.label(),
+                    target.name,
+                    target.pid,
+                    detail
+                ),
+            },
             is_error: outcome.is_error(),
             observed_at: Instant::now(),
         });
@@ -2771,6 +3239,18 @@ impl App {
         self.pid_input_error = None;
     }
 
+    fn process_passes_filters(&self, pid: Pid) -> bool {
+        let Some(process) = self.processes.get(&pid) else {
+            return false;
+        };
+        let Ok(filters) = CompiledProcessFilters::compile(&self.process_filters) else {
+            return true;
+        };
+        let subtree = self.resources.get(&pid).copied().unwrap_or_default();
+        let direct_children = self.children.get(&Some(pid)).map(Vec::len).unwrap_or(0);
+        filters.matches(process, subtree, direct_children)
+    }
+
     fn finish_pid_input(&mut self) {
         let Some(input) = self.pid_input.as_deref() else {
             return;
@@ -2778,21 +3258,52 @@ impl App {
         let pid_number = match input.parse::<u32>() {
             Ok(pid) => pid,
             Err(_) => {
-                self.pid_input_error = Some("PID must fit in an unsigned 32-bit number".into());
+                self.pid_input_error = Some(
+                    text(
+                        self.language(),
+                        "PID must fit in an unsigned 32-bit number",
+                        "PID 必须是有效的 32 位无符号整数",
+                    )
+                    .into(),
+                );
                 return;
             }
         };
         let pid = Pid::from_u32(pid_number);
         if !self.processes.contains_key(&pid) {
-            self.pid_input_error = Some(format!("PID {pid_number} is not visible"));
+            self.pid_input_error = Some(match self.language() {
+                UiLanguage::English => format!("PID {pid_number} is not visible"),
+                UiLanguage::Chinese => format!("PID {pid_number} 当前不可见"),
+            });
+            return;
+        }
+        if !self.process_passes_filters(pid) {
+            self.pid_input_error = Some(match self.language() {
+                UiLanguage::English => {
+                    format!("PID {pid_number} is hidden by process filters; press Esc then F")
+                }
+                UiLanguage::Chinese => {
+                    format!("PID {pid_number} 已被进程过滤器隐藏；按 Esc 后再按 F 管理")
+                }
+            });
             return;
         }
         self.jump_to_process(pid);
     }
 
-    fn guidance_error_notice(&mut self, action: &str, error: std::io::Error) {
+    fn guidance_error_notice(
+        &mut self,
+        english_action: &str,
+        chinese_action: &str,
+        error: std::io::Error,
+    ) {
         self.notice = Some(StatusNotice {
-            message: format!("{action}, but the preference could not be saved: {error}"),
+            message: match self.language() {
+                UiLanguage::English => {
+                    format!("{english_action}, but the preference could not be saved: {error}")
+                }
+                UiLanguage::Chinese => format!("{chinese_action}，但无法保存偏好：{error}"),
+            },
             is_error: true,
             observed_at: Instant::now(),
         });
@@ -2800,17 +3311,25 @@ impl App {
 
     fn dismiss_guidance(&mut self) {
         if let Err(error) = self.guidance.dismiss() {
-            self.guidance_error_notice("Guidance closed", error);
+            self.guidance_error_notice("Guidance closed", "引导已关闭", error);
         }
     }
 
     fn disable_startup_guidance(&mut self) {
         if let Err(error) = self.guidance.disable_startup() {
-            self.guidance_error_notice("Startup cards disabled for this session", error);
+            self.guidance_error_notice(
+                "Startup cards disabled for this session",
+                "本次启动卡片已关闭",
+                error,
+            );
         } else {
             self.notice = Some(StatusNotice {
-                message: "Startup help and tips disabled; press ? then T to enable tips again"
-                    .into(),
+                message: text(
+                    self.language(),
+                    "Startup help and tips disabled; press ? then T to enable tips again",
+                    "启动手册和提示已停用；按 ? 后再按 T 可重新启用",
+                )
+                .into(),
                 is_error: false,
                 observed_at: Instant::now(),
             });
@@ -2821,22 +3340,33 @@ impl App {
         match self.guidance.toggle_tips() {
             Ok(enabled) => {
                 self.notice = Some(StatusNotice {
-                    message: format!(
-                        "Startup tips {}",
-                        if enabled { "enabled" } else { "disabled" }
-                    ),
+                    message: match self.language() {
+                        UiLanguage::English => format!(
+                            "Startup tips {}",
+                            if enabled { "enabled" } else { "disabled" }
+                        ),
+                        UiLanguage::Chinese => {
+                            format!("启动提示已{}", if enabled { "启用" } else { "停用" })
+                        }
+                    },
                     is_error: false,
                     observed_at: Instant::now(),
                 });
             }
-            Err(error) => {
-                self.guidance_error_notice("Tip preference changed for this session", error)
-            }
+            Err(error) => self.guidance_error_notice(
+                "Tip preference changed for this session",
+                "本次提示偏好已更改",
+                error,
+            ),
         }
     }
 
     pub(crate) fn on_key(&mut self, key: KeyEvent) -> bool {
         if key.kind != KeyEventKind::Press {
+            return false;
+        }
+        if key.code == KeyCode::F(2) && key.modifiers.is_empty() {
+            self.toggle_language();
             return false;
         }
         if let Some(overlay) = self.guidance.overlay {
@@ -2862,6 +3392,10 @@ impl App {
                         self.guidance.open_help();
                         return false;
                     }
+                    KeyCode::Char('L') => {
+                        self.toggle_language();
+                        return false;
+                    }
                     _ => self.dismiss_guidance(),
                 }
             } else {
@@ -2875,6 +3409,7 @@ impl App {
                     KeyCode::Right | KeyCode::Down | KeyCode::Tab => self.guidance.next_page(),
                     KeyCode::Char('d' | 'D') => self.disable_startup_guidance(),
                     KeyCode::Char('t' | 'T') => self.toggle_startup_tips(),
+                    KeyCode::Char('L') => self.toggle_language(),
                     KeyCode::Char('?') if overlay == GuidanceOverlay::Help => {
                         self.dismiss_guidance();
                     }
@@ -2885,6 +3420,7 @@ impl App {
         }
         if !self.searching
             && !self.network_searching
+            && !self.show_filter_manager
             && self.pid_input.is_none()
             && key.modifiers.is_empty()
             && key.code == KeyCode::Char('o')
@@ -2972,6 +3508,49 @@ impl App {
                     return true;
                 }
                 _ => {}
+            }
+            return false;
+        }
+        if self.show_filter_manager {
+            if let Some(editor) = &mut self.filter_editor {
+                match key.code {
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return true;
+                    }
+                    KeyCode::Esc => self.filter_editor = None,
+                    KeyCode::Enter => self.apply_filter_editor(),
+                    KeyCode::Tab => editor.action = editor.action.toggle(),
+                    KeyCode::Backspace => {
+                        editor.input.pop();
+                        editor.error = None;
+                    }
+                    KeyCode::Char(character) if key.modifiers.is_empty() => {
+                        editor.input.push(character);
+                        editor.error = None;
+                    }
+                    _ => {}
+                }
+            } else {
+                match key.code {
+                    KeyCode::Char('q') => return true,
+                    KeyCode::Esc | KeyCode::Char('F') => self.close_filter_manager(),
+                    KeyCode::Char('a') => self.start_filter_editor(FilterAction::Include),
+                    KeyCode::Char('x') => self.start_filter_editor(FilterAction::Exclude),
+                    KeyCode::Char('e') | KeyCode::Enter => self.edit_selected_filter(),
+                    KeyCode::Char(' ') => self.toggle_selected_filter(),
+                    KeyCode::Char('d') | KeyCode::Delete => self.remove_selected_filter(),
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.filter_selected = (self.filter_selected + 1)
+                            .min(self.process_filters.len().saturating_sub(1));
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.filter_selected = self.filter_selected.saturating_sub(1);
+                    }
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return true;
+                    }
+                    _ => {}
+                }
             }
             return false;
         }
@@ -3477,6 +4056,7 @@ impl App {
                 self.begin_pid_input(c);
             }
             KeyCode::Char('f') => self.toggle_focus(),
+            KeyCode::Char('F') => self.open_filter_manager(),
             KeyCode::Char('s') => self.cycle_sort_mode(),
             KeyCode::Char('r') => self.refresh(),
             KeyCode::Char(' ') => self.toggle_paused(),
@@ -3514,6 +4094,7 @@ impl App {
             KeyCode::Char('m') => self.open_service_context(),
             KeyCode::Char('v') => self.open_executable_context(),
             KeyCode::Char('l') => self.open_logs_context(),
+            KeyCode::Char('L') => self.toggle_language(),
             KeyCode::Char('k') => self.open_selected_process_termination(),
             KeyCode::Char('p') => self.open_selected_process_action(),
             KeyCode::Char('?') => self.guidance.open_help(),
