@@ -96,9 +96,39 @@ grep -q 'file' "$prefix/share/fish/vendor_completions.d/psmore.fish" || fail 'fi
 grep -q 'run' "$prefix/share/bash-completion/completions/psmore" || fail 'bash completion is missing the run command'
 grep -q 'run' "$prefix/share/zsh/site-functions/_psmore" || fail 'zsh completion is missing the run command'
 grep -q 'run' "$prefix/share/fish/vendor_completions.d/psmore.fish" || fail 'fish completion is missing the run command'
+grep -q 'service' "$prefix/share/bash-completion/completions/psmore" || fail 'bash completion is missing the service command'
+grep -q 'service' "$prefix/share/zsh/site-functions/_psmore" || fail 'zsh completion is missing the service command'
+grep -q 'service' "$prefix/share/fish/vendor_completions.d/psmore.fish" || fail 'fish completion is missing the service command'
+grep -q 'exe' "$prefix/share/bash-completion/completions/psmore" || fail 'bash completion is missing the exe command'
+grep -q 'exe' "$prefix/share/zsh/site-functions/_psmore" || fail 'zsh completion is missing the exe command'
+grep -q 'exe' "$prefix/share/fish/vendor_completions.d/psmore.fish" || fail 'fish completion is missing the exe command'
+grep -q 'stale' "$prefix/share/bash-completion/completions/psmore" || fail 'bash completion is missing the stale command'
+grep -q 'stale' "$prefix/share/zsh/site-functions/_psmore" || fail 'zsh completion is missing the stale command'
+grep -q 'stale' "$prefix/share/fish/vendor_completions.d/psmore.fish" || fail 'fish completion is missing the stale command'
+grep -q 'stale' "$prefix/share/bash-completion/completions/psmore" || fail 'bash completion is missing the stale command'
+grep -q 'stale' "$prefix/share/zsh/site-functions/_psmore" || fail 'zsh completion is missing the stale command'
+grep -q 'stale' "$prefix/share/fish/vendor_completions.d/psmore.fish" || fail 'fish completion is missing the stale command'
 file_report="$temp_dir/file-report.json"
 "$prefix/bin/psmore" file "$prefix/bin/psmore" --json --limit 1 > "$file_report"
 grep -q '"schema": "psmore.file-usage"' "$file_report" || fail 'installed file command returned an unexpected schema'
+
+service_report="$temp_dir/service-report.json"
+"$prefix/bin/psmore" service "$$" --json > "$service_report"
+grep -q '"schema": "psmore.service-context"' "$service_report" || fail 'installed service command returned an unexpected schema'
+
+exe_report="$temp_dir/exe-report.json"
+"$prefix/bin/psmore" exe "$$" --json --no-hash > "$exe_report"
+grep -q '"schema": "psmore.executable-image"' "$exe_report" || fail 'installed exe command returned an unexpected schema'
+
+if [ "$(uname -s)" = Linux ]; then
+    cgroup_report="$temp_dir/cgroup-report.json"
+    "$prefix/bin/psmore" cgroup --json --limit 1 > "$cgroup_report"
+    grep -q '"schema": "psmore.linux-cgroups"' "$cgroup_report" || fail 'installed cgroup command returned an unexpected schema'
+
+    stale_report="$temp_dir/stale-report.json"
+    "$prefix/bin/psmore" stale --json --limit 1 > "$stale_report"
+    grep -q '"schema": "psmore.stale-executables"' "$stale_report" || fail 'installed stale command returned an unexpected schema'
+fi
 
 run_report="$temp_dir/run-report.json"
 set +e

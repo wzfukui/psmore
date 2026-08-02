@@ -67,6 +67,11 @@ pub(crate) const TIPS: &[Tip] = &[
         keys: "t trend  |  i CPU/memory or I/O",
     },
     Tip {
+        title: "Verify what is actually running",
+        body: "Compare the selected process image with the current disk path, package, hash, and code signature after a deploy.",
+        keys: "v verify image  |  h hash on/off  |  m service context",
+    },
+    Tip {
         title: "Export the context you already collected",
         body: "The report includes the current tree, query, attention findings, events, actions, and any opened diagnostic panels.",
         keys: "o private JSON report",

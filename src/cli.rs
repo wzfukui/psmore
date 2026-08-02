@@ -9,6 +9,12 @@ pub(crate) enum LaunchMode {
     CheckJson,
     InspectTable,
     InspectJson,
+    ExeTable,
+    ExeJson,
+    StaleTable,
+    StaleJson,
+    ServiceTable,
+    ServiceJson,
     PortTable,
     PortJson,
     ListenTable,
@@ -21,6 +27,8 @@ pub(crate) enum LaunchMode {
     TraceJsonl,
     RunTable,
     RunJson,
+    CgroupTable,
+    CgroupJson,
     DeletedTable,
     DeletedJson,
     FileTable,
@@ -46,12 +54,16 @@ pub(crate) enum LaunchMode {
 pub(crate) enum HelpTopic {
     Check,
     Inspect,
+    Exe,
+    Stale,
+    Service,
     Port,
     Listen,
     Tree,
     Watch,
     Trace,
     Run,
+    Cgroup,
     Deleted,
     File,
     Fd,
@@ -124,6 +136,26 @@ pub(crate) enum CheckExpectation {
     #[default]
     None,
     Any,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum CgroupSort {
+    Cpu,
+    #[default]
+    Memory,
+    Pressure,
+    Processes,
+}
+
+impl CgroupSort {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Memory => "memory",
+            Self::Pressure => "pressure",
+            Self::Processes => "processes",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -208,6 +240,11 @@ pub(crate) struct Cli {
     pub(crate) diff_output: Option<String>,
     pub(crate) diff_force: bool,
     pub(crate) inspect_pid: Option<u32>,
+    pub(crate) exe_pid: Option<u32>,
+    pub(crate) exe_hash: bool,
+    pub(crate) stale_limit: Option<usize>,
+    pub(crate) stale_expectation: Option<CheckExpectation>,
+    pub(crate) service_pid: Option<u32>,
     pub(crate) port: Option<u16>,
     pub(crate) port_protocol: PortProtocol,
     pub(crate) port_all: bool,
@@ -228,6 +265,8 @@ pub(crate) struct Cli {
     pub(crate) run_descendant_grace_ms: u64,
     pub(crate) run_output: Option<String>,
     pub(crate) run_force: bool,
+    pub(crate) cgroup_sort: CgroupSort,
+    pub(crate) cgroup_limit: Option<usize>,
     pub(crate) deleted_min_size: u64,
     pub(crate) deleted_expectation: Option<CheckExpectation>,
     pub(crate) file_path: Option<String>,
@@ -276,6 +315,11 @@ impl Default for Cli {
             diff_output: None,
             diff_force: false,
             inspect_pid: None,
+            exe_pid: None,
+            exe_hash: true,
+            stale_limit: Some(100),
+            stale_expectation: None,
+            service_pid: None,
             port: None,
             port_protocol: PortProtocol::Any,
             port_all: false,
@@ -296,6 +340,8 @@ impl Default for Cli {
             run_descendant_grace_ms: 1_000,
             run_output: None,
             run_force: false,
+            cgroup_sort: CgroupSort::Memory,
+            cgroup_limit: Some(20),
             deleted_min_size: 0,
             deleted_expectation: None,
             file_path: None,
@@ -345,6 +391,7 @@ impl Cli {
                 "watch" => Some((parse_watch(&arguments[1..]), HelpTopic::Watch)),
                 "trace" => Some((parse_trace(&arguments[1..]), HelpTopic::Trace)),
                 "run" => Some((parse_run(&arguments[1..]), HelpTopic::Run)),
+                "cgroup" => Some((parse_cgroup(&arguments[1..]), HelpTopic::Cgroup)),
                 "deleted" => Some((parse_deleted(&arguments[1..]), HelpTopic::Deleted)),
                 "file" => Some((parse_file(&arguments[1..]), HelpTopic::File)),
                 "fd" => Some((parse_fd(&arguments[1..]), HelpTopic::Fd)),
@@ -355,6 +402,9 @@ impl Cli {
                 "check" => Some((parse_check(&arguments[1..]), HelpTopic::Check)),
                 "listen" => Some((parse_listen(&arguments[1..]), HelpTopic::Listen)),
                 "inspect" => Some((parse_inspect(&arguments[1..]), HelpTopic::Inspect)),
+                "exe" => Some((parse_exe(&arguments[1..]), HelpTopic::Exe)),
+                "stale" => Some((parse_stale(&arguments[1..]), HelpTopic::Stale)),
+                "service" => Some((parse_service(&arguments[1..]), HelpTopic::Service)),
                 "port" => Some((parse_port(&arguments[1..]), HelpTopic::Port)),
                 "tree" => Some((parse_tree(&arguments[1..]), HelpTopic::Tree)),
                 "diff" => Some((parse_diff(&arguments[1..]), HelpTopic::Diff)),
@@ -1897,6 +1947,138 @@ fn set_run_grace(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(),
     Ok(())
 }
 
+fn parse_cgroup(arguments: &[String]) -> Result<Cli, String> {
+    let mut cli = Cli {
+        mode: LaunchMode::CgroupTable,
+        ..Cli::default()
+    };
+    let mut output_mode = None;
+    let mut query_set = false;
+    let mut sort_set = false;
+    let mut limit_set = false;
+    let mut sample_set = false;
+    let mut positional_filter = Vec::new();
+    let mut arguments = arguments.iter().cloned().peekable();
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "-h" | "--help" => cli.mode = LaunchMode::Help,
+            "-V" | "--version" => cli.mode = LaunchMode::Version,
+            "--table" => {
+                set_cgroup_output_mode(&mut cli.mode, &mut output_mode, LaunchMode::CgroupTable)?
+            }
+            "--json" => {
+                set_cgroup_output_mode(&mut cli.mode, &mut output_mode, LaunchMode::CgroupJson)?
+            }
+            "-q" | "--query" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| format!("{argument} requires a value"))?;
+                set_query(&mut cli, &mut query_set, value)?;
+            }
+            "--by" => {
+                let value = arguments.next().ok_or_else(|| {
+                    "--by requires cpu, memory, pressure, or processes".to_string()
+                })?;
+                set_cgroup_sort(&mut cli, &mut sort_set, &value)?;
+            }
+            "--limit" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--limit requires a positive integer or all".to_string())?;
+                set_cgroup_limit(&mut cli, &mut limit_set, &value)?;
+            }
+            "--sample-ms" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--sample-ms requires a value".to_string())?;
+                set_sample_ms(&mut cli, &mut sample_set, &value)?;
+            }
+            _ if argument.starts_with("--query=") => set_query(
+                &mut cli,
+                &mut query_set,
+                argument.trim_start_matches("--query=").to_string(),
+            )?,
+            _ if argument.starts_with("--by=") => set_cgroup_sort(
+                &mut cli,
+                &mut sort_set,
+                argument.trim_start_matches("--by="),
+            )?,
+            _ if argument.starts_with("--limit=") => set_cgroup_limit(
+                &mut cli,
+                &mut limit_set,
+                argument.trim_start_matches("--limit="),
+            )?,
+            _ if argument.starts_with("--sample-ms=") => set_sample_ms(
+                &mut cli,
+                &mut sample_set,
+                argument.trim_start_matches("--sample-ms="),
+            )?,
+            _ if argument.starts_with('-') => {
+                return Err(format!("unknown cgroup option: {argument}"));
+            }
+            _ => positional_filter.push(argument),
+        }
+    }
+    if matches!(cli.mode, LaunchMode::Help | LaunchMode::Version) {
+        return Ok(cli);
+    }
+    if !positional_filter.is_empty() {
+        if query_set {
+            return Err("cgroup filter may be positional or passed with --query, not both".into());
+        }
+        set_query(&mut cli, &mut query_set, positional_filter.join(" "))?;
+    }
+    Ok(cli)
+}
+
+fn set_cgroup_output_mode(
+    mode: &mut LaunchMode,
+    output_mode: &mut Option<LaunchMode>,
+    requested: LaunchMode,
+) -> Result<(), String> {
+    if output_mode.replace(requested).is_some() {
+        return Err("cgroup output mode may only be specified once".into());
+    }
+    if !matches!(mode, LaunchMode::Help | LaunchMode::Version) {
+        *mode = requested;
+    }
+    Ok(())
+}
+
+fn set_cgroup_sort(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+    if *value_set {
+        return Err("--by may only be specified once".into());
+    }
+    cli.cgroup_sort = match value.to_ascii_lowercase().as_str() {
+        "cpu" => CgroupSort::Cpu,
+        "memory" | "mem" => CgroupSort::Memory,
+        "pressure" | "percent" | "utilization" => CgroupSort::Pressure,
+        "processes" | "procs" | "pids" => CgroupSort::Processes,
+        _ => return Err("--by requires cpu, memory, pressure, or processes".into()),
+    };
+    *value_set = true;
+    Ok(())
+}
+
+fn set_cgroup_limit(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+    if *value_set {
+        return Err("--limit may only be specified once".into());
+    }
+    cli.cgroup_limit = if value.eq_ignore_ascii_case("all") {
+        None
+    } else {
+        let limit = value
+            .parse::<usize>()
+            .map_err(|_| "--limit requires a positive integer or all".to_string())?;
+        if !(1..=10_000).contains(&limit) {
+            return Err("--limit must be between 1 and 10000, or all".into());
+        }
+        Some(limit)
+    };
+    *value_set = true;
+    Ok(())
+}
+
 fn parse_watch(arguments: &[String]) -> Result<Cli, String> {
     let mut cli = Cli {
         mode: LaunchMode::WatchTable,
@@ -2449,6 +2631,261 @@ fn set_inspect_output_mode(
     Ok(())
 }
 
+fn parse_exe(arguments: &[String]) -> Result<Cli, String> {
+    let mut cli = Cli {
+        mode: LaunchMode::ExeTable,
+        ..Cli::default()
+    };
+    let mut output_mode = None;
+    let mut pids = Vec::new();
+    for argument in arguments {
+        match argument.as_str() {
+            "-h" | "--help" => cli.mode = LaunchMode::Help,
+            "-V" | "--version" => cli.mode = LaunchMode::Version,
+            "--table" => {
+                set_exe_output_mode(&mut cli.mode, &mut output_mode, LaunchMode::ExeTable)?
+            }
+            "--json" => set_exe_output_mode(&mut cli.mode, &mut output_mode, LaunchMode::ExeJson)?,
+            "--no-hash" => {
+                if !cli.exe_hash {
+                    return Err("exe --no-hash may only be specified once".into());
+                }
+                cli.exe_hash = false;
+            }
+            _ if argument.starts_with('-') => {
+                return Err(format!("unknown exe option: {argument}"));
+            }
+            _ => pids.push(argument.clone()),
+        }
+    }
+    if matches!(cli.mode, LaunchMode::Help | LaunchMode::Version) {
+        return Ok(cli);
+    }
+    if pids.len() != 1 {
+        return Err(format!(
+            "exe requires exactly one PID; received {}",
+            pids.len()
+        ));
+    }
+    let pid = pids[0]
+        .parse::<u32>()
+        .map_err(|_| format!("invalid PID: {}", pids[0]))?;
+    if pid == 0 {
+        return Err("exe requires a real process PID greater than 0".into());
+    }
+    if pid > i32::MAX as u32 {
+        return Err(format!("PID {pid} exceeds the supported system PID range"));
+    }
+    cli.exe_pid = Some(pid);
+    Ok(cli)
+}
+
+fn set_exe_output_mode(
+    mode: &mut LaunchMode,
+    output_mode: &mut Option<LaunchMode>,
+    requested: LaunchMode,
+) -> Result<(), String> {
+    if output_mode.is_some_and(|existing| existing != requested) {
+        return Err("exe --table and --json cannot be used together".into());
+    }
+    *output_mode = Some(requested);
+    if !matches!(mode, LaunchMode::Help | LaunchMode::Version) {
+        *mode = requested;
+    }
+    Ok(())
+}
+
+fn parse_stale(arguments: &[String]) -> Result<Cli, String> {
+    let mut cli = Cli {
+        mode: LaunchMode::StaleTable,
+        ..Cli::default()
+    };
+    let mut output_mode = None;
+    let mut query_set = false;
+    let mut sample_set = false;
+    let mut limit_set = false;
+    let mut expectation_set = false;
+    let mut positional_query = Vec::new();
+    let mut arguments = arguments.iter().cloned().peekable();
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "-h" | "--help" => cli.mode = LaunchMode::Help,
+            "-V" | "--version" => cli.mode = LaunchMode::Version,
+            "--table" => {
+                set_stale_output_mode(&mut cli.mode, &mut output_mode, LaunchMode::StaleTable)?
+            }
+            "--json" => {
+                set_stale_output_mode(&mut cli.mode, &mut output_mode, LaunchMode::StaleJson)?
+            }
+            "--quiet" => cli.quiet = true,
+            "-q" | "--query" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| format!("{argument} requires a value"))?;
+                set_query(&mut cli, &mut query_set, value)?;
+            }
+            "--sample-ms" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--sample-ms requires a value".to_string())?;
+                set_sample_ms(&mut cli, &mut sample_set, &value)?;
+            }
+            "--limit" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "stale --limit requires 1-10000 or all".to_string())?;
+                set_stale_limit(&mut cli, &mut limit_set, &value)?;
+            }
+            "--expect" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "stale --expect requires none or any".to_string())?;
+                set_stale_expectation(&mut cli, &mut expectation_set, &value)?;
+            }
+            _ if argument.starts_with("--query=") => set_query(
+                &mut cli,
+                &mut query_set,
+                argument.trim_start_matches("--query=").to_string(),
+            )?,
+            _ if argument.starts_with("--sample-ms=") => set_sample_ms(
+                &mut cli,
+                &mut sample_set,
+                argument.trim_start_matches("--sample-ms="),
+            )?,
+            _ if argument.starts_with("--limit=") => set_stale_limit(
+                &mut cli,
+                &mut limit_set,
+                argument.trim_start_matches("--limit="),
+            )?,
+            _ if argument.starts_with("--expect=") => set_stale_expectation(
+                &mut cli,
+                &mut expectation_set,
+                argument.trim_start_matches("--expect="),
+            )?,
+            _ if argument.starts_with('-') => {
+                return Err(format!("unknown stale option: {argument}"));
+            }
+            _ => positional_query.push(argument),
+        }
+    }
+    if matches!(cli.mode, LaunchMode::Help | LaunchMode::Version) {
+        return Ok(cli);
+    }
+    if !positional_query.is_empty() {
+        if query_set {
+            return Err("stale query may be positional or passed with --query, not both".into());
+        }
+        set_query(&mut cli, &mut query_set, positional_query.join(" "))?;
+    }
+    if cli.quiet && cli.stale_expectation.is_none() {
+        return Err("stale --quiet requires --expect any or --expect none".into());
+    }
+    Ok(cli)
+}
+
+fn set_stale_output_mode(
+    mode: &mut LaunchMode,
+    output_mode: &mut Option<LaunchMode>,
+    requested: LaunchMode,
+) -> Result<(), String> {
+    if output_mode.is_some_and(|existing| existing != requested) {
+        return Err("stale --table and --json cannot be used together".into());
+    }
+    *output_mode = Some(requested);
+    if !matches!(mode, LaunchMode::Help | LaunchMode::Version) {
+        *mode = requested;
+    }
+    Ok(())
+}
+
+fn set_stale_limit(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+    if *value_set {
+        return Err("stale --limit may only be specified once".into());
+    }
+    cli.stale_limit = if value.eq_ignore_ascii_case("all") {
+        None
+    } else {
+        let limit = value
+            .parse::<usize>()
+            .map_err(|_| format!("invalid stale --limit value: {value}; use 1-10000 or all"))?;
+        if !(1..=10_000).contains(&limit) {
+            return Err("stale --limit must be between 1 and 10000, or all".into());
+        }
+        Some(limit)
+    };
+    *value_set = true;
+    Ok(())
+}
+
+fn set_stale_expectation(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+    if *value_set {
+        return Err("stale --expect may only be specified once".into());
+    }
+    cli.stale_expectation = Some(parse_expectation(value)?);
+    *value_set = true;
+    Ok(())
+}
+
+fn parse_service(arguments: &[String]) -> Result<Cli, String> {
+    let mut cli = Cli {
+        mode: LaunchMode::ServiceTable,
+        ..Cli::default()
+    };
+    let mut output_mode = None;
+    let mut pids = Vec::new();
+    for argument in arguments {
+        match argument.as_str() {
+            "-h" | "--help" => cli.mode = LaunchMode::Help,
+            "-V" | "--version" => cli.mode = LaunchMode::Version,
+            "--table" => {
+                set_service_output_mode(&mut cli.mode, &mut output_mode, LaunchMode::ServiceTable)?
+            }
+            "--json" => {
+                set_service_output_mode(&mut cli.mode, &mut output_mode, LaunchMode::ServiceJson)?
+            }
+            _ if argument.starts_with('-') => {
+                return Err(format!("unknown service option: {argument}"));
+            }
+            _ => pids.push(argument.clone()),
+        }
+    }
+    if matches!(cli.mode, LaunchMode::Help | LaunchMode::Version) {
+        return Ok(cli);
+    }
+    if pids.len() != 1 {
+        return Err(format!(
+            "service requires exactly one PID; received {}",
+            pids.len()
+        ));
+    }
+    let pid = pids[0]
+        .parse::<u32>()
+        .map_err(|_| format!("invalid PID: {}", pids[0]))?;
+    if pid == 0 {
+        return Err("service requires a real process PID greater than 0".into());
+    }
+    if pid > i32::MAX as u32 {
+        return Err(format!("PID {pid} exceeds the supported system PID range"));
+    }
+    cli.service_pid = Some(pid);
+    Ok(cli)
+}
+
+fn set_service_output_mode(
+    mode: &mut LaunchMode,
+    output_mode: &mut Option<LaunchMode>,
+    requested: LaunchMode,
+) -> Result<(), String> {
+    if output_mode.is_some_and(|existing| existing != requested) {
+        return Err("service --table and --json cannot be used together".into());
+    }
+    *output_mode = Some(requested);
+    if !matches!(mode, LaunchMode::Help | LaunchMode::Version) {
+        *mode = requested;
+    }
+    Ok(())
+}
+
 fn parse_check(arguments: &[String]) -> Result<Cli, String> {
     let mut cli = Cli {
         mode: LaunchMode::CheckTable,
@@ -2834,6 +3271,9 @@ USAGE:
 COMMANDS:
   check       Evaluate a process query as an operations health gate
   inspect     Inspect one process, threads, sockets, files, and context
+  exe         Verify a process executable, disk drift, package, and signing
+  stale       Find Linux processes still holding deleted or replaced executables
+  service     Resolve a PID to its systemd or launchd service context
   port        Find the process and socket using a local port
   listen      Inventory listeners and classify non-loopback exposure
   net         Search all listeners and peer connections with process context
@@ -2846,6 +3286,7 @@ COMMANDS:
   fd          Rank processes by open file-descriptor pressure
   top         Rank current CPU, memory, and disk I/O hotspots
   oom         Diagnose Linux memory pressure and OOM kill priority
+  cgroup      Inventory Linux systemd/container resource boundaries
   doctor      Run conservative host and process triage in one command
   diff        Compare two process snapshots or host-doctor reports
   completion  Generate shell completion for bash, zsh, or fish
@@ -2907,6 +3348,76 @@ The PID identity is revalidated after collection; confirmed PID reuse is refused
 EXAMPLES:
   psmore inspect 1234
   psmore inspect 1234 --json > process-1234.json
+"
+        }
+        Some(HelpTopic::Exe) => {
+            "psmore exe - verify the executable image held by one process
+
+USAGE:
+  psmore exe PID [--table|--json] [--no-hash]
+
+OPTIONS:
+      --table    Human-readable image identity and provenance report [default]
+      --json     psmore.executable-image JSON
+      --no-hash  Skip SHA-256 reads; file identity and package/signing remain
+      --redact   Mask common secret values in the process command line
+
+Linux compares /proc/PID/exe device/inode and hash evidence with the current
+disk path, detecting unlinked or replaced running images. macOS verifies the
+current path's code signature and reports that independent mapped-image identity
+is unavailable. Hashing is capped at 1 GiB per image and PID identity is
+revalidated after collection.
+EXAMPLES:
+  psmore exe 1234
+  psmore exe 1234 --json > executable-1234.json
+  psmore exe 1234 --no-hash
+"
+        }
+        Some(HelpTopic::Stale) => {
+            "psmore stale - find Linux processes that still hold obsolete executables
+
+USAGE:
+  psmore stale [QUERY] [--limit N|all] [--table|--json]
+               [--expect none|any] [--quiet] [--sample-ms MS]
+
+OPTIONS:
+  -q, --query QUERY  Positional QUERY alternative; full psmore query language
+      --limit N|all  Maximum returned stale processes [default: 100]
+      --table        Human-readable restart-review list [default]
+      --json         psmore.stale-executables JSON
+      --expect MODE  Apply none/any health-gate policy before truncation
+      --quiet        Suppress output; requires --expect
+      --sample-ms M  Process query sampling interval [default: 500]
+      --redact       Mask common secret values in process command lines
+
+Linux only. /proc/PID/exe is compared with the current disk path by device and
+inode. A zero-match none policy is inconclusive when any query-eligible image
+was unreadable or raced with collection. psmore prints service owners and
+per-PID `psmore exe` follow-ups but never restarts a process.
+EXIT: 0 success/pass, 1 unsupported/error/inconclusive, 2 usage, 3 violation
+EXAMPLES:
+  psmore stale
+  psmore stale 'user:deploy age>5m' --limit all
+  psmore stale --expect none --quiet
+"
+        }
+        Some(HelpTopic::Service) => {
+            "psmore service - resolve one process to its service-manager context
+
+USAGE:
+  psmore service PID [--table|--json]
+
+OPTIONS:
+      --table   Human-readable manager, state, config, resources, and next steps [default]
+      --json    psmore.service-context JSON
+      --redact  Mask common secret values in the process command line
+
+Linux reads the process cgroup and queries systemd's machine-readable show
+properties. macOS maps the process ancestor chain through the current launchd
+bootstrap namespace. Collection is read-only and PID identity is revalidated.
+EXAMPLES:
+  psmore service 1234
+  psmore service 1234 --json > service-1234.json
 "
         }
         Some(HelpTopic::Port) => {
@@ -3184,6 +3695,32 @@ EXAMPLES:
   psmore oom name:api --min-score 700 --expect none --quiet
 "
         }
+        Some(HelpTopic::Cgroup) => {
+            "psmore cgroup - inventory Linux systemd/container resource boundaries
+
+USAGE:
+  psmore cgroup [FILTER] [--by cpu|memory|pressure|processes]
+                 [--limit N|all] [--table|--json] [--sample-ms MS]
+
+OPTIONS:
+  -q, --query TEXT  FILTER alternative; searches group and process context
+      --by METRIC   Sort by sampled CPU, kernel memory, limit pressure, or PIDs
+                    [default: memory]
+      --limit N|all Maximum returned leaf groups [default: 20]
+      --table       Human-readable boundary and member evidence [default]
+      --json        Versioned psmore.linux-cgroups JSON
+      --sample-ms M Process CPU and I/O sampling interval [default: 500]
+      --redact      Mask common secret values in process command lines
+
+Linux only. Process RSS and rates sum visible direct members; memory.current,
+limits, PID counts, CPU/I/O totals, and OOM events are hierarchical kernel
+evidence. Missing membership is reported as partial rather than ignored.
+EXAMPLES:
+  psmore cgroup
+  psmore cgroup docker --by pressure --limit all
+  psmore cgroup api.service --json
+"
+        }
         Some(HelpTopic::Doctor) => {
             "psmore doctor - run conservative host and process triage
 
@@ -3301,6 +3838,11 @@ mod tests {
                 diff_output: None,
                 diff_force: false,
                 inspect_pid: None,
+                exe_pid: None,
+                exe_hash: true,
+                stale_limit: Some(100),
+                stale_expectation: None,
+                service_pid: None,
                 port: None,
                 port_protocol: PortProtocol::Any,
                 port_all: false,
@@ -3321,6 +3863,8 @@ mod tests {
                 run_descendant_grace_ms: 1_000,
                 run_output: None,
                 run_force: false,
+                cgroup_sort: CgroupSort::Memory,
+                cgroup_limit: Some(20),
                 deleted_min_size: 0,
                 deleted_expectation: None,
                 file_path: None,
@@ -3538,6 +4082,27 @@ mod tests {
         );
         assert_eq!(
             Cli::parse([
+                "cgroup",
+                "docker",
+                "api",
+                "--by=pressure",
+                "--limit",
+                "all",
+                "--json",
+                "--sample-ms=750"
+            ])
+            .unwrap(),
+            Cli {
+                mode: LaunchMode::CgroupJson,
+                query: "docker api".into(),
+                sample_ms: 750,
+                cgroup_sort: CgroupSort::Pressure,
+                cgroup_limit: None,
+                ..Cli::default()
+            }
+        );
+        assert_eq!(
+            Cli::parse([
                 "run",
                 "--output=profile.json",
                 "--force",
@@ -3592,6 +4157,47 @@ mod tests {
                 mode: LaunchMode::InspectJson,
                 sample_ms: 300,
                 inspect_pid: Some(1_234),
+                ..Cli::default()
+            }
+        );
+        assert_eq!(
+            Cli::parse(["service", "4321", "--json", "--redact"]).unwrap(),
+            Cli {
+                mode: LaunchMode::ServiceJson,
+                service_pid: Some(4_321),
+                redact_secrets: true,
+                ..Cli::default()
+            }
+        );
+        assert_eq!(
+            Cli::parse(["exe", "4321", "--json", "--no-hash", "--redact"]).unwrap(),
+            Cli {
+                mode: LaunchMode::ExeJson,
+                exe_pid: Some(4_321),
+                exe_hash: false,
+                redact_secrets: true,
+                ..Cli::default()
+            }
+        );
+        assert_eq!(
+            Cli::parse([
+                "stale",
+                "user:deploy",
+                "age>5m",
+                "--limit=all",
+                "--json",
+                "--expect=none",
+                "--sample-ms=750",
+                "--redact",
+            ])
+            .unwrap(),
+            Cli {
+                mode: LaunchMode::StaleJson,
+                query: "user:deploy age>5m".into(),
+                sample_ms: 750,
+                stale_limit: None,
+                stale_expectation: Some(CheckExpectation::None),
+                redact_secrets: true,
                 ..Cli::default()
             }
         );
@@ -3781,12 +4387,16 @@ mod tests {
         for (command, topic) in [
             ("check", HelpTopic::Check),
             ("inspect", HelpTopic::Inspect),
+            ("exe", HelpTopic::Exe),
+            ("stale", HelpTopic::Stale),
+            ("service", HelpTopic::Service),
             ("port", HelpTopic::Port),
             ("listen", HelpTopic::Listen),
             ("tree", HelpTopic::Tree),
             ("watch", HelpTopic::Watch),
             ("trace", HelpTopic::Trace),
             ("run", HelpTopic::Run),
+            ("cgroup", HelpTopic::Cgroup),
             ("deleted", HelpTopic::Deleted),
             ("file", HelpTopic::File),
             ("fd", HelpTopic::Fd),
@@ -3879,6 +4489,31 @@ mod tests {
         assert!(Cli::parse(["run", "--output=a", "--output=b", "--", "worker"]).is_err());
         assert!(Cli::parse(["run", "--force", "--", "worker"]).is_err());
         assert!(Cli::parse(["run", "--table", "--output=a", "--", "worker"]).is_err());
+        assert!(Cli::parse(["service"]).is_err());
+        assert!(Cli::parse(["service", "0"]).is_err());
+        assert!(Cli::parse(["service", "nope"]).is_err());
+        assert!(Cli::parse(["service", "1", "2"]).is_err());
+        assert!(Cli::parse(["service", "1", "--table", "--json"]).is_err());
+        assert!(Cli::parse(["exe"]).is_err());
+        assert!(Cli::parse(["exe", "0"]).is_err());
+        assert!(Cli::parse(["exe", "nope"]).is_err());
+        assert!(Cli::parse(["exe", "1", "2"]).is_err());
+        assert!(Cli::parse(["exe", "1", "--table", "--json"]).is_err());
+        assert!(Cli::parse(["exe", "1", "--no-hash", "--no-hash"]).is_err());
+        assert!(Cli::parse(["stale", "--table", "--json"]).is_err());
+        assert!(Cli::parse(["stale", "api", "--query=worker"]).is_err());
+        assert!(Cli::parse(["stale", "--limit=0"]).is_err());
+        assert!(Cli::parse(["stale", "--limit=10001"]).is_err());
+        assert!(Cli::parse(["stale", "--limit=1", "--limit=all"]).is_err());
+        assert!(Cli::parse(["stale", "--sample-ms=99"]).is_err());
+        assert!(Cli::parse(["stale", "--expect=all"]).is_err());
+        assert!(Cli::parse(["stale", "--quiet"]).is_err());
+        assert!(Cli::parse(["cgroup", "--by=io"]).is_err());
+        assert!(Cli::parse(["cgroup", "--limit=0"]).is_err());
+        assert!(Cli::parse(["cgroup", "--limit=10001"]).is_err());
+        assert!(Cli::parse(["cgroup", "--table", "--json"]).is_err());
+        assert!(Cli::parse(["cgroup", "api", "--query=worker"]).is_err());
+        assert!(Cli::parse(["cgroup", "--sample-ms=99"]).is_err());
         assert!(Cli::parse(["deleted", "extra"]).is_err());
         assert!(Cli::parse(["deleted", "--min-size=nope"]).is_err());
         assert!(Cli::parse(["deleted", "--table", "--json"]).is_err());
@@ -3971,12 +4606,16 @@ mod tests {
         for (topic, command) in [
             (HelpTopic::Check, "check"),
             (HelpTopic::Inspect, "inspect"),
+            (HelpTopic::Exe, "exe"),
+            (HelpTopic::Stale, "stale"),
+            (HelpTopic::Service, "service"),
             (HelpTopic::Port, "port"),
             (HelpTopic::Listen, "listen"),
             (HelpTopic::Tree, "tree"),
             (HelpTopic::Watch, "watch"),
             (HelpTopic::Trace, "trace"),
             (HelpTopic::Run, "run"),
+            (HelpTopic::Cgroup, "cgroup"),
             (HelpTopic::Deleted, "deleted"),
             (HelpTopic::File, "file"),
             (HelpTopic::Fd, "fd"),

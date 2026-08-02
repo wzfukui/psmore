@@ -36,6 +36,26 @@ to require consecutive passing evaluations.
 Inspect one process, its runtime context, threads, sockets, files, limits, and
 security evidence.
 .TP
+.B exe PID
+Compare the executable image held by a process with the current disk path.
+Report replaced, deleted, missing, or matching image evidence, optional SHA-256,
+package ownership, and macOS code-signing provenance. Use
+.B --no-hash
+to skip file hashing while retaining identity, package, and signing evidence.
+.TP
+.B stale
+On Linux, scan visible processes for executable images that were deleted,
+replaced at their original path, or whose disk path disappeared. Results retain
+service and package ownership. Use
+.B --expect none
+as a conservative post-deployment gate; zero matches with incomplete visibility
+are inconclusive rather than clean.
+.TP
+.B service PID
+Resolve a process to its Linux systemd unit or macOS launchd job. Report
+manager state, restart evidence, configuration origin, resource context, and
+read-only suggested commands without changing the service.
+.TP
 .B port PORT
 Find processes and socket references associated with a local TCP or UDP port.
 .TP
@@ -85,6 +105,12 @@ Rank process or complete subtree CPU, memory, read, and write hotspots.
 .B oom
 On Linux, correlate OOM selection priority with memory, swap, PSI, cgroup, and
 kernel OOM evidence.
+.TP
+.B cgroup
+On Linux, group visible processes by their actual leaf cgroup and correlate
+sampled member CPU, RSS, and I/O with hierarchical memory, PID limits, and OOM
+events from the kernel controllers. Filters search systemd, container, path,
+and process context.
 .TP
 .B doctor
 Run conservative host and process triage. With
@@ -210,6 +236,18 @@ navigation leaves locate mode while retaining the result context.
 .B Space
 Pause or resume live refresh.
 .TP
+.B m
+Open the selected process service-context workspace. Resolve the owning systemd
+unit or launchd job in the background and show state, configuration, resource
+boundaries, and suggested read-only commands. Enter or r refreshes; m or Escape
+closes the workspace.
+.TP
+.B v
+Open the selected process executable-image workspace. Verify image identity,
+disk drift, package ownership, hashes, and signing in the background. Enter or
+r refreshes, h toggles SHA-256 collection, m switches to service context, and v
+or Escape closes the workspace.
+.TP
 .BR n ,
 .BR d ,
 .BR b ,
@@ -280,6 +318,31 @@ macOS performs one global
 .BR lsof (8)
 scan. psmore and its collection helper are excluded. Incomplete visibility is
 reported explicitly and never used to prove that a path has no users.
+.PP
+The
+.B exe
+command is read-only. Linux compares
+.I /proc/PID/exe
+device and inode evidence with the current disk path and can hash each image up
+to a 1 GiB safety limit. macOS reports current-path package and code-signing
+evidence while explicitly noting that independent mapped-image identity is not
+available. PID identity is revalidated after collection.
+.PP
+The
+.B stale
+command performs the same Linux mapped-image identity comparison across all
+query-eligible processes. Result truncation does not affect policy evaluation.
+Unreadable or racing processes make a zero-match policy inconclusive. Suggested
+restart review and per-PID verification commands are printed but not executed.
+.PP
+The
+.B service
+command is also read-only. Linux derives membership from
+.I /proc/PID/cgroup
+and queries machine-readable systemd properties. macOS maps the process ancestor
+chain through the current launchd bootstrap namespace and only emits an
+allowlist of job fields; launchd environment dictionaries are not copied into
+the report. Suggested commands are printed, not executed.
 .SH SEE ALSO
 .BR ps (1),
 .BR lsof (8),

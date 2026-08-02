@@ -24,7 +24,7 @@ use crate::{
 };
 
 const REPORT_SCHEMA: &str = "psmore.diagnostic-report";
-const REPORT_SCHEMA_VERSION: u32 = 3;
+const REPORT_SCHEMA_VERSION: u32 = 5;
 
 pub(crate) struct ReportInput<'a> {
     pub(crate) platform: &'static str,
@@ -44,6 +44,10 @@ pub(crate) struct ReportInput<'a> {
     pub(crate) network_scan_in_progress: bool,
     pub(crate) inspection: Option<&'a ProcessInspection>,
     pub(crate) inspection_in_progress: bool,
+    pub(crate) service_context: Option<&'a serde_json::Value>,
+    pub(crate) service_context_in_progress: bool,
+    pub(crate) executable_context: Option<&'a serde_json::Value>,
+    pub(crate) executable_context_in_progress: bool,
     pub(crate) action_history: &'a [ProcessActionRecord],
     pub(crate) baseline: Option<&'a BaselineSnapshot>,
 }
@@ -70,6 +74,8 @@ struct DiagnosticReport {
     attention_findings: Vec<AttentionReport>,
     network_scan: Option<NetworkReport>,
     selected_inspection: Option<InspectionReport>,
+    selected_service_context: Option<serde_json::Value>,
+    selected_executable_context: Option<serde_json::Value>,
     baseline: Option<BaselineReport>,
 }
 
@@ -83,6 +89,8 @@ struct ToolReport {
 struct CollectionStatusReport {
     network_scan_in_progress: bool,
     inspection_in_progress: bool,
+    service_context_in_progress: bool,
+    executable_context_in_progress: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -598,6 +606,8 @@ fn build_report(input: ReportInput<'_>, generated_at: u64) -> DiagnosticReport {
         collection_status: CollectionStatusReport {
             network_scan_in_progress: input.network_scan_in_progress,
             inspection_in_progress: input.inspection_in_progress,
+            service_context_in_progress: input.service_context_in_progress,
+            executable_context_in_progress: input.executable_context_in_progress,
         },
         sort_mode: input.sort_mode.label(),
         process_count: input.processes.len().saturating_sub(1),
@@ -625,6 +635,8 @@ fn build_report(input: ReportInput<'_>, generated_at: u64) -> DiagnosticReport {
             .collect(),
         network_scan,
         selected_inspection: input.inspection.map(inspection_report),
+        selected_service_context: input.service_context.cloned(),
+        selected_executable_context: input.executable_context.cloned(),
         baseline,
     }
 }

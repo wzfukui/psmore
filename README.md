@@ -11,7 +11,7 @@
 - 上方以树展示进程父子关系，PID 0 是用于承接系统根、不可见父进程和采集期间消失进程的虚拟根节点
 - 下方显示当前节点的 PID、PPID、子进程数、状态、CPU、内存、磁盘读写速率、运行时间、路径和命令
 - 下方同时聚合当前进程与全部后代的进程数、CPU、内存和磁盘 I/O，便于判断一个完整服务树的真实资源占用
-- 首次进入 TUI 显示三页可翻阅的现场手册；随后每次启动显示一条不阻塞键盘的高级 tip，10 条循环轮播，直到用户主动关闭，并可随时按 `?` 重新打开
+- 首次进入 TUI 显示三页可翻阅的现场手册；随后每次启动显示一条不阻塞键盘的高级 tip，11 条循环轮播，直到用户主动关闭，并可随时按 `?` 重新打开
 - 每一行在 PID 后显示命令行，若命令行不可用则显示可执行文件路径
 - 同级进程按名称、PID 确定性排序，刷新时不会因 HashMap 或同名进程导致顺序漂移
 - 键盘导航，实时搜索/过滤，聚焦当前进程的父链和子树
@@ -41,10 +41,10 @@
 - `b` 捕获内存中的系统基线，`d` 对比当前状态：集中列出新增、退出、PID 复用、父进程变化，以及子树 CPU、内存、读写速率增长排行
 - 基线对比以进程启动时间区分同一 PID 的不同实例，并显示全系统进程数、CPU 和内存变化，适合发布、压测或故障前后核对
 - `n` 按需扫描全局 TCP/UDP/Unix socket；默认聚焦监听端口，按 `v` 切换到全部连接，展示本地到远端路由、状态、PID、FD 与网络命名空间，并可直接跳回所有者进程树
-- 全局网络扫描和进程深度检查都在后台执行；耗时采集会显示动画与已用时间，期间进程树继续刷新，键盘关闭面板和退出始终可用
+- 全局网络扫描、进程深度检查、Service Context 和可执行映像验证都在后台执行；耗时采集会显示动画与已用时间，期间进程树继续刷新，键盘关闭面板和退出始终可用
 - `p` 打开进程操作中心，可发送 TERM、KILL、STOP、CONT；选择操作后必须另按 `y` 确认，执行前会重新校验 PID 与启动时间，避免把信号发给复用该 PID 的新进程
 - PID 0、PID 1 和 `psmore` 自身受强制保护；每次已发送、被安全策略拒绝或被操作系统拒绝的结果都会进入活动审计
-- `o` 将当前诊断上下文导出为带版本号的 JSON 报告，包括完整进程清单、资源聚合、当前查询及命中数、关注事项、最近事件和进程操作审计；已经打开的端口扫描、深度检查及已捕获基线会一并写入，但导出本身不会触发额外扫描
+- `o` 将当前诊断上下文导出为带版本号的 JSON 报告，包括完整进程清单、资源聚合、当前查询及命中数、关注事项、最近事件和进程操作审计；已经打开的网络扫描、深度检查、Service Context、可执行映像证据及已捕获基线会一并写入，但导出本身不会触发额外扫描
 - 支持无交互快照模式：`--table` 输出适合 SSH 现场查看的稳定表格，`--json` 输出带版本号的机器可读快照；两者复用 TUI 的完整查询语法与子树资源聚合
 - 无交互模式执行两次采样，默认间隔 500 ms，使 CPU 与磁盘 I/O 速率具有实际意义；可用 `--sample-ms` 在 100–60000 ms 之间调整
 - 所有无交互表格、JSON 和 JSONL 输出支持 `--redact`：在保留命令结构的同时遮盖常见密码、token、API key、认证 header、URL userinfo 和敏感查询参数
@@ -52,6 +52,9 @@
 - `psmore diff BEFORE.json AFTER.json` 自动识别进程快照或主机体检报告：前者对比启动/退出、PID 复用、父进程与资源增量，后者对比新观察到/恢复/持续信号、严重度以及主机和 deep 证据变化；支持 `--fail-on regression --quiet` 发布门禁和 `--output` 私有原子归档
 - `psmore check QUERY` 将任意结构化查询变成 CI/运维健康门禁：排除检查器自身及其对子树聚合的干扰，默认期望零命中，`--expect any` 可反向要求服务存在；`--wait` 等待发布/恢复收敛，`--stable` 要求连续多个样本通过
 - `psmore inspect PID` 将 TUI 深度检查直接带到 SSH、脚本和事故工单：一次输出进程身份、完整命令、热点线程、socket、打开文件及平台运行上下文，也可导出 `psmore.process-inspection` JSON
+- `psmore exe PID` 核对进程实际持有的可执行映像与当前磁盘路径，识别发布后仍运行旧映像、文件已删除或被替换，并补充软件包和代码签名来源
+- `psmore stale [QUERY]` 在 Linux 整机扫描仍持有已删除或已替换可执行映像的进程，关联 systemd unit/软件包，并可作为发布后的保守健康门禁
+- `psmore service PID` 将任意进程反查到 Linux systemd unit 或 macOS launchd job，展示状态、重启、配置来源、资源边界和可复制的下一步只读诊断命令
 - `psmore port PORT` 直接回答“谁占用了这个端口”：将 TCP/UDP 本地端点关联到 PID、用户、完整命令、FD 和 Linux 网络 namespace，并可作为端口存在/释放健康门禁
 - `psmore listen` 从全局监听面反查进程和启动上下文，并将 wildcard、非回环网络、loopback 与 Unix socket 分类；`--exposed` 可直接聚焦需要安全复核的主机暴露面
 - `psmore net [FILTER]` 检索全局监听、已建立 TCP/UDP 对端和 Unix 连接，展示本地到对端路由、状态、PID/FD、完整进程上下文和 Linux 网络 namespace，并支持状态门禁
@@ -61,6 +64,7 @@
 - `psmore run -- COMMAND` 从启动瞬间跟踪命令及完整后代树，汇总真实退出状态、耗时、进程构成和 CPU/内存/I/O 峰值；命令标准输出保持可管道使用
 - `psmore top [QUERY]` 将 TUI 热点排名带到 SSH 和脚本：按 CPU、内存、磁盘读或写排序，可在进程自身与完整服务子树口径之间切换，并输出稳定表格或版本化 JSON
 - `psmore oom [QUERY]` 在 Linux 上联合展示主机 MemAvailable/Swap、memory PSI、OOM kill 计数与进程 `oom_score`/调整值/cgroup 内存事件，区分“杀进程优先级”和“正在发生内存压力”
+- `psmore cgroup [FILTER]` 将 Linux 进程按实际 systemd/容器 cgroup 边界分组，并列展示可见成员资源、内核层级内存/PID 上限及累计 OOM 事件
 - `psmore file PATH` 反查谁正在执行、映射、打开或以 cwd/root 使用某个文件；`--recursive` 可定位目录或挂载点下的全部使用者，并可作为发布替换、卸载和清理前的安全门禁
 - `psmore deleted` 定位“文件已删除但进程仍占用”的磁盘空间泄漏：展示 PID、FD、用户、完整命令、文件身份与大小，并按 device+inode 去重估算真正可释放空间
 - `psmore fd` 对全系统打开的文件描述符做风险排名：展示 PID、用户、完整命令、FD 数量以及 Linux 软/硬限制和使用率，可直接作为 FD 泄漏或耗尽的巡检门禁
@@ -71,7 +75,7 @@
 
 第一次进入交互界面时，psmore 会展示三页现场手册，将主要能力按“理解进程树 → 从症状找到证据 → 安全操作与分享”组织起来。使用 `←`/`→`、`↑`/`↓` 或 `Tab` 翻页，`Enter`/`Esc` 开始工作；`q` 和 `Ctrl-C` 始终可以直接退出。
 
-完成首次手册后，每次启动会在右下角展示一条高级 tip，覆盖子树查询、热点、基线、网络、趋势和安全操作；10 条完成后从第一条继续轮播，直到用户主动关闭。Tip 不会抢走工作键：除 `Enter`、`Esc`、`?`、`T`、`D` 外，按下任意键都会关闭 tip 并继续执行该键原本的操作，例如 `Space` 仍会立即暂停、`/` 仍会开始查询。
+完成首次手册后，每次启动会在右下角展示一条高级 tip，覆盖子树查询、热点、基线、网络、趋势、映像验证和安全操作；11 条完成后从第一条继续轮播，直到用户主动关闭。Tip 不会抢走工作键：除 `Enter`、`Esc`、`?`、`T`、`D` 外，按下任意键都会关闭 tip 并继续执行该键原本的操作，例如 `Space` 仍会立即暂停、`/` 仍会开始查询。
 
 任何时候按 `?` 都能打开完整现场手册。引导内按 `T` 切换未来启动 tip，按 `D` 永久关闭启动卡片；只想本次跳过可运行：
 
@@ -293,6 +297,66 @@ psmore inspect 1234 --sample-ms 1000
 表格不截断命令、socket 或文件路径；终端自行换行。JSON 使用 `psmore.process-inspection` schema v1，包含采集主机、进程资源、运行上下文、安全信息、namespace、资源限制、热点线程、socket 和打开文件。macOS 的线程 CPU 明确标记为 `scheduler_estimate`，Linux 标记为 `sample_delta` 并记录实际采样毫秒数。
 
 命令在深检前后重新采集目标 PID：若确认发生 PID 复用，会拒绝合并两个进程实例并以退出码 `1` 失败；若目标在采集中正常退出，则保留已经取得的诊断结果，同时将身份标记为 `exited_during_collection`。无法取得启动时间时会标记为 `unverified`，不会伪装成已经确认。输出可能包含敏感参数、路径、用户名、线程名和网络端点，分享前应检查。
+
+### 进程实际运行的是哪个可执行映像
+
+发布完成但服务没有真正加载新二进制、磁盘文件已被覆盖而旧进程仍存活，或者需要确认程序来自哪个包和签名主体时，可以从 PID 直接核对。在 TUI 中选中进程按 `v` 可直接打开同一份 Verify Image 工作区：
+
+```bash
+# 默认比较文件身份并计算 SHA-256
+psmore exe 1234
+
+# 机器可读的证据报告；大型文件或只需快速核对时可跳过哈希
+psmore exe 1234 --json > executable-1234.json
+psmore exe 1234 --no-hash
+```
+
+Linux 通过 `/proc/<pid>/exe` 读取进程实际持有的映像，再与命令路径当前指向的磁盘文件比较 device/inode 和 SHA-256，可区分 `same_image`、`replaced_on_disk`、`running_image_deleted`、`disk_image_missing` 与证据不足；同时尽力查询 dpkg、RPM 或 APK 的包名、版本和架构。这样不会把“路径名称相同”误当成“进程已经运行新版本”。
+
+macOS 能验证当前可执行路径、Homebrew Cellar 或 `.app` bundle 来源，并使用系统 `codesign` 展示严格验签结果、identifier、Team ID 和证书链。macOS 普通用户接口不能像 Linux `/proc/<pid>/exe` 那样独立打开进程持有的 Mach-O 映像，因此报告明确使用 `current_path_only`，不会声称已证明运行中 inode 与磁盘文件一致。
+
+默认每个映像最多读取 1 GiB 用于 SHA-256，超过上限会跳过并给出 warning；`--no-hash` 仍保留文件身份、软件包和签名证据。采集前后重新校验 PID 实例，确认复用时拒绝合并。JSON 使用 `psmore.executable-image` schema v1。命令只读，不修改文件、不重启进程；报告含完整命令、路径、所有者、哈希、包和签名信息，分享前应使用 `--redact` 并复核。
+
+TUI 默认同样计算 SHA-256，但采集在后台执行，不阻塞进程树。面板内按 `h` 可在完整哈希与快速身份核对之间切换，按 `Enter`/`r` 重新采集，按 `m` 直接切到同一 PID 的 Service Context，按 `v`/`Esc` 返回进程树；在 Service Context 内按 `v` 可以切回来。
+
+### Linux 整机排查仍运行旧映像的进程
+
+单个 PID 用 `exe` 深挖；发布完成后要确认整台 Linux 主机是否还有服务持有旧二进制，可直接扫描所有可见进程：
+
+```bash
+# 列出已替换、已删除或磁盘路径已消失的运行映像
+psmore stale
+
+# 只看目标用户/服务范围，并保留全部结果
+psmore stale 'user:deploy age>5m' --limit all
+
+# 发布门禁：确认没有可见旧映像；通过 0、违反 3、证据不完整 1
+psmore stale --expect none --quiet
+```
+
+Linux 使用 `/proc/<pid>/exe` 作为进程实际持有的映像句柄，将其 device/inode 与当前磁盘路径比较。`replaced_on_disk` 表示原路径已经指向另一个文件，`running_image_deleted` 表示旧映像已 unlink 且原路径没有可比较的新文件，`disk_image_missing` 表示磁盘路径消失。结果关联最具体的 systemd service/scope、dpkg/RPM/APK 软件包和可复制的 `psmore exe PID` 深检入口，但不会自动重启进程。
+
+筛选使用完整 psmore 查询语言，`--limit` 只截断返回行，不影响策略对全部匹配项的判断。普通用户无法读取其他用户或受保护进程的 `/proc/<pid>/exe` 时，coverage 会标为 partial；零命中的 `--expect none` 因此返回 inconclusive 和退出码 `1`，不会把“看不见”误报为“整机已清理”。需要整机发布门禁时，应以足够权限运行，或用 `user:`/服务范围把检查限定到当前有权验证的进程。JSON 使用 `psmore.stale-executables` schema v1；macOS 会明确返回不支持。
+
+### 从 PID 追到 systemd 或 launchd 服务
+
+知道进程有问题之后，下一步通常是确认“谁负责拉起它、配置在哪里、为什么会重启、日志该从哪里看”。`service` 将这条管理链直接补到 PID 上；在交互进程树中也可以选中任意进程按 `m`，不离开 TUI 即可打开同一份 Service Context：
+
+```bash
+# 人读报告：管理器、unit/job、状态、配置、资源和下一步命令
+psmore service 1234
+
+# 适合工单和自动化分析的版本化报告
+psmore service 1234 --json --redact > service-1234.safe.json
+```
+
+Linux 从目标 `/proc/<pid>/cgroup` 选择最具体的 `.service` 或 `.scope`，区分 system/user manager，再使用 `systemctl show` 获取 ActiveState/SubState、Result、MainPID、重启策略/次数、unit 文件、drop-in、TasksCurrent、MemoryCurrent 和累计 CPU。若当前用户无权访问其他用户的 user manager，仍保留内核 cgroup 归属并明确标为 partial。报告会给出可复制但不会自动执行的 `systemctl status`、`journalctl` 和 `systemctl cat` 命令。
+
+macOS 沿目标父链匹配当前 bootstrap namespace 中已加载的 launchd job，并结合 `launchctl print pid/PID`、job label 和可访问的 `gui/user/system` target，展示 label、运行状态、最近退出状态、程序参数和 plist 来源；下一步提供 `launchctl print`、`launchctl blame`、统一日志及 `plutil` 命令。普通 App 或未能映射到当前 namespace 的进程会明确显示 unmanaged/partial，不猜测不存在的 job。
+
+采集前后会重新验证 PID 实例，确认复用时拒绝合并。JSON 使用 `psmore.service-context` schema v1；输出可能含完整命令、配置路径、用户、主机、service identifier 和建议命令，分享前应使用 `--redact` 并复核。该命令只读，不启动、停止、重启或修改任何服务。
+
+TUI 中的采集在后台执行，进程树与键盘输入不会被 `systemctl` 或 `launchctl` 阻塞。面板内按 `Enter`/`r` 重新采集，使用方向键、`j/k` 或 PageUp/PageDown 滚动，按 `m`/`Esc` 返回进程树；采集期间会持续显示耗时，并在目标退出或 PID 被复用时明确警告。
 
 ### 端口占用诊断
 
@@ -519,6 +583,28 @@ psmore oom --min-score 250 --json > oom-diagnostics.json
 
 该命令依赖 Linux `/proc`、PSI 和 cgroup 文件系统；macOS 会明确返回“不支持”，可先用 `psmore top --by memory`、`psmore trace PID` 和系统内存压力工具排查，不会伪造 Linux OOM 分数。
 
+### Linux cgroup、systemd 与容器边界
+
+单 PID 深检适合回答“这个进程属于哪里”；需要从整机角度比较 systemd 服务、用户 session 和容器边界时，使用 `cgroup`：
+
+```bash
+# 默认按内核 cgroup memory.current 排名前 20 个叶级边界
+psmore cgroup
+
+# 搜索路径、unit、容器、PID、用户、进程名或完整命令
+psmore cgroup docker --by pressure --limit all
+psmore cgroup api.service --by cpu
+
+# 保留所有成员及内核控制器证据
+psmore cgroup --by processes --limit all --json > cgroups.json
+```
+
+每个进程按 `/proc/<pid>/cgroup` 的实际叶级成员关系只归入一个组，避免把父 slice 与子 service 重复相加。表格中的 CPU、RSS、读写速率是当前权限可见的直接成员在同一 psmore 采样周期内求和；`CGMEM/MAX`、`PIDS`、cgroup CPU/I/O 总量和 `memory.events` 则来自内核控制器，通常包含后代 cgroup，是层级证据。两种口径会并列保留，不把 RSS 冒充 `memory.current`，也不把累计 I/O 冒充实时速率。
+
+`--by` 支持 `memory`、`cpu`、`pressure` 和 `processes`。pressure 使用可计算的 `memory.current / memory.max`，没有有限上限的组稳定排在已知值之后。`MEM_WARN`/`MEM_CRIT` 表示当前内存上限利用率达到 75%/90%，`PIDS_WARN`/`PIDS_CRIT` 同理；`OOM_HISTORY` 只表示该 cgroup 生命周期内 `oom_kill` 非零，是需要核对的累计证据，不等于正在 OOM。
+
+JSON 使用 `psmore.linux-cgroups` schema v1，`coverage` 记录成员归因可见性，`selection` 记录筛选与截断，并附带三条资源口径说明。无法读取或采集期间退出的进程会使 coverage 标为 incomplete。psmore 自身会从可见成员列表和成员资源求和中排除；但 `memory.current/pids.current` 等是内核原始层级计数，采集器若与目标同属该组也会短暂包含在内，报告不会偷偷篡改这些计数。命令全程只读；cgroup v2 提供完整控制器证据，旧式 v1 会尽可能读取 memory/pids controller。macOS 没有 Linux cgroup 层级，因此明确返回不支持。
+
 ### 文件、目录与挂载点使用者
 
 发布替换文件、卸载挂载点、删除构建目录，或者怀疑进程仍在使用旧配置时，可以直接从路径反查进程上下文：
@@ -654,6 +740,8 @@ doctor 对比使用稳定 finding code 识别同一类信号，分别列出新�
 | `d` | 打开基线差异面板；支持方向键、`j/k`、PageUp/PageDown 滚动 |
 | `x` | 清除当前基线；在差异面板内同样可用 |
 | `n` | 打开全局网络面板；`v` 切换监听/全部连接，`/` 过滤，`r` 重新扫描，`Enter` 跳到所有者进程，`Esc` 或 `n` 关闭 |
+| `m` | 在后台解析选中进程的 systemd unit 或 launchd job，展示状态、配置、资源边界和下一步只读命令；`Enter`/`r` 刷新，`Esc` 或 `m` 关闭 |
+| `v` | 在后台验证选中进程的运行映像、磁盘漂移、软件包与代码签名；面板内 `h` 切换 SHA-256，`m` 切到服务上下文，`Esc` 或 `v` 关闭 |
 | `p` | 打开选中进程的操作中心；选择 TERM/KILL/STOP/CONT 后，另按 `y` 才发送信号，`Esc` 取消 |
 | `o` | 将当前诊断上下文导出到工作目录中的 `psmore-report-*.json`；任意面板内均可使用 |
 | `?` | 打开三页现场帮助；帮助内 `T` 切换启动 tips，`D` 永久关闭启动卡片 |
@@ -678,4 +766,4 @@ doctor 对比使用稳定 finding code 识别同一类信号，分别列出新�
 - 深度检查遵循当前用户权限；看不到其他用户进程的文件或端口时会显示警告，不会伪装成“没有连接”。
 - 两个平台都建议使用与目标进程相同的用户运行；更高权限能够看到更多进程参数，但 `psmore` 本身不要求 root。
 - 进程操作遵循当前用户权限，不会提权。确认时如果目标已退出、启动时间不可用或 PID 已被复用，操作会拒绝并留下原因；信号只发送给选中 PID，不会隐式发送给整个子树或进程组。
-- 诊断报告 schema v3 先写临时文件再原子改名，并在 Unix 平台使用 `0600` 权限。报告可能包含完整命令行、文件路径、用户名、主机名、线程名、socket 端点和人工操作审计，分享前应先检查敏感信息。
+- 诊断报告 schema v5 先写临时文件再原子改名，并在 Unix 平台使用 `0600` 权限。报告可能包含完整命令行、文件路径、用户名、主机名、线程名、socket 端点、systemd/launchd 服务上下文、可执行映像哈希与签名和人工操作审计，分享前应先检查敏感信息。

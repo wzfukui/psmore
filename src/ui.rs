@@ -630,6 +630,195 @@ fn draw_inspection_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
     );
 }
 
+fn draw_service_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
+    let Some(panel) = app.service_context.clone() else {
+        return;
+    };
+    let width = area.width.saturating_sub(2).clamp(1, 140);
+    let height = area.height.saturating_sub(2).max(1);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let mut lines = Vec::new();
+    if app.service_context_is_scanning() {
+        let elapsed = app.service_context_elapsed();
+        lines.push(Line::from(Span::styled(
+            format!(
+                " {} resolving systemd/launchd ownership in the background ({:.1}s)",
+                activity_spinner(elapsed),
+                elapsed.as_secs_f64()
+            ),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+    }
+    if let Some(warning) = panel.warning.as_deref() {
+        lines.push(Line::from(Span::styled(
+            format!(" WARNING  {warning}"),
+            Style::default().fg(Color::LightRed),
+        )));
+        lines.push(Line::from(""));
+    }
+    for line in panel.content.lines() {
+        let style = if line.starts_with("service ") {
+            Style::default()
+                .fg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD)
+        } else if line.starts_with("state ") {
+            Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD)
+        } else if line.starts_with("warning ") {
+            Style::default().fg(Color::LightRed)
+        } else if line.starts_with("next ") {
+            Style::default().fg(Color::Yellow)
+        } else if line.starts_with("evidence ") {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(Span::styled(line.to_owned(), style)));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " No service context available",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    let content_height = height.saturating_sub(2) as usize;
+    let content_width = width.saturating_sub(2).max(1) as usize;
+    let visual_lines = lines
+        .iter()
+        .map(|line| line.width().max(1).div_ceil(content_width))
+        .sum::<usize>();
+    let max_scroll = visual_lines
+        .saturating_sub(content_height)
+        .min(u16::MAX as usize) as u16;
+    app.service_context_scroll = app.service_context_scroll.min(max_scroll);
+    let scanning = if app.service_context_is_scanning() {
+        "  scanning"
+    } else {
+        ""
+    };
+    let title = format!(
+        " manager {} [{}]{}  Enter/r refresh  ↑↓ scroll  v verify  m/Esc close ",
+        panel.name, panel.pid, scanning
+    );
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .scroll((app.service_context_scroll, 0))
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
+fn draw_executable_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
+    let Some(panel) = app.executable_context.clone() else {
+        return;
+    };
+    let width = area.width.saturating_sub(2).clamp(1, 140);
+    let height = area.height.saturating_sub(2).max(1);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let mut lines = Vec::new();
+    if app.executable_context_is_scanning() {
+        let elapsed = app.executable_context_elapsed();
+        lines.push(Line::from(Span::styled(
+            format!(
+                " {} verifying executable image and provenance in the background ({:.1}s)",
+                activity_spinner(elapsed),
+                elapsed.as_secs_f64()
+            ),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+    }
+    if let Some(warning) = panel.warning.as_deref() {
+        lines.push(Line::from(Span::styled(
+            format!(" WARNING  {warning}"),
+            Style::default().fg(Color::LightRed),
+        )));
+        lines.push(Line::from(""));
+    }
+    for line in panel.content.lines() {
+        let style = if line.starts_with("status ") {
+            if line.contains("attention yes") {
+                Style::default()
+                    .fg(Color::LightRed)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(Color::LightGreen)
+                    .add_modifier(Modifier::BOLD)
+            }
+        } else if line.starts_with("running ") || line.starts_with("disk ") {
+            Style::default().fg(Color::LightCyan)
+        } else if line.starts_with("package ") {
+            Style::default().fg(Color::LightMagenta)
+        } else if line.starts_with("signing ") {
+            if line.contains("valid no") {
+                Style::default().fg(Color::LightRed)
+            } else {
+                Style::default().fg(Color::LightGreen)
+            }
+        } else if line.starts_with("warning ") {
+            Style::default().fg(Color::LightRed)
+        } else if line.starts_with("coverage ") {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(Span::styled(line.to_owned(), style)));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " No executable image evidence available",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    let content_height = height.saturating_sub(2) as usize;
+    let content_width = width.saturating_sub(2).max(1) as usize;
+    let visual_lines = lines
+        .iter()
+        .map(|line| line.width().max(1).div_ceil(content_width))
+        .sum::<usize>();
+    let max_scroll = visual_lines
+        .saturating_sub(content_height)
+        .min(u16::MAX as usize) as u16;
+    app.executable_context_scroll = app.executable_context_scroll.min(max_scroll);
+    let scanning = if app.executable_context_is_scanning() {
+        "  scanning"
+    } else {
+        ""
+    };
+    let hash = if panel.hash { "hash on" } else { "hash off" };
+    let title = format!(
+        " verify image {} [{}]{}  {}  Enter/r refresh  h hash  m manager  v/Esc close ",
+        panel.name, panel.pid, scanning, hash
+    );
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .scroll((app.executable_context_scroll, 0))
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
 fn f32_stats(values: &[f32]) -> (f32, f32, f32) {
     if values.is_empty() {
         return (0.0, 0.0, 0.0);
@@ -1767,11 +1956,19 @@ fn guidance_page(page: usize) -> Vec<Line<'static>> {
             guidance_key("h", "CPU, memory, read, and write hotspot workbench"),
             guidance_key("t", "recent own and complete-subtree resource trend"),
             guidance_key("n", "listeners, connections, peers, owners, and namespaces"),
+            guidance_key(
+                "v",
+                "verify executable image, package, hash, and code signature",
+            ),
+            guidance_key(
+                "m",
+                "systemd or launchd ownership, state, config, and next commands",
+            ),
             guidance_key("b / d / x", "capture baseline, compare, and clear"),
             guidance_key("Space / r", "freeze the scene; sample manually"),
             Line::from(""),
             Line::from(Span::styled(
-                " Tip: hotspot panels use v to switch process vs service-tree scope.",
+                " Tip: inside manager/image panels, m and v switch ownership and provenance.",
                 Style::default().fg(Color::Yellow),
             )),
         ],
@@ -1791,7 +1988,7 @@ fn guidance_page(page: usize) -> Vec<Line<'static>> {
             guidance_key("q / Ctrl-C", "leave psmore"),
             Line::from(""),
             Line::from(Span::styled(
-                " CLI companions: doctor, inspect, tree, listen, net, trace, diff",
+                " CLI companions: doctor, inspect, exe, service, tree, net, trace, diff",
                 Style::default().fg(Color::Yellow),
             )),
         ],
@@ -1926,6 +2123,9 @@ fn draw_guidance_overlay(frame: &mut Frame, app: &App, area: Rect) {
 
 pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
     let detail_height = detail_height(app, area);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -2120,7 +2320,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     } else if !app.search.is_empty() {
         " filter active | / new search or clear | ↑↓/jk move | Enter inspect | q quit ".into()
     } else {
-        " ↑↓/jk move | ←/→ tree | / find | a attention | h hot | s sort | p actions | t trend | n network | b base | d diff | o report | ? help ".into()
+        " ↑↓/jk move | ←/→ tree | / find | a attention | h hot | m manager | v image | p actions | t trend | n network | b base | d diff | o report | ? help ".into()
     };
     let footer = Paragraph::new(vec![
         Line::from(format!(
@@ -2154,6 +2354,10 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         draw_snapshot_diff_overlay(frame, app, area);
     } else if app.trend_pid.is_some() {
         draw_trend_overlay(frame, app, area);
+    } else if app.executable_context.is_some() {
+        draw_executable_context_overlay(frame, app, area);
+    } else if app.service_context.is_some() {
+        draw_service_context_overlay(frame, app, area);
     } else if app.inspection.is_some() {
         draw_inspection_overlay(frame, app, area);
     } else if app.show_events {
@@ -2172,7 +2376,10 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::*;
-    use crate::onboarding::Guidance;
+    use crate::{
+        app::{ExecutableContextPanel, ServiceContextPanel},
+        onboarding::Guidance,
+    };
 
     fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
         let buffer = terminal.backend().buffer();
@@ -2211,12 +2418,12 @@ mod tests {
         app.guidance = Guidance::tip_for_test(0);
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let tip = buffer_text(&terminal);
-        assert!(tip.contains("PSMORE TIP 1/10"));
+        assert!(tip.contains("PSMORE TIP 1/11"));
         assert!(tip.contains("Reveal the real parent chain"));
         assert!(tip.contains("Any other key continues"));
         let tip_row = tip
             .lines()
-            .position(|line| line.contains("PSMORE TIP 1/10"))
+            .position(|line| line.contains("PSMORE TIP 1/11"))
             .unwrap();
         assert!(
             tip_row >= 14,
@@ -2239,5 +2446,133 @@ mod tests {
         tip.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         assert!(!tip.guidance.is_open());
         assert!(tip.paused);
+    }
+
+    #[test]
+    fn service_context_overlay_renders_scrolls_and_closes() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        app.service_context = Some(ServiceContextPanel {
+            pid: Pid::from_u32(4321),
+            name: "worker".into(),
+            content: [
+                "manager systemd (system)  managed yes  coverage complete",
+                "service example.service  target system/example.service  root PID 4321",
+                "state active/running  load loaded  result success  enabled enabled",
+                "config /etc/systemd/system/example.service  program /usr/bin/example",
+                "next logs: journalctl --unit example.service --since -1h",
+            ]
+            .join("\n"),
+            report: None,
+            warning: None,
+        });
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let output = buffer_text(&terminal);
+        assert!(output.contains("manager worker [4321]"));
+        assert!(output.contains("example.service"));
+        assert!(output.contains("journalctl"));
+
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.service_context_scroll, 1);
+        app.on_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert!(app.service_context.is_none());
+        assert_eq!(app.service_context_scroll, 0);
+    }
+
+    #[test]
+    fn manager_key_opens_context_for_the_selected_process() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        let current_pid = sysinfo::get_current_pid().unwrap();
+        app.selected = app
+            .visible
+            .iter()
+            .position(|row| row.pid == current_pid)
+            .expect("current test process should be visible");
+
+        app.on_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        let panel = app
+            .service_context
+            .as_ref()
+            .expect("manager key should open service context");
+        assert_eq!(panel.pid, current_pid);
+        assert!(app.service_context_is_scanning());
+
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.service_context.is_none());
+        assert!(!app.service_context_is_scanning());
+    }
+
+    #[test]
+    fn executable_context_overlay_renders_toggles_hash_and_closes() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        let current_pid = sysinfo::get_current_pid().unwrap();
+        app.executable_context = Some(ExecutableContextPanel {
+            pid: current_pid,
+            name: "worker".into(),
+            content: [
+                "PSMORE EXECUTABLE IMAGE",
+                "process worker [4321]  user deploy  identity verified",
+                "status replaced_on_disk  attention yes",
+                "running /opt/worker.old  exists yes  deleted yes  readable yes",
+                "disk /opt/worker  exists yes  deleted no  readable yes",
+                "package dpkg worker 1.2.3 (amd64)",
+                "coverage complete  sources 3  warnings 0",
+            ]
+            .join("\n"),
+            report: None,
+            warning: None,
+            hash: true,
+        });
+        let backend = TestBackend::new(110, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let output = buffer_text(&terminal);
+        assert!(output.contains(&format!("verify image worker [{current_pid}]")));
+        assert!(output.contains("replaced_on_disk"));
+        assert!(output.contains("package dpkg worker"));
+
+        app.on_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert!(!app.executable_context.as_ref().unwrap().hash);
+        assert!(app.executable_context_is_scanning());
+        app.on_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert!(app.executable_context.is_none());
+        assert!(!app.executable_context_is_scanning());
+    }
+
+    #[test]
+    fn verify_image_key_opens_context_for_the_selected_process() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        let current_pid = sysinfo::get_current_pid().unwrap();
+        app.selected = app
+            .visible
+            .iter()
+            .position(|row| row.pid == current_pid)
+            .expect("current test process should be visible");
+
+        app.on_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        let panel = app
+            .executable_context
+            .as_ref()
+            .expect("verify image key should open executable context");
+        assert_eq!(panel.pid, current_pid);
+        assert!(panel.hash);
+        assert!(app.executable_context_is_scanning());
+
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.executable_context.is_none());
+        assert!(!app.executable_context_is_scanning());
+    }
+
+    #[test]
+    fn zero_sized_terminal_does_not_panic() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        let backend = TestBackend::new(0, 0);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
     }
 }

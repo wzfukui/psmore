@@ -14,6 +14,8 @@ use crate::{
         ProcessActionDialog, ProcessActionKind, ProcessActionRecord, ProcessActionTarget,
         execute_process_action,
     },
+    headless_exe::{capture_executable, render_executable_json, render_executable_table},
+    headless_service::{capture_service_context, render_service_json, render_service_table},
     history::ResourceHistory,
     inspection::inspect_process,
     model::{
@@ -451,6 +453,39 @@ struct InspectionTask {
     start_time: u64,
 }
 
+struct ServiceContextTask {
+    receiver: Receiver<Result<(String, serde_json::Value), String>>,
+    started_at: Instant,
+    pid: Pid,
+    start_time: u64,
+}
+
+struct ExecutableContextTask {
+    receiver: Receiver<Result<(String, serde_json::Value), String>>,
+    started_at: Instant,
+    pid: Pid,
+    start_time: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ServiceContextPanel {
+    pub(crate) pid: Pid,
+    pub(crate) name: String,
+    pub(crate) content: String,
+    pub(crate) report: Option<serde_json::Value>,
+    pub(crate) warning: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ExecutableContextPanel {
+    pub(crate) pid: Pid,
+    pub(crate) name: String,
+    pub(crate) content: String,
+    pub(crate) report: Option<serde_json::Value>,
+    pub(crate) warning: Option<String>,
+    pub(crate) hash: bool,
+}
+
 pub(crate) struct App {
     pub(crate) provider: NativeProcessProvider,
     pub(crate) processes: HashMap<Pid, ProcessInfo>,
@@ -500,6 +535,12 @@ pub(crate) struct App {
     pub(crate) inspection: Option<ProcessInspection>,
     inspection_task: Option<InspectionTask>,
     pub(crate) inspection_scroll: u16,
+    pub(crate) service_context: Option<ServiceContextPanel>,
+    service_context_task: Option<ServiceContextTask>,
+    pub(crate) service_context_scroll: u16,
+    pub(crate) executable_context: Option<ExecutableContextPanel>,
+    executable_context_task: Option<ExecutableContextTask>,
+    pub(crate) executable_context_scroll: u16,
     pub(crate) process_action: Option<ProcessActionDialog>,
     pub(crate) action_history: Vec<ProcessActionRecord>,
     pub(crate) guidance: Guidance,
@@ -567,6 +608,12 @@ impl App {
             inspection: None,
             inspection_task: None,
             inspection_scroll: 0,
+            service_context: None,
+            service_context_task: None,
+            service_context_scroll: 0,
+            executable_context: None,
+            executable_context_task: None,
+            executable_context_scroll: 0,
             process_action: None,
             action_history: Vec::new(),
             guidance,
@@ -713,6 +760,105 @@ impl App {
             }
             Some(Err(TryRecvError::Empty)) | None => {}
         }
+
+        let service_result = self
+            .service_context_task
+            .as_ref()
+            .map(|task| task.receiver.try_recv());
+        match service_result {
+            Some(Ok(result)) => {
+                let task = self.service_context_task.take();
+                let same_instance = task
+                    .as_ref()
+                    .map(|task| {
+                        self.processes
+                            .get(&task.pid)
+                            .map(|process| {
+                                task.start_time == 0
+                                    || process.start_time == 0
+                                    || process.start_time == task.start_time
+                            })
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if let Some(panel) = &mut self.service_context {
+                    if !same_instance {
+                        panel.content.clear();
+                        panel.report = None;
+                        panel.warning = Some(
+                            "process exited or PID was reused while service context was collected"
+                                .into(),
+                        );
+                    } else {
+                        match result {
+                            Ok((content, report)) => {
+                                panel.content = content;
+                                panel.report = Some(report);
+                            }
+                            Err(error) => panel.warning = Some(error),
+                        }
+                    }
+                }
+                self.service_context_scroll = 0;
+            }
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.service_context_task = None;
+                if let Some(panel) = &mut self.service_context {
+                    panel.warning = Some("service context background worker stopped".into());
+                }
+            }
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
+
+        let executable_result = self
+            .executable_context_task
+            .as_ref()
+            .map(|task| task.receiver.try_recv());
+        match executable_result {
+            Some(Ok(result)) => {
+                let task = self.executable_context_task.take();
+                let same_instance = task
+                    .as_ref()
+                    .map(|task| {
+                        self.processes
+                            .get(&task.pid)
+                            .map(|process| {
+                                task.start_time == 0
+                                    || process.start_time == 0
+                                    || process.start_time == task.start_time
+                            })
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if let Some(panel) = &mut self.executable_context {
+                    if !same_instance {
+                        panel.content.clear();
+                        panel.report = None;
+                        panel.warning = Some(
+                            "process exited or PID was reused while executable image was verified"
+                                .into(),
+                        );
+                    } else {
+                        match result {
+                            Ok((content, report)) => {
+                                panel.content = content;
+                                panel.report = Some(report);
+                            }
+                            Err(error) => panel.warning = Some(error),
+                        }
+                    }
+                }
+                self.executable_context_scroll = 0;
+            }
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.executable_context_task = None;
+                if let Some(panel) = &mut self.executable_context {
+                    panel.warning =
+                        Some("executable verification background worker stopped".into());
+                }
+            }
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
     }
 
     pub(crate) fn network_is_scanning(&self) -> bool {
@@ -732,6 +878,28 @@ impl App {
 
     pub(crate) fn inspection_elapsed(&self) -> Duration {
         self.inspection_task
+            .as_ref()
+            .map(|task| task.started_at.elapsed())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn service_context_is_scanning(&self) -> bool {
+        self.service_context_task.is_some()
+    }
+
+    pub(crate) fn service_context_elapsed(&self) -> Duration {
+        self.service_context_task
+            .as_ref()
+            .map(|task| task.started_at.elapsed())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn executable_context_is_scanning(&self) -> bool {
+        self.executable_context_task.is_some()
+    }
+
+    pub(crate) fn executable_context_elapsed(&self) -> Duration {
+        self.executable_context_task
             .as_ref()
             .map(|task| task.started_at.elapsed())
             .unwrap_or_default()
@@ -840,6 +1008,207 @@ impl App {
             return;
         };
         self.start_inspection(process, false);
+    }
+
+    fn start_service_context(&mut self, process: ProcessInfo, clear_previous: bool) {
+        if self.service_context_task.is_some() {
+            return;
+        }
+        if clear_previous {
+            self.service_context = Some(ServiceContextPanel {
+                pid: process.pid,
+                name: process.name.clone(),
+                content: String::new(),
+                report: None,
+                warning: None,
+            });
+            self.service_context_scroll = 0;
+        } else if let Some(panel) = &mut self.service_context {
+            panel.warning = None;
+        }
+        let pid = process.pid;
+        let start_time = process.start_time;
+        let (sender, receiver) = mpsc::channel();
+        match thread::Builder::new()
+            .name(format!("psmore-service-context-{}", pid.as_u32()))
+            .spawn(move || {
+                let result = capture_service_context(pid.as_u32()).and_then(|captured| {
+                    let table = render_service_table(&captured);
+                    let json = render_service_json(&captured)
+                        .map_err(|error| format!("cannot serialize service context: {error}"))?;
+                    let report = serde_json::from_str(&json)
+                        .map_err(|error| format!("cannot serialize service context: {error}"))?;
+                    Ok((table, report))
+                });
+                let _ = sender.send(result);
+            }) {
+            Ok(_) => {
+                self.service_context_task = Some(ServiceContextTask {
+                    receiver,
+                    started_at: Instant::now(),
+                    pid,
+                    start_time,
+                });
+            }
+            Err(error) => {
+                if let Some(panel) = &mut self.service_context {
+                    panel.warning = Some(format!("cannot start service context: {error}"));
+                }
+            }
+        }
+    }
+
+    fn open_service_context(&mut self) {
+        let Some(process) = self
+            .selected_pid()
+            .and_then(|pid| self.processes.get(&pid))
+            .cloned()
+        else {
+            return;
+        };
+        self.show_attention = false;
+        self.attention_selected = None;
+        self.show_hotspots = false;
+        self.hotspot_selected = None;
+        self.show_network = false;
+        self.network_filter.clear();
+        self.network_searching = false;
+        self.show_snapshot_diff = false;
+        self.trend_pid = None;
+        self.inspection = None;
+        self.inspection_task = None;
+        self.executable_context = None;
+        self.executable_context_task = None;
+        self.executable_context_scroll = 0;
+        self.show_events = false;
+        self.start_service_context(process, true);
+    }
+
+    fn refresh_service_context(&mut self) {
+        if self.service_context_task.is_some() {
+            return;
+        }
+        let Some(pid) = self.service_context.as_ref().map(|panel| panel.pid) else {
+            self.open_service_context();
+            return;
+        };
+        let Some(process) = self.processes.get(&pid).cloned() else {
+            if let Some(panel) = &mut self.service_context {
+                panel.warning = Some("process has exited since this snapshot".into());
+            }
+            return;
+        };
+        self.start_service_context(process, false);
+    }
+
+    fn start_executable_context(&mut self, process: ProcessInfo, hash: bool, clear_previous: bool) {
+        if self.executable_context_task.is_some() {
+            return;
+        }
+        if clear_previous {
+            self.executable_context = Some(ExecutableContextPanel {
+                pid: process.pid,
+                name: process.name.clone(),
+                content: String::new(),
+                report: None,
+                warning: None,
+                hash,
+            });
+            self.executable_context_scroll = 0;
+        } else if let Some(panel) = &mut self.executable_context {
+            panel.warning = None;
+            panel.report = None;
+        }
+        let pid = process.pid;
+        let start_time = process.start_time;
+        let (sender, receiver) = mpsc::channel();
+        match thread::Builder::new()
+            .name(format!("psmore-executable-context-{}", pid.as_u32()))
+            .spawn(move || {
+                let result = capture_executable(pid.as_u32(), hash).and_then(|captured| {
+                    let table = render_executable_table(&captured);
+                    let json = render_executable_json(&captured)
+                        .map_err(|error| format!("cannot serialize executable context: {error}"))?;
+                    let report = serde_json::from_str(&json).map_err(|error| {
+                        format!("cannot parse executable context JSON: {error}")
+                    })?;
+                    Ok((table, report))
+                });
+                let _ = sender.send(result);
+            }) {
+            Ok(_) => {
+                self.executable_context_task = Some(ExecutableContextTask {
+                    receiver,
+                    started_at: Instant::now(),
+                    pid,
+                    start_time,
+                });
+            }
+            Err(error) => {
+                if let Some(panel) = &mut self.executable_context {
+                    panel.warning = Some(format!("cannot start executable verification: {error}"));
+                }
+            }
+        }
+    }
+
+    fn open_executable_context(&mut self) {
+        let Some(process) = self
+            .selected_pid()
+            .and_then(|pid| self.processes.get(&pid))
+            .cloned()
+        else {
+            return;
+        };
+        self.show_attention = false;
+        self.attention_selected = None;
+        self.show_hotspots = false;
+        self.hotspot_selected = None;
+        self.show_network = false;
+        self.network_filter.clear();
+        self.network_searching = false;
+        self.show_snapshot_diff = false;
+        self.trend_pid = None;
+        self.inspection = None;
+        self.inspection_task = None;
+        self.service_context = None;
+        self.service_context_task = None;
+        self.service_context_scroll = 0;
+        self.show_events = false;
+        self.start_executable_context(process, true, true);
+    }
+
+    fn refresh_executable_context(&mut self) {
+        if self.executable_context_task.is_some() {
+            return;
+        }
+        let Some((pid, hash)) = self
+            .executable_context
+            .as_ref()
+            .map(|panel| (panel.pid, panel.hash))
+        else {
+            self.open_executable_context();
+            return;
+        };
+        let Some(process) = self.processes.get(&pid).cloned() else {
+            if let Some(panel) = &mut self.executable_context {
+                panel.warning = Some("process has exited since this snapshot".into());
+            }
+            return;
+        };
+        self.start_executable_context(process, hash, false);
+    }
+
+    fn toggle_executable_hash(&mut self) {
+        if self.executable_context_task.is_some() {
+            return;
+        }
+        if let Some(panel) = &mut self.executable_context {
+            panel.hash = !panel.hash;
+            panel.content.clear();
+            panel.report = None;
+        }
+        self.refresh_executable_context();
     }
 
     fn rebuild_visible(&mut self) {
@@ -1221,6 +1590,16 @@ impl App {
                     network_scan_in_progress: self.network_is_scanning(),
                     inspection: self.inspection.as_ref(),
                     inspection_in_progress: self.inspection_is_scanning(),
+                    service_context: self
+                        .service_context
+                        .as_ref()
+                        .and_then(|panel| panel.report.as_ref()),
+                    service_context_in_progress: self.service_context_is_scanning(),
+                    executable_context: self
+                        .executable_context
+                        .as_ref()
+                        .and_then(|panel| panel.report.as_ref()),
+                    executable_context_in_progress: self.executable_context_is_scanning(),
                     action_history: &self.action_history,
                     baseline: self.baseline.as_ref(),
                 },
@@ -1906,6 +2285,77 @@ impl App {
             }
             return false;
         }
+        if self.service_context.is_some() {
+            match key.code {
+                KeyCode::Char('q') => return true,
+                KeyCode::Esc | KeyCode::Char('m') => {
+                    self.service_context = None;
+                    self.service_context_task = None;
+                    self.service_context_scroll = 0;
+                }
+                KeyCode::Char('v') => {
+                    self.service_context = None;
+                    self.service_context_task = None;
+                    self.service_context_scroll = 0;
+                    self.open_executable_context();
+                }
+                KeyCode::Enter | KeyCode::Char('r') => self.refresh_service_context(),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.service_context_scroll = self.service_context_scroll.saturating_add(1);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.service_context_scroll = self.service_context_scroll.saturating_sub(1);
+                }
+                KeyCode::PageDown => {
+                    self.service_context_scroll = self.service_context_scroll.saturating_add(10);
+                }
+                KeyCode::PageUp => {
+                    self.service_context_scroll = self.service_context_scroll.saturating_sub(10);
+                }
+                KeyCode::Char(' ') => self.toggle_paused(),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
+                _ => {}
+            }
+            return false;
+        }
+        if self.executable_context.is_some() {
+            match key.code {
+                KeyCode::Char('q') => return true,
+                KeyCode::Esc | KeyCode::Char('v') => {
+                    self.executable_context = None;
+                    self.executable_context_task = None;
+                    self.executable_context_scroll = 0;
+                }
+                KeyCode::Char('m') => {
+                    self.executable_context = None;
+                    self.executable_context_task = None;
+                    self.executable_context_scroll = 0;
+                    self.open_service_context();
+                }
+                KeyCode::Enter | KeyCode::Char('r') => self.refresh_executable_context(),
+                KeyCode::Char('h') => self.toggle_executable_hash(),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.executable_context_scroll =
+                        self.executable_context_scroll.saturating_add(1);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.executable_context_scroll =
+                        self.executable_context_scroll.saturating_sub(1);
+                }
+                KeyCode::PageDown => {
+                    self.executable_context_scroll =
+                        self.executable_context_scroll.saturating_add(10);
+                }
+                KeyCode::PageUp => {
+                    self.executable_context_scroll =
+                        self.executable_context_scroll.saturating_sub(10);
+                }
+                KeyCode::Char(' ') => self.toggle_paused(),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
+                _ => {}
+            }
+            return false;
+        }
         if self.inspection.is_some() {
             match key.code {
                 KeyCode::Char('q') => return true,
@@ -2036,6 +2486,8 @@ impl App {
             KeyCode::Char('n') => self.open_network(),
             KeyCode::Char('h') => self.open_hotspots(),
             KeyCode::Char('a') => self.open_attention(),
+            KeyCode::Char('m') => self.open_service_context(),
+            KeyCode::Char('v') => self.open_executable_context(),
             KeyCode::Char('p') => self.open_selected_process_action(),
             KeyCode::Char('?') => self.guidance.open_help(),
             KeyCode::Enter => self.open_inspection(),

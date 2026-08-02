@@ -3,10 +3,12 @@ mod app;
 mod cli;
 mod completion;
 mod headless;
+mod headless_cgroup;
 mod headless_deleted;
 mod headless_diff;
 mod headless_doctor;
 mod headless_doctor_diff;
+mod headless_exe;
 mod headless_fd;
 mod headless_file;
 mod headless_inspect;
@@ -15,6 +17,8 @@ mod headless_net;
 mod headless_oom;
 mod headless_port;
 mod headless_run;
+mod headless_service;
+mod headless_stale;
 mod headless_top;
 mod headless_trace;
 mod headless_tree;
@@ -58,6 +62,7 @@ use crate::{
         capture_snapshot, matching_process_count_excluding_collector, render_check_json,
         render_check_table, render_json, render_table, validate_query,
     },
+    headless_cgroup::{capture_cgroups, render_cgroups_json, render_cgroups_table},
     headless_deleted::{
         DeletedPolicyStatus, capture_deleted_files, render_deleted_json, render_deleted_table,
     },
@@ -65,6 +70,7 @@ use crate::{
     headless_doctor::{
         DoctorPolicyStatus, capture_doctor, render_doctor_json, render_doctor_table,
     },
+    headless_exe::{capture_executable, render_executable_json, render_executable_table},
     headless_fd::{FdPolicyStatus, capture_fd_usage, render_fd_json, render_fd_table},
     headless_file::{FilePolicyStatus, capture_file_usage, render_file_json, render_file_table},
     headless_inspect::{capture_inspection, render_inspection_json, render_inspection_table},
@@ -77,6 +83,8 @@ use crate::{
     headless_oom::{OomPolicyStatus, capture_oom_diagnostics, render_oom_json, render_oom_table},
     headless_port::{PortPolicyStatus, capture_port, render_port_json, render_port_table},
     headless_run::{RunOutput, run_command_profile},
+    headless_service::{capture_service_context, render_service_json, render_service_table},
+    headless_stale::{StalePolicyStatus, capture_stale, render_stale_json, render_stale_table},
     headless_top::{render_top_json, render_top_table},
     headless_trace::{TraceOutput, TraceRunStatus, run_trace},
     headless_tree::{build_tree, render_tree_json, render_tree_table},
@@ -342,6 +350,80 @@ fn main() -> ExitCode {
                     LaunchMode::InspectTable => render_inspection_table(&inspection),
                     LaunchMode::InspectJson => {
                         render_inspection_json(&inspection).map_err(io::Error::other)?
+                    }
+                    _ => unreachable!(),
+                };
+                write_stdout(&output)?;
+                Ok(())
+            })();
+            runtime_result(result)
+        }
+        LaunchMode::ExeTable | LaunchMode::ExeJson => {
+            let Some(pid) = cli.exe_pid else {
+                return usage_error("exe requires exactly one PID");
+            };
+            let result = (|| -> Result<(), Box<dyn Error>> {
+                let captured = capture_executable(pid, cli.exe_hash).map_err(io::Error::other)?;
+                let output = match cli.mode {
+                    LaunchMode::ExeTable => render_executable_table(&captured),
+                    LaunchMode::ExeJson => {
+                        render_executable_json(&captured).map_err(io::Error::other)?
+                    }
+                    _ => unreachable!(),
+                };
+                write_stdout(&output)?;
+                Ok(())
+            })();
+            runtime_result(result)
+        }
+        LaunchMode::StaleTable | LaunchMode::StaleJson => {
+            if let Err(error) = validate_query(&cli.query) {
+                return usage_error(&format!("invalid query: {error}"));
+            }
+            let result = (|| -> Result<Option<StalePolicyStatus>, Box<dyn Error>> {
+                let snapshot = capture_snapshot(cli.sample_ms);
+                let captured = capture_stale(&snapshot, &cli.query, cli.stale_limit)
+                    .map_err(io::Error::other)?;
+                let policy_status = cli
+                    .stale_expectation
+                    .map(|expectation| captured.evaluate_policy(expectation));
+                if !cli.quiet {
+                    let expectation = cli.stale_expectation.map(|value| value.label());
+                    let output = match cli.mode {
+                        LaunchMode::StaleTable => {
+                            render_stale_table(&captured, expectation, policy_status)
+                        }
+                        LaunchMode::StaleJson => {
+                            render_stale_json(&captured, expectation, policy_status)
+                                .map_err(io::Error::other)?
+                        }
+                        _ => unreachable!(),
+                    };
+                    if let Err(error) = write_stdout(&output) {
+                        if error.kind() != io::ErrorKind::BrokenPipe {
+                            return Err(error.into());
+                        }
+                    }
+                }
+                Ok(policy_status)
+            })();
+            match result {
+                Ok(None | Some(StalePolicyStatus::Passed)) => ExitCode::SUCCESS,
+                Ok(Some(StalePolicyStatus::Violated)) => ExitCode::from(3),
+                Ok(Some(StalePolicyStatus::Inconclusive)) => ExitCode::FAILURE,
+                Err(error) => runtime_result(Err(error)),
+            }
+        }
+        LaunchMode::ServiceTable | LaunchMode::ServiceJson => {
+            let Some(pid) = cli.service_pid else {
+                return usage_error("service requires exactly one PID");
+            };
+            let result = (|| -> Result<(), Box<dyn Error>> {
+                let captured = capture_service_context(pid).map_err(io::Error::other)?;
+                let output = match cli.mode {
+                    LaunchMode::ServiceTable => render_service_table(&captured),
+                    LaunchMode::ServiceJson => {
+                        render_service_json(&captured).map_err(io::Error::other)?
                     }
                     _ => unreachable!(),
                 };
@@ -746,6 +828,24 @@ fn main() -> ExitCode {
                 Ok(Some(OomPolicyStatus::Inconclusive)) => ExitCode::FAILURE,
                 Err(error) => runtime_result(Err(error)),
             }
+        }
+        LaunchMode::CgroupTable | LaunchMode::CgroupJson => {
+            let result = (|| -> Result<(), Box<dyn Error>> {
+                let snapshot = capture_snapshot(cli.sample_ms);
+                let captured =
+                    capture_cgroups(&snapshot, &cli.query, cli.cgroup_sort, cli.cgroup_limit)
+                        .map_err(io::Error::other)?;
+                let output = match cli.mode {
+                    LaunchMode::CgroupTable => render_cgroups_table(&captured),
+                    LaunchMode::CgroupJson => {
+                        render_cgroups_json(&captured).map_err(io::Error::other)?
+                    }
+                    _ => unreachable!(),
+                };
+                write_stdout(&output)?;
+                Ok(())
+            })();
+            runtime_result(result)
         }
         LaunchMode::DoctorTable | LaunchMode::DoctorJson => {
             if let Err(error) = validate_query(&cli.query) {
@@ -1888,6 +1988,26 @@ Max address space         unlimited            unlimited            bytes\n";
             thread_sample_ms: 250,
             ..ProcessInspection::default()
         };
+        let service_context = serde_json::json!({
+            "schema": "psmore.service-context",
+            "schema_version": 1,
+            "process": { "pid": 42, "name": "worker" },
+            "manager": {
+                "kind": "systemd",
+                "identifier": "worker.service",
+                "state": { "active_state": "active", "sub_state": "running" }
+            }
+        });
+        let executable_context = serde_json::json!({
+            "schema": "psmore.executable-image",
+            "schema_version": 1,
+            "process": { "pid": 42, "name": "worker" },
+            "comparison": {
+                "status": "same_image",
+                "attention_required": false
+            },
+            "hashing_enabled": true
+        });
 
         let path = export_report(
             ReportInput {
@@ -1908,6 +2028,10 @@ Max address space         unlimited            unlimited            bytes\n";
                 network_scan_in_progress: false,
                 inspection: Some(&inspection),
                 inspection_in_progress: false,
+                service_context: Some(&service_context),
+                service_context_in_progress: false,
+                executable_context: Some(&executable_context),
+                executable_context_in_progress: false,
                 action_history: &action_history,
                 baseline: None,
             },
@@ -1919,7 +2043,7 @@ Max address space         unlimited            unlimited            bytes\n";
                 .expect("parse exported report");
 
         assert_eq!(report["schema"], "psmore.diagnostic-report");
-        assert_eq!(report["schema_version"], 3);
+        assert_eq!(report["schema_version"], 5);
         assert_eq!(report["tool"]["name"], "psmore");
         assert_eq!(report["platform"], platform_name());
         assert_eq!(report["selected_pid"], 42);
@@ -1929,6 +2053,14 @@ Max address space         unlimited            unlimited            bytes\n";
         assert_eq!(report["paused"], true);
         assert_eq!(
             report["collection_status"]["network_scan_in_progress"],
+            false
+        );
+        assert_eq!(
+            report["collection_status"]["service_context_in_progress"],
+            false
+        );
+        assert_eq!(
+            report["collection_status"]["executable_context_in_progress"],
             false
         );
         assert_eq!(report["process_count"], 2);
@@ -1963,6 +2095,22 @@ Max address space         unlimited            unlimited            bytes\n";
         assert_eq!(
             report["selected_inspection"]["threads"][0]["cpu_percent"],
             87.5
+        );
+        assert_eq!(
+            report["selected_service_context"]["schema"],
+            "psmore.service-context"
+        );
+        assert_eq!(
+            report["selected_service_context"]["manager"]["identifier"],
+            "worker.service"
+        );
+        assert_eq!(
+            report["selected_executable_context"]["schema"],
+            "psmore.executable-image"
+        );
+        assert_eq!(
+            report["selected_executable_context"]["comparison"]["status"],
+            "same_image"
         );
         assert!(report["baseline"].is_null());
         #[cfg(unix)]
