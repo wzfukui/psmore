@@ -11,7 +11,7 @@ use sysinfo::{Pid, System};
 use crate::{
     headless::ProcessSnapshot,
     model::{
-        ProcessChange, ProcessInfo, ResourceAggregate, diff_processes, process_command_line,
+        ProcessChange, ProcessInfo, ResourceAggregate, diff_processes, process_command_for_output,
         process_path, sanitize_terminal_text,
     },
     provider::{NativeProcessProvider, ProcessProvider, platform_name},
@@ -266,7 +266,7 @@ impl From<&WatchEvent> for JsonWatchProcess {
             parent_pid: process.parent.map(Pid::as_u32),
             name: process.name.clone(),
             path: process_path(process),
-            command: process_command_line(process),
+            command: process_command_for_output(process),
             user: process.user.clone(),
             status: process.status.clone(),
             cpu_percent: finite(process.cpu),
@@ -381,7 +381,7 @@ fn write_table_event<W: Write>(
         human_bytes(event.aggregate.memory),
         event.aggregate.process_count,
         sanitize_terminal_text(&process.name),
-        sanitize_terminal_text(&process_command_line(process)),
+        sanitize_terminal_text(&process_command_for_output(process)),
         relationship,
     )
 }

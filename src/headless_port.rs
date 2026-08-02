@@ -8,7 +8,7 @@ use sysinfo::{Pid, System};
 
 use crate::{
     cli::{CheckExpectation, PortProtocol},
-    model::{ProcessInfo, process_command_line, process_path, sanitize_terminal_text},
+    model::{ProcessInfo, process_command_for_output, process_path, sanitize_terminal_text},
     network::{NetworkEndpoint, NetworkScope, scan_network},
     provider::{NativeProcessProvider, ProcessProvider, platform_name},
 };
@@ -197,7 +197,7 @@ fn json_endpoint(
         process: endpoint.process.clone(),
         user: process.map(|process| process.user.clone()),
         path: process.map(process_path),
-        command: process.map(process_command_line),
+        command: process.map(process_command_for_output),
         namespace: (!endpoint.namespace.is_empty()).then(|| endpoint.namespace.clone()),
     }
 }
@@ -319,7 +319,7 @@ pub(crate) fn render_port_table(
                     .unwrap_or_else(|| "-".into()),
                 sanitize_terminal_text(&endpoint.process),
                 process
-                    .map(process_command_line)
+                    .map(process_command_for_output)
                     .map(|command| sanitize_terminal_text(&command))
                     .unwrap_or_else(|| "[owner unavailable]".into()),
             ));

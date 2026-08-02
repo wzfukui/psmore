@@ -10,7 +10,8 @@ use sysinfo::{Pid, System};
 use crate::{
     headless::ProcessSnapshot,
     model::{
-        ProcessInfo, ResourceAggregate, process_command_line, process_path, sanitize_terminal_text,
+        ProcessInfo, ResourceAggregate, process_command_for_output, process_command_line,
+        process_path, sanitize_terminal_text,
     },
     provider::{NativeProcessProvider, ProcessProvider, platform_name},
 };
@@ -235,7 +236,7 @@ impl From<&ProcessInfo> for JsonTargetIdentity {
             identity_verified: process.start_time > 0,
             name: sanitize_terminal_text(&process.name),
             path: sanitize_terminal_text(&process_path(process)),
-            command: sanitize_terminal_text(&process_command_line(process)),
+            command: sanitize_terminal_text(&process_command_for_output(process)),
             user: sanitize_terminal_text(&process.user),
         }
     }
@@ -327,7 +328,7 @@ fn json_process(
         parent_pid: process.parent.map(Pid::as_u32),
         name: sanitize_terminal_text(&process.name),
         path: sanitize_terminal_text(&process_path(process)),
-        command: sanitize_terminal_text(&process_command_line(process)),
+        command: sanitize_terminal_text(&process_command_for_output(process)),
         user: sanitize_terminal_text(&process.user),
         status: sanitize_terminal_text(&process.status),
         start_time_unix_seconds: process.start_time,
@@ -452,7 +453,7 @@ fn write_table_header<W: Write>(
     writeln!(
         writer,
         "command {}",
-        sanitize_terminal_text(&process_command_line(process))
+        sanitize_terminal_text(&process_command_for_output(process))
     )?;
     writeln!(
         writer,

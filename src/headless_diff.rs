@@ -7,7 +7,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::sanitize_terminal_text;
+use crate::model::{command_for_output, sanitize_terminal_text};
 
 const SNAPSHOT_SCHEMA: &str = "psmore.process-snapshot";
 const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
@@ -459,6 +459,18 @@ pub(crate) fn render_diff_json(comparison: &SnapshotComparison) -> Result<String
         .unwrap_or_default()
         .as_millis()
         .min(u128::from(u64::MAX)) as u64;
+    let mut output_comparison = comparison.clone();
+    for identity in output_comparison
+        .appeared
+        .iter_mut()
+        .chain(output_comparison.disappeared.iter_mut())
+    {
+        identity.command = command_for_output(&identity.command);
+    }
+    for reused in &mut output_comparison.pid_reused {
+        reused.before.command = command_for_output(&reused.before.command);
+        reused.after.command = command_for_output(&reused.after.command);
+    }
     serde_json::to_string_pretty(&JsonDiff {
         schema: DIFF_SCHEMA,
         schema_version: DIFF_SCHEMA_VERSION,
@@ -468,7 +480,7 @@ pub(crate) fn render_diff_json(comparison: &SnapshotComparison) -> Result<String
             version: env!("CARGO_PKG_VERSION"),
         },
         generated_at_unix_ms,
-        comparison,
+        comparison: &output_comparison,
     })
     .map_err(|error| error.to_string())
 }
@@ -525,7 +537,7 @@ fn append_identity_rows(
             entry.pid,
             parent_label(entry.parent_pid),
             sanitize_terminal_text(&entry.name),
-            sanitize_terminal_text(&entry.command)
+            sanitize_terminal_text(&command_for_output(&entry.command))
         ));
     }
     if entries.len() > TABLE_CHANGE_LIMIT {

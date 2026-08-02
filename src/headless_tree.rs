@@ -6,7 +6,8 @@ use sysinfo::{Pid, System};
 use crate::{
     headless::ProcessSnapshot,
     model::{
-        ProcessInfo, ResourceAggregate, process_command_line, process_path, sanitize_terminal_text,
+        ProcessInfo, ResourceAggregate, process_command_for_output, process_path,
+        sanitize_terminal_text,
     },
     provider::platform_name,
 };
@@ -214,7 +215,7 @@ impl From<&TreeNode> for JsonNodeSummary {
             parent_pid: process.parent.map(Pid::as_u32),
             name: process.name.clone(),
             path: process_path(process),
-            command: process_command_line(process),
+            command: process_command_for_output(process),
             user: process.user.clone(),
             status: process.status.clone(),
             cpu_percent: finite(process.cpu),
@@ -330,7 +331,7 @@ fn push_node_line(output: &mut String, prefix: &str, node: &TreeNode, target: bo
         node.aggregate.process_count,
         sanitize_terminal_text(&process.user),
         sanitize_terminal_text(&process.status),
-        sanitize_terminal_text(&process_command_line(process)),
+        sanitize_terminal_text(&process_command_for_output(process)),
     ));
 }
 

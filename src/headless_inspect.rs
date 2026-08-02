@@ -10,7 +10,7 @@ use crate::{
     inspection::inspect_process,
     model::{
         InspectionField, OpenFileInfo, ProcessInfo, ProcessInspection, SocketInfo, ThreadInfo,
-        process_command_line, process_path, sanitize_terminal_text,
+        process_command_for_output, process_path, sanitize_terminal_text,
     },
     provider::{NativeProcessProvider, ProcessProvider, platform_name},
 };
@@ -164,7 +164,7 @@ impl From<&ProcessInfo> for JsonProcess {
             parent_pid: process.parent.map(Pid::as_u32),
             name: process.name.clone(),
             path: process_path(process),
-            command: process_command_line(process),
+            command: process_command_for_output(process),
             executable: process.executable.clone(),
             user: process.user.clone(),
             cwd: process.cwd.clone(),
@@ -344,7 +344,7 @@ pub(crate) fn render_inspection_table(captured: &CapturedInspection) -> String {
     ));
     output.push_str(&format!(
         "COMMAND  {}\n",
-        sanitize_terminal_text(&process_command_line(process))
+        sanitize_terminal_text(&process_command_for_output(process))
     ));
 
     push_fields(&mut output, "RUNTIME CONTEXT", &inspection.runtime);

@@ -8,7 +8,10 @@ mod headless_diff;
 mod headless_fd;
 mod headless_inspect;
 mod headless_listen;
+mod headless_net;
+mod headless_oom;
 mod headless_port;
+mod headless_top;
 mod headless_trace;
 mod headless_tree;
 mod headless_watch;
@@ -54,10 +57,16 @@ use crate::{
     headless_listen::{
         ListenPolicyStatus, capture_listeners, render_listeners_json, render_listeners_table,
     },
+    headless_net::{
+        NetPolicyStatus, capture_network_connections, render_network_json, render_network_table,
+    },
+    headless_oom::{OomPolicyStatus, capture_oom_diagnostics, render_oom_json, render_oom_table},
     headless_port::{PortPolicyStatus, capture_port, render_port_json, render_port_table},
+    headless_top::{render_top_json, render_top_table},
     headless_trace::{TraceOutput, TraceRunStatus, run_trace},
     headless_tree::{build_tree, render_tree_json, render_tree_table},
     headless_watch::{WatchOutput, run_watch},
+    model::set_output_secret_redaction,
     ui::draw,
 };
 
@@ -147,6 +156,7 @@ fn main() -> ExitCode {
         Ok(cli) => cli,
         Err(error) => return usage_error(&error),
     };
+    set_output_secret_redaction(cli.redact_secrets);
     match cli.mode {
         LaunchMode::Help => {
             runtime_result(write_stdout(help_text(cli.help_topic)).map_err(Into::into))
@@ -321,6 +331,45 @@ fn main() -> ExitCode {
                 Err(error) => runtime_result(Err(error)),
             }
         }
+        LaunchMode::NetTable | LaunchMode::NetJson => {
+            let result = (|| -> Result<Option<NetPolicyStatus>, Box<dyn Error>> {
+                let captured = capture_network_connections(
+                    &cli.query,
+                    cli.net_protocol,
+                    cli.net_connected_only,
+                    cli.net_state.as_deref(),
+                    cli.net_limit,
+                );
+                let policy_status = cli
+                    .net_expectation
+                    .map(|expectation| captured.evaluate_policy(expectation));
+                if !cli.quiet {
+                    let expectation = cli.net_expectation.map(|value| value.label());
+                    let output = match cli.mode {
+                        LaunchMode::NetTable => {
+                            render_network_table(&captured, expectation, policy_status)
+                        }
+                        LaunchMode::NetJson => {
+                            render_network_json(&captured, expectation, policy_status)
+                                .map_err(io::Error::other)?
+                        }
+                        _ => unreachable!(),
+                    };
+                    if let Err(error) = write_stdout(&output) {
+                        if error.kind() != io::ErrorKind::BrokenPipe {
+                            return Err(error.into());
+                        }
+                    }
+                }
+                Ok(policy_status)
+            })();
+            match result {
+                Ok(None | Some(NetPolicyStatus::Passed)) => ExitCode::SUCCESS,
+                Ok(Some(NetPolicyStatus::Violated)) => ExitCode::from(3),
+                Ok(Some(NetPolicyStatus::Inconclusive)) => ExitCode::FAILURE,
+                Err(error) => runtime_result(Err(error)),
+            }
+        }
         LaunchMode::TreeTable | LaunchMode::TreeJson => {
             let Some(pid) = cli.tree_pid else {
                 return usage_error("tree requires exactly one PID");
@@ -455,6 +504,76 @@ fn main() -> ExitCode {
                 Ok(None | Some(FdPolicyStatus::Passed)) => ExitCode::SUCCESS,
                 Ok(Some(FdPolicyStatus::Violated)) => ExitCode::from(3),
                 Ok(Some(FdPolicyStatus::Inconclusive)) => ExitCode::FAILURE,
+                Err(error) => runtime_result(Err(error)),
+            }
+        }
+        LaunchMode::TopTable | LaunchMode::TopJson => {
+            if let Err(error) = validate_query(&cli.query) {
+                return usage_error(&format!("invalid query: {error}"));
+            }
+            let result = (|| -> Result<(), Box<dyn Error>> {
+                let snapshot = capture_snapshot(cli.sample_ms);
+                let output = match cli.mode {
+                    LaunchMode::TopTable => render_top_table(
+                        &snapshot,
+                        &cli.query,
+                        cli.top_metric,
+                        cli.top_scope,
+                        cli.top_limit,
+                    ),
+                    LaunchMode::TopJson => render_top_json(
+                        &snapshot,
+                        &cli.query,
+                        cli.top_metric,
+                        cli.top_scope,
+                        cli.top_limit,
+                    ),
+                    _ => unreachable!(),
+                }
+                .map_err(io::Error::other)?;
+                write_stdout(&output)?;
+                Ok(())
+            })();
+            runtime_result(result)
+        }
+        LaunchMode::OomTable | LaunchMode::OomJson => {
+            if let Err(error) = validate_query(&cli.query) {
+                return usage_error(&format!("invalid query: {error}"));
+            }
+            let result = (|| -> Result<Option<OomPolicyStatus>, Box<dyn Error>> {
+                let captured = capture_oom_diagnostics(
+                    &cli.query,
+                    cli.sample_ms,
+                    cli.oom_min_score,
+                    cli.oom_limit,
+                )?;
+                let policy_status = cli
+                    .oom_expectation
+                    .map(|expectation| captured.evaluate_policy(expectation));
+                if !cli.quiet {
+                    let expectation = cli.oom_expectation.map(|value| value.label());
+                    let output = match cli.mode {
+                        LaunchMode::OomTable => {
+                            render_oom_table(&captured, expectation, policy_status)
+                        }
+                        LaunchMode::OomJson => {
+                            render_oom_json(&captured, expectation, policy_status)
+                                .map_err(io::Error::other)?
+                        }
+                        _ => unreachable!(),
+                    };
+                    if let Err(error) = write_stdout(&output) {
+                        if error.kind() != io::ErrorKind::BrokenPipe {
+                            return Err(error.into());
+                        }
+                    }
+                }
+                Ok(policy_status)
+            })();
+            match result {
+                Ok(None | Some(OomPolicyStatus::Passed)) => ExitCode::SUCCESS,
+                Ok(Some(OomPolicyStatus::Violated)) => ExitCode::from(3),
+                Ok(Some(OomPolicyStatus::Inconclusive)) => ExitCode::FAILURE,
                 Err(error) => runtime_result(Err(error)),
             }
         }

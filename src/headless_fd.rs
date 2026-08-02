@@ -16,7 +16,7 @@ use sysinfo::{Pid, System};
 
 use crate::{
     cli::CheckExpectation,
-    model::{ProcessInfo, process_command_line, sanitize_terminal_text},
+    model::{ProcessInfo, command_for_output, process_command_line, sanitize_terminal_text},
     provider::{NativeProcessProvider, ProcessProvider, platform_name},
 };
 
@@ -526,7 +526,7 @@ impl From<&FdUsage> for JsonProcess {
         Self {
             pid: usage.pid,
             process: sanitize_terminal_text(&usage.process),
-            command: sanitize_terminal_text(&usage.command),
+            command: sanitize_terminal_text(&command_for_output(&usage.command)),
             user: sanitize_terminal_text(&usage.user),
             open_fd_count: usage.open_fd_count,
             soft_limit: usage.soft_limit.numeric(),
@@ -647,7 +647,7 @@ pub(crate) fn render_fd_table(
                 usage.pid,
                 sanitize_terminal_text(&usage.user),
                 sanitize_terminal_text(&usage.process),
-                sanitize_terminal_text(&usage.command),
+                sanitize_terminal_text(&command_for_output(&usage.command)),
             ));
         }
         if captured.returned_count() < captured.entries.len() {

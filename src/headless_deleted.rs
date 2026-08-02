@@ -15,7 +15,7 @@ use sysinfo::{Pid, System};
 use crate::inspection::linux_fd_access;
 use crate::{
     cli::CheckExpectation,
-    model::{ProcessInfo, process_command_line, sanitize_terminal_text},
+    model::{ProcessInfo, command_for_output, process_command_line, sanitize_terminal_text},
     provider::{NativeProcessProvider, ProcessProvider, platform_name},
 };
 
@@ -462,7 +462,7 @@ impl From<&DeletedOpenFile> for JsonDeletedFile {
         Self {
             pid: file.pid,
             process: file.process.clone(),
-            command: file.command.clone(),
+            command: command_for_output(&file.command),
             user: file.user.clone(),
             fd: file.fd.clone(),
             access: file.access.clone(),
@@ -569,7 +569,7 @@ pub(crate) fn render_deleted_table(
             ));
             output.push_str(&format!(
                 "                       command {}\n",
-                sanitize_terminal_text(&entry.command)
+                sanitize_terminal_text(&command_for_output(&entry.command))
             ));
         }
         output.push_str(

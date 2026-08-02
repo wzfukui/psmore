@@ -1,3 +1,5 @@
+use crate::model::{HotspotMetric, HotspotScope};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LaunchMode {
     Tui,
@@ -21,6 +23,12 @@ pub(crate) enum LaunchMode {
     DeletedJson,
     FdTable,
     FdJson,
+    TopTable,
+    TopJson,
+    OomTable,
+    OomJson,
+    NetTable,
+    NetJson,
     DiffTable,
     DiffJson,
     Completion,
@@ -39,6 +47,9 @@ pub(crate) enum HelpTopic {
     Trace,
     Deleted,
     Fd,
+    Top,
+    Oom,
+    Net,
     Diff,
     Completion,
 }
@@ -152,6 +163,18 @@ pub(crate) struct Cli {
     pub(crate) fd_min_percent: Option<u16>,
     pub(crate) fd_limit: Option<usize>,
     pub(crate) fd_expectation: Option<CheckExpectation>,
+    pub(crate) top_metric: HotspotMetric,
+    pub(crate) top_scope: HotspotScope,
+    pub(crate) top_limit: Option<usize>,
+    pub(crate) oom_min_score: u16,
+    pub(crate) oom_limit: Option<usize>,
+    pub(crate) oom_expectation: Option<CheckExpectation>,
+    pub(crate) net_protocol: ListenProtocol,
+    pub(crate) net_connected_only: bool,
+    pub(crate) net_state: Option<String>,
+    pub(crate) net_limit: Option<usize>,
+    pub(crate) net_expectation: Option<CheckExpectation>,
+    pub(crate) redact_secrets: bool,
     pub(crate) check_expectation: CheckExpectation,
     pub(crate) quiet: bool,
 }
@@ -187,6 +210,18 @@ impl Default for Cli {
             fd_min_percent: None,
             fd_limit: Some(20),
             fd_expectation: None,
+            top_metric: HotspotMetric::Cpu,
+            top_scope: HotspotScope::Process,
+            top_limit: Some(20),
+            oom_min_score: 1,
+            oom_limit: Some(20),
+            oom_expectation: None,
+            net_protocol: ListenProtocol::Any,
+            net_connected_only: false,
+            net_state: None,
+            net_limit: Some(100),
+            net_expectation: None,
+            redact_secrets: false,
             check_expectation: CheckExpectation::None,
             quiet: false,
         }
@@ -199,13 +234,17 @@ impl Cli {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        let arguments: Vec<String> = args.into_iter().map(Into::into).collect();
+        let mut arguments: Vec<String> = args.into_iter().map(Into::into).collect();
+        let redact_secrets = extract_secret_redaction(&mut arguments)?;
         if let Some(command) = arguments.first().map(String::as_str) {
             let parsed = match command {
                 "watch" => Some((parse_watch(&arguments[1..]), HelpTopic::Watch)),
                 "trace" => Some((parse_trace(&arguments[1..]), HelpTopic::Trace)),
                 "deleted" => Some((parse_deleted(&arguments[1..]), HelpTopic::Deleted)),
                 "fd" => Some((parse_fd(&arguments[1..]), HelpTopic::Fd)),
+                "top" => Some((parse_top(&arguments[1..]), HelpTopic::Top)),
+                "oom" => Some((parse_oom(&arguments[1..]), HelpTopic::Oom)),
+                "net" => Some((parse_net(&arguments[1..]), HelpTopic::Net)),
                 "check" => Some((parse_check(&arguments[1..]), HelpTopic::Check)),
                 "listen" => Some((parse_listen(&arguments[1..]), HelpTopic::Listen)),
                 "inspect" => Some((parse_inspect(&arguments[1..]), HelpTopic::Inspect)),
@@ -216,7 +255,8 @@ impl Cli {
                 _ => None,
             };
             if let Some((parsed, topic)) = parsed {
-                return with_help_topic(parsed, topic);
+                return with_help_topic(parsed, topic)
+                    .and_then(|cli| apply_secret_redaction(cli, redact_secrets));
             }
         }
         let mut cli = Self::default();
@@ -264,8 +304,60 @@ impl Cli {
         if sample_set && cli.mode == LaunchMode::Tui {
             return Err("--sample-ms requires --table or --json".into());
         }
-        Ok(cli)
+        apply_secret_redaction(cli, redact_secrets)
     }
+}
+
+fn extract_secret_redaction(arguments: &mut Vec<String>) -> Result<bool, String> {
+    const VALUE_OPTIONS: [&str; 17] = [
+        "-q",
+        "--query",
+        "--sample-ms",
+        "--expect",
+        "--protocol",
+        "--limit",
+        "--min-count",
+        "--min-percent",
+        "--min-size",
+        "--interval-ms",
+        "--count",
+        "--depth",
+        "--by",
+        "--scope",
+        "--min-score",
+        "--state",
+        "--output",
+    ];
+    let mut enabled = false;
+    let mut expects_value = false;
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = arguments[index].as_str();
+        if expects_value {
+            expects_value = false;
+            index += 1;
+            continue;
+        }
+        if matches!(argument, "--redact" | "--redact-secrets") {
+            if enabled {
+                return Err("--redact may only be specified once".into());
+            }
+            arguments.remove(index);
+            enabled = true;
+            continue;
+        }
+        expects_value = VALUE_OPTIONS.contains(&argument);
+        index += 1;
+    }
+    Ok(enabled)
+}
+
+fn apply_secret_redaction(mut cli: Cli, enabled: bool) -> Result<Cli, String> {
+    if enabled && cli.mode == LaunchMode::Tui {
+        return Err("--redact requires a non-interactive command or --table/--json".into());
+    }
+    cli.redact_secrets = enabled;
+    Ok(cli)
 }
 
 fn with_help_topic(result: Result<Cli, String>, topic: HelpTopic) -> Result<Cli, String> {
@@ -317,6 +409,518 @@ fn parse_completion(arguments: &[String]) -> Result<Cli, String> {
         completion_shell: Some(completion_shell),
         ..Cli::default()
     })
+}
+
+fn parse_top(arguments: &[String]) -> Result<Cli, String> {
+    let mut cli = Cli {
+        mode: LaunchMode::TopTable,
+        ..Cli::default()
+    };
+    let mut output_mode = None;
+    let mut query_set = false;
+    let mut sample_set = false;
+    let mut metric_set = false;
+    let mut scope_set = false;
+    let mut limit_set = false;
+    let mut positional_query = Vec::new();
+    let mut arguments = arguments.iter().cloned().peekable();
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "-h" | "--help" => cli.mode = LaunchMode::Help,
+            "-V" | "--version" => cli.mode = LaunchMode::Version,
+            "--table" => {
+                set_top_output_mode(&mut cli.mode, &mut output_mode, LaunchMode::TopTable)?
+            }
+            "--json" => set_top_output_mode(&mut cli.mode, &mut output_mode, LaunchMode::TopJson)?,
+            "-q" | "--query" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| format!("{argument} requires a value"))?;
+                set_query(&mut cli, &mut query_set, value)?;
+            }
+            "--by" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--by requires cpu, memory, read, or write".to_string())?;
+                set_top_metric(&mut cli, &mut metric_set, &value)?;
+            }
+            "--scope" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--scope requires process or tree".to_string())?;
+                set_top_scope(&mut cli, &mut scope_set, &value)?;
+            }
+            "--limit" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--limit requires a positive integer or all".to_string())?;
+                set_top_limit(&mut cli, &mut limit_set, &value)?;
+            }
+            "--sample-ms" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--sample-ms requires a value".to_string())?;
+                set_sample_ms(&mut cli, &mut sample_set, &value)?;
+            }
+            _ if argument.starts_with("--query=") => {
+                let value = argument.trim_start_matches("--query=").to_string();
+                set_query(&mut cli, &mut query_set, value)?;
+            }
+            _ if argument.starts_with("--by=") => {
+                set_top_metric(
+                    &mut cli,
+                    &mut metric_set,
+                    argument.trim_start_matches("--by="),
+                )?;
+            }
+            _ if argument.starts_with("--scope=") => {
+                set_top_scope(
+                    &mut cli,
+                    &mut scope_set,
+                    argument.trim_start_matches("--scope="),
+                )?;
+            }
+            _ if argument.starts_with("--limit=") => {
+                set_top_limit(
+                    &mut cli,
+                    &mut limit_set,
+                    argument.trim_start_matches("--limit="),
+                )?;
+            }
+            _ if argument.starts_with("--sample-ms=") => {
+                set_sample_ms(
+                    &mut cli,
+                    &mut sample_set,
+                    argument.trim_start_matches("--sample-ms="),
+                )?;
+            }
+            _ if argument.starts_with('-') => {
+                return Err(format!("unknown top option: {argument}"));
+            }
+            _ => positional_query.push(argument),
+        }
+    }
+    if matches!(cli.mode, LaunchMode::Help | LaunchMode::Version) {
+        return Ok(cli);
+    }
+    if !positional_query.is_empty() {
+        if query_set {
+            return Err("top query may be positional or passed with --query, not both".into());
+        }
+        set_query(&mut cli, &mut query_set, positional_query.join(" "))?;
+    }
+    Ok(cli)
+}
+
+fn set_top_output_mode(
+    mode: &mut LaunchMode,
+    output_mode: &mut Option<LaunchMode>,
+    value: LaunchMode,
+) -> Result<(), String> {
+    if output_mode.replace(value).is_some() {
+        return Err("top output mode may only be specified once".into());
+    }
+    *mode = value;
+    Ok(())
+}
+
+fn set_top_metric(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+    if *value_set {
+        return Err("--by may only be specified once".into());
+    }
+    cli.top_metric = match value.to_ascii_lowercase().as_str() {
+        "cpu" => HotspotMetric::Cpu,
+        "memory" | "mem" => HotspotMetric::Memory,
+        "read" | "read-rate" => HotspotMetric::Read,
+        "write" | "write-rate" => HotspotMetric::Write,
+        _ => return Err("--by requires cpu, memory, read, or write".into()),
+    };
+    *value_set = true;
+    Ok(())
+}
+
+fn set_top_scope(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+    if *value_set {
+        return Err("--scope may only be specified once".into());
+    }
+    cli.top_scope = match value.to_ascii_lowercase().as_str() {
+        "process" | "self" | "own" => HotspotScope::Process,
+        "tree" | "subtree" | "service" => HotspotScope::Subtree,
+        _ => return Err("--scope requires process or tree".into()),
+    };
+    *value_set = true;
+    Ok(())
+}
+
+fn set_top_limit(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+    if *value_set {
+        return Err("--limit may only be specified once".into());
+    }
+    cli.top_limit = if value.eq_ignore_ascii_case("all") {
+        None
+    } else {
+        let limit = value
+            .parse::<usize>()
+            .map_err(|_| "--limit requires a positive integer or all".to_string())?;
+        if !(1..=10_000).contains(&limit) {
+            return Err("--limit must be between 1 and 10000, or all".into());
+        }
+        Some(limit)
+    };
+    *value_set = true;
+    Ok(())
+}
+
+fn parse_oom(arguments: &[String]) -> Result<Cli, String> {
+    let mut cli = Cli {
+        mode: LaunchMode::OomTable,
+        ..Cli::default()
+    };
+    let mut output_mode = None;
+    let mut query_set = false;
+    let mut sample_set = false;
+    let mut min_score_set = false;
+    let mut limit_set = false;
+    let mut expectation_set = false;
+    let mut positional_query = Vec::new();
+    let mut arguments = arguments.iter().cloned().peekable();
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "-h" | "--help" => cli.mode = LaunchMode::Help,
+            "-V" | "--version" => cli.mode = LaunchMode::Version,
+            "--table" => {
+                set_oom_output_mode(&mut cli.mode, &mut output_mode, LaunchMode::OomTable)?
+            }
+            "--json" => set_oom_output_mode(&mut cli.mode, &mut output_mode, LaunchMode::OomJson)?,
+            "--quiet" => cli.quiet = true,
+            "-q" | "--query" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| format!("{argument} requires a value"))?;
+                set_query(&mut cli, &mut query_set, value)?;
+            }
+            "--min-score" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--min-score requires an integer from 0 to 1000".to_string())?;
+                set_oom_min_score(&mut cli, &mut min_score_set, &value)?;
+            }
+            "--limit" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--limit requires a positive integer or all".to_string())?;
+                set_oom_limit(&mut cli, &mut limit_set, &value)?;
+            }
+            "--expect" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--expect requires none or any".to_string())?;
+                set_oom_expectation(&mut cli, &mut expectation_set, &value)?;
+            }
+            "--sample-ms" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--sample-ms requires a value".to_string())?;
+                set_sample_ms(&mut cli, &mut sample_set, &value)?;
+            }
+            _ if argument.starts_with("--query=") => {
+                set_query(
+                    &mut cli,
+                    &mut query_set,
+                    argument.trim_start_matches("--query=").to_string(),
+                )?;
+            }
+            _ if argument.starts_with("--min-score=") => {
+                set_oom_min_score(
+                    &mut cli,
+                    &mut min_score_set,
+                    argument.trim_start_matches("--min-score="),
+                )?;
+            }
+            _ if argument.starts_with("--limit=") => {
+                set_oom_limit(
+                    &mut cli,
+                    &mut limit_set,
+                    argument.trim_start_matches("--limit="),
+                )?;
+            }
+            _ if argument.starts_with("--expect=") => {
+                set_oom_expectation(
+                    &mut cli,
+                    &mut expectation_set,
+                    argument.trim_start_matches("--expect="),
+                )?;
+            }
+            _ if argument.starts_with("--sample-ms=") => {
+                set_sample_ms(
+                    &mut cli,
+                    &mut sample_set,
+                    argument.trim_start_matches("--sample-ms="),
+                )?;
+            }
+            _ if argument.starts_with('-') => {
+                return Err(format!("unknown oom option: {argument}"));
+            }
+            _ => positional_query.push(argument),
+        }
+    }
+    if matches!(cli.mode, LaunchMode::Help | LaunchMode::Version) {
+        return Ok(cli);
+    }
+    if !positional_query.is_empty() {
+        if query_set {
+            return Err("oom query may be positional or passed with --query, not both".into());
+        }
+        set_query(&mut cli, &mut query_set, positional_query.join(" "))?;
+    }
+    if cli.quiet && cli.oom_expectation.is_none() {
+        return Err("oom --quiet requires --expect any or --expect none".into());
+    }
+    Ok(cli)
+}
+
+fn set_oom_output_mode(
+    mode: &mut LaunchMode,
+    output_mode: &mut Option<LaunchMode>,
+    value: LaunchMode,
+) -> Result<(), String> {
+    if output_mode.replace(value).is_some() {
+        return Err("oom output mode may only be specified once".into());
+    }
+    *mode = value;
+    Ok(())
+}
+
+fn set_oom_min_score(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+    if *value_set {
+        return Err("--min-score may only be specified once".into());
+    }
+    let score = value
+        .parse::<u16>()
+        .map_err(|_| "--min-score requires an integer from 0 to 1000".to_string())?;
+    if score > 1_000 {
+        return Err("--min-score must be between 0 and 1000".into());
+    }
+    cli.oom_min_score = score;
+    *value_set = true;
+    Ok(())
+}
+
+fn set_oom_limit(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+    if *value_set {
+        return Err("--limit may only be specified once".into());
+    }
+    cli.oom_limit = if value.eq_ignore_ascii_case("all") {
+        None
+    } else {
+        let limit = value
+            .parse::<usize>()
+            .map_err(|_| "--limit requires a positive integer or all".to_string())?;
+        if !(1..=10_000).contains(&limit) {
+            return Err("--limit must be between 1 and 10000, or all".into());
+        }
+        Some(limit)
+    };
+    *value_set = true;
+    Ok(())
+}
+
+fn set_oom_expectation(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+    if *value_set {
+        return Err("--expect may only be specified once".into());
+    }
+    cli.oom_expectation = Some(parse_expectation(value)?);
+    *value_set = true;
+    Ok(())
+}
+
+fn parse_net(arguments: &[String]) -> Result<Cli, String> {
+    let mut cli = Cli {
+        mode: LaunchMode::NetTable,
+        ..Cli::default()
+    };
+    let mut output_mode = None;
+    let mut query_set = false;
+    let mut protocol_set = false;
+    let mut state_set = false;
+    let mut limit_set = false;
+    let mut expectation_set = false;
+    let mut positional_query = Vec::new();
+    let mut arguments = arguments.iter().cloned().peekable();
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "-h" | "--help" => cli.mode = LaunchMode::Help,
+            "-V" | "--version" => cli.mode = LaunchMode::Version,
+            "--table" => {
+                set_net_output_mode(&mut cli.mode, &mut output_mode, LaunchMode::NetTable)?
+            }
+            "--json" => set_net_output_mode(&mut cli.mode, &mut output_mode, LaunchMode::NetJson)?,
+            "--connected" | "--peers" => cli.net_connected_only = true,
+            "--quiet" => cli.quiet = true,
+            "-q" | "--query" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| format!("{argument} requires a value"))?;
+                set_query(&mut cli, &mut query_set, value)?;
+            }
+            "--protocol" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--protocol requires tcp, udp, unix, or any".to_string())?;
+                set_net_protocol(&mut cli, &mut protocol_set, &value)?;
+            }
+            "--state" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--state requires a socket state".to_string())?;
+                set_net_state(&mut cli, &mut state_set, &value)?;
+            }
+            "--limit" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--limit requires a positive integer or all".to_string())?;
+                set_net_limit(&mut cli, &mut limit_set, &value)?;
+            }
+            "--expect" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--expect requires none or any".to_string())?;
+                set_net_expectation(&mut cli, &mut expectation_set, &value)?;
+            }
+            _ if argument.starts_with("--query=") => {
+                set_query(
+                    &mut cli,
+                    &mut query_set,
+                    argument.trim_start_matches("--query=").to_string(),
+                )?;
+            }
+            _ if argument.starts_with("--protocol=") => {
+                set_net_protocol(
+                    &mut cli,
+                    &mut protocol_set,
+                    argument.trim_start_matches("--protocol="),
+                )?;
+            }
+            _ if argument.starts_with("--state=") => {
+                set_net_state(
+                    &mut cli,
+                    &mut state_set,
+                    argument.trim_start_matches("--state="),
+                )?;
+            }
+            _ if argument.starts_with("--limit=") => {
+                set_net_limit(
+                    &mut cli,
+                    &mut limit_set,
+                    argument.trim_start_matches("--limit="),
+                )?;
+            }
+            _ if argument.starts_with("--expect=") => {
+                set_net_expectation(
+                    &mut cli,
+                    &mut expectation_set,
+                    argument.trim_start_matches("--expect="),
+                )?;
+            }
+            _ if argument.starts_with('-') => {
+                return Err(format!("unknown net option: {argument}"));
+            }
+            _ => positional_query.push(argument),
+        }
+    }
+    if matches!(cli.mode, LaunchMode::Help | LaunchMode::Version) {
+        return Ok(cli);
+    }
+    if query_set && !positional_query.is_empty() {
+        return Err("net filter must be positional or passed with --query, not both".into());
+    }
+    if !query_set && !positional_query.is_empty() {
+        set_query(&mut cli, &mut query_set, positional_query.join(" "))?;
+    }
+    if cli.quiet && cli.net_expectation.is_none() {
+        return Err("net --quiet requires --expect any or --expect none".into());
+    }
+    Ok(cli)
+}
+
+fn set_net_output_mode(
+    mode: &mut LaunchMode,
+    output_mode: &mut Option<LaunchMode>,
+    requested: LaunchMode,
+) -> Result<(), String> {
+    if output_mode.is_some_and(|existing| existing != requested) {
+        return Err("net --table and --json cannot be used together".into());
+    }
+    *output_mode = Some(requested);
+    if !matches!(mode, LaunchMode::Help | LaunchMode::Version) {
+        *mode = requested;
+    }
+    Ok(())
+}
+
+fn set_net_protocol(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+    if *value_set {
+        return Err("--protocol may only be specified once".into());
+    }
+    cli.net_protocol = match value.to_ascii_lowercase().as_str() {
+        "any" => ListenProtocol::Any,
+        "tcp" => ListenProtocol::Tcp,
+        "udp" => ListenProtocol::Udp,
+        "unix" => ListenProtocol::Unix,
+        _ => {
+            return Err(format!(
+                "invalid net protocol: {value}; use tcp, udp, unix, or any"
+            ));
+        }
+    };
+    *value_set = true;
+    Ok(())
+}
+
+fn set_net_state(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+    if *value_set {
+        return Err("--state may only be specified once".into());
+    }
+    let normalized = value.trim().to_ascii_uppercase().replace('-', "_");
+    if normalized.is_empty()
+        || normalized.len() > 64
+        || !normalized
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        return Err("--state must be a non-empty socket state such as ESTABLISHED".into());
+    }
+    cli.net_state = Some(normalized);
+    *value_set = true;
+    Ok(())
+}
+
+fn set_net_limit(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+    if *value_set {
+        return Err("--limit may only be specified once".into());
+    }
+    cli.net_limit = if value.eq_ignore_ascii_case("all") {
+        None
+    } else {
+        let limit = value
+            .parse::<usize>()
+            .map_err(|_| format!("invalid --limit value: {value}; use 1-10000 or all"))?;
+        if !(1..=10_000).contains(&limit) {
+            return Err("--limit must be between 1 and 10000, or all".into());
+        }
+        Some(limit)
+    };
+    *value_set = true;
+    Ok(())
+}
+
+fn set_net_expectation(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+    if *value_set {
+        return Err("--expect may only be specified once".into());
+    }
+    cli.net_expectation = Some(parse_expectation(value)?);
+    *value_set = true;
+    Ok(())
 }
 
 fn parse_fd(arguments: &[String]) -> Result<Cli, String> {
@@ -1467,11 +2071,14 @@ COMMANDS:
   inspect     Inspect one process, threads, sockets, files, and context
   port        Find the process and socket using a local port
   listen      Inventory listeners and classify non-loopback exposure
+  net         Search all listeners and peer connections with process context
   tree        Print one PID's complete ancestor and descendant context
   watch       Stream process lifecycle and query transition events
   trace       Record process and complete-subtree resource time series
   deleted     Find deleted files that processes still hold open
   fd          Rank processes by open file-descriptor pressure
+  top         Rank current CPU, memory, and disk I/O hotspots
+  oom         Diagnose Linux memory pressure and OOM kill priority
   diff        Compare two psmore process snapshot JSON files
   completion  Generate shell completion for bash, zsh, or fish
 
@@ -1480,6 +2087,7 @@ GLOBAL OPTIONS:
       --table         Print a human-readable process snapshot and exit
       --json          Print a versioned JSON process snapshot and exit
       --sample-ms MS  CPU and I/O sampling interval, 100-60000 [default: 500]
+      --redact        Mask common secret values in emitted command lines
   -h, --help          Print help
   -V, --version       Print version
 
@@ -1499,6 +2107,7 @@ OPTIONS:
       --json          psmore.check-result JSON
       --quiet         Suppress output and use only the exit code
       --sample-ms MS  Sampling interval, 100-60000 [default: 500]
+      --redact        Mask common secret values in emitted command lines
 
 EXIT: 0 policy passed, 1 runtime error, 2 usage/query error, 3 policy violated
 EXAMPLES:
@@ -1516,6 +2125,7 @@ OPTIONS:
       --table         Human-readable process, thread, socket, file, and context report [default]
       --json          psmore.process-inspection JSON
       --sample-ms MS  Process resource sampling interval, 100-60000 [default: 500]
+      --redact        Mask common secret values in emitted command lines
 
 The PID identity is revalidated after collection; confirmed PID reuse is refused.
 EXAMPLES:
@@ -1535,6 +2145,7 @@ OPTIONS:
       --all          Include non-listening local connections
       --expect MODE  Apply none/any health-gate policy
       --quiet        Suppress output; requires --expect
+      --redact       Mask common secret values in emitted command lines
 
 EXIT: 0 success/pass, 1 error or inconclusive absence, 2 usage, 3 violation
 EXAMPLES:
@@ -1557,11 +2168,41 @@ OPTIONS:
       --limit N|all  Maximum returned socket references [default: 100]
       --expect MODE  Apply none/any health-gate policy
       --quiet        Suppress output; requires --expect
+      --redact       Mask common secret values in emitted command lines
 
 EXAMPLES:
   psmore listen --exposed --protocol tcp
   psmore listen nginx --limit all --json
   psmore listen debug --exposed --expect none --quiet
+"
+        }
+        Some(HelpTopic::Net) => {
+            "psmore net - search all sockets, peer endpoints, and process owners
+
+USAGE:
+  psmore net [FILTER] [--protocol tcp|udp|unix|any] [--connected]
+             [--state STATE] [--limit N|all] [--table|--json]
+             [--expect none|any] [--quiet]
+
+OPTIONS:
+  -q, --query TEXT  FILTER alternative; searches routes, owners, commands, and namespace
+      --protocol P  tcp, udp, unix, or any [default: any]
+      --connected   Keep non-terminal peer connections; exclude listeners, binds, and CLOSED
+      --state S     Exact normalized state, e.g. ESTABLISHED, TIME_WAIT, CONNECTED
+      --limit N|all Maximum returned socket references [default: 100]
+      --table       Human-readable route and owner evidence [default]
+      --json        Versioned psmore.network-connections JSON
+      --expect MODE Apply none/any health-gate policy to all matches
+      --quiet       Suppress output; requires --expect
+      --redact      Mask common secret values in emitted command lines
+
+Local and peer endpoints are kernel evidence. psmore does not guess whether an
+established route was initiated inbound or outbound without packet/flow state.
+EXAMPLES:
+  psmore net --connected --protocol tcp
+  psmore net 203.0.113.10 --state established
+  psmore net worker --connected --limit all --json
+  psmore net 198.51.100.20 --expect none --quiet
 "
         }
         Some(HelpTopic::Tree) => {
@@ -1575,6 +2216,7 @@ OPTIONS:
       --table        Directory-style tree with own/subtree resources [default]
       --json         Nested psmore.process-tree JSON
       --sample-ms MS Sampling interval, 100-60000 [default: 500]
+      --redact       Mask common secret values in emitted command lines
 
 EXAMPLES:
   psmore tree 1234 --depth 2
@@ -1593,6 +2235,7 @@ OPTIONS:
       --jsonl        One psmore.process-watch-event document per record
       --interval-ms  Refresh interval, 100-60000 [default: 1000]
       --count N      Stop after N post-baseline refreshes [default: unlimited]
+      --redact       Mask common secret values in emitted command lines
 
 EXAMPLES:
   psmore watch 'cpu>80 age>5s' --interval-ms 250
@@ -1610,6 +2253,7 @@ OPTIONS:
       --jsonl        Baseline, sample, lifecycle, and complete JSON records
       --interval-ms  Target refresh interval, 100-60000 [default: 1000]
       --count N      Stop after N post-baseline samples [default: unlimited]
+      --redact       Mask common secret values in emitted command lines
 
 Trace never follows a reused PID into a new process instance.
 EXAMPLES:
@@ -1629,6 +2273,7 @@ OPTIONS:
       --json          psmore.deleted-open-files JSON
       --expect MODE   Apply none/any policy to unique matching files
       --quiet         Suppress output; requires --expect
+      --redact        Mask common secret values in emitted command lines
 
 EXIT: 0 success/pass, 1 error or inconclusive absence, 2 usage, 3 violation
 EXAMPLES:
@@ -1649,12 +2294,64 @@ OPTIONS:
       --limit N|all    Maximum returned process rows [default: 20]
       --expect MODE    Apply none/any policy to all matches
       --quiet          Suppress output; requires --expect
+      --redact         Mask common secret values in emitted command lines
 
 Count and percent filters use AND semantics. Linux exposes per-process limits;
 macOS reports limit utilization as unknown rather than inventing a percentage.
 EXAMPLES:
   psmore fd --min-percent 80
   psmore fd --min-count 4096 --expect none --quiet
+"
+        }
+        Some(HelpTopic::Top) => {
+            "psmore top - rank current process and service-tree hotspots
+
+USAGE:
+  psmore top [QUERY] [--by cpu|memory|read|write] [--scope process|tree]
+             [--limit N|all] [--table|--json] [--sample-ms MS]
+
+OPTIONS:
+  -q, --query QUERY  Positional QUERY alternative; uses the full query language
+      --by METRIC    Ranking metric [default: cpu]
+      --scope SCOPE  Rank process self or complete service subtree [default: process]
+      --limit N|all  Maximum returned rows [default: 20]
+      --table        Human-readable ranked evidence [default]
+      --json         Versioned psmore.process-top JSON
+      --sample-ms MS CPU and I/O sampling interval, 100-60000 [default: 500]
+      --redact       Mask common secret values in emitted command lines
+
+The psmore collector process is excluded from ranking. Ties use name then PID.
+EXAMPLES:
+  psmore top --by memory --limit 10
+  psmore top 'user:deploy age>1m' --by cpu
+  psmore top name:api --scope tree --by write --json
+"
+        }
+        Some(HelpTopic::Oom) => {
+            "psmore oom - diagnose Linux memory pressure and OOM selection priority
+
+USAGE:
+  psmore oom [QUERY] [--min-score 0-1000] [--limit N|all]
+             [--table|--json] [--expect none|any] [--quiet] [--sample-ms MS]
+
+OPTIONS:
+  -q, --query QUERY  Positional QUERY alternative; uses the full query language
+      --min-score N  Minimum kernel oom_score [default: 1]
+      --limit N|all  Maximum returned candidates [default: 20]
+      --table         Human-readable host pressure and candidate evidence [default]
+      --json          Versioned psmore.oom-diagnostics JSON
+      --expect MODE   Apply none/any health-gate policy to all matching candidates
+      --quiet         Suppress output; requires --expect
+      --sample-ms MS  Process sampling interval, 100-60000 [default: 500]
+      --redact        Mask common secret values in emitted command lines
+
+Linux only. A high oom_score describes relative kill selection priority; host
+PSI, available memory, swap, and OOM event counters determine actual pressure.
+EXIT: 0 success/pass, 1 unsupported/error/inconclusive, 2 usage, 3 violation
+EXAMPLES:
+  psmore oom --limit 10
+  psmore oom 'user:deploy tree.mem>1g' --min-score 500
+  psmore oom name:api --min-score 700 --expect none --quiet
 "
         }
         Some(HelpTopic::Diff) => {
@@ -1666,6 +2363,7 @@ USAGE:
 OPTIONS:
       --table  Human-readable lifecycle and resource delta report [default]
       --json   Versioned machine-readable difference
+      --redact Mask common secret values in emitted command lines
 
 Inputs must be compatible psmore.process-snapshot v1 documents from the same
 host, platform, and query scope, with AFTER not older than BEFORE.
@@ -1738,6 +2436,18 @@ mod tests {
                 fd_min_percent: None,
                 fd_limit: Some(20),
                 fd_expectation: None,
+                top_metric: HotspotMetric::Cpu,
+                top_scope: HotspotScope::Process,
+                top_limit: Some(20),
+                oom_min_score: 1,
+                oom_limit: Some(20),
+                oom_expectation: None,
+                net_protocol: ListenProtocol::Any,
+                net_connected_only: false,
+                net_state: None,
+                net_limit: Some(100),
+                net_expectation: None,
+                redact_secrets: false,
                 check_expectation: CheckExpectation::None,
                 quiet: false,
             }
@@ -1910,6 +2620,92 @@ mod tests {
                 ..Cli::default()
             }
         );
+        assert_eq!(
+            Cli::parse(["--redact", "top", "--by", "memory"]).unwrap(),
+            Cli {
+                mode: LaunchMode::TopTable,
+                top_metric: HotspotMetric::Memory,
+                redact_secrets: true,
+                ..Cli::default()
+            }
+        );
+        assert_eq!(
+            Cli::parse(["--table", "--query", "--redact"])
+                .unwrap()
+                .query,
+            "--redact"
+        );
+        assert_eq!(
+            Cli::parse([
+                "top",
+                "user:deploy",
+                "age>1m",
+                "--by=mem",
+                "--scope",
+                "tree",
+                "--limit=all",
+                "--json",
+                "--sample-ms",
+                "750"
+            ])
+            .unwrap(),
+            Cli {
+                mode: LaunchMode::TopJson,
+                query: "user:deploy age>1m".into(),
+                sample_ms: 750,
+                top_metric: HotspotMetric::Memory,
+                top_scope: HotspotScope::Subtree,
+                top_limit: None,
+                ..Cli::default()
+            }
+        );
+        assert_eq!(
+            Cli::parse([
+                "oom",
+                "user:deploy",
+                "tree.mem>1g",
+                "--min-score=500",
+                "--limit",
+                "all",
+                "--json",
+                "--expect=none",
+                "--sample-ms=750"
+            ])
+            .unwrap(),
+            Cli {
+                mode: LaunchMode::OomJson,
+                query: "user:deploy tree.mem>1g".into(),
+                sample_ms: 750,
+                oom_min_score: 500,
+                oom_limit: None,
+                oom_expectation: Some(CheckExpectation::None),
+                ..Cli::default()
+            }
+        );
+        assert_eq!(
+            Cli::parse([
+                "net",
+                "203.0.113.10",
+                "--protocol=tcp",
+                "--connected",
+                "--state",
+                "time-wait",
+                "--limit=all",
+                "--json",
+                "--expect=any"
+            ])
+            .unwrap(),
+            Cli {
+                mode: LaunchMode::NetJson,
+                query: "203.0.113.10".into(),
+                net_protocol: ListenProtocol::Tcp,
+                net_connected_only: true,
+                net_state: Some("TIME_WAIT".into()),
+                net_limit: None,
+                net_expectation: Some(CheckExpectation::Any),
+                ..Cli::default()
+            }
+        );
         for (command, topic) in [
             ("check", HelpTopic::Check),
             ("inspect", HelpTopic::Inspect),
@@ -1920,6 +2716,9 @@ mod tests {
             ("trace", HelpTopic::Trace),
             ("deleted", HelpTopic::Deleted),
             ("fd", HelpTopic::Fd),
+            ("top", HelpTopic::Top),
+            ("oom", HelpTopic::Oom),
+            ("net", HelpTopic::Net),
             ("diff", HelpTopic::Diff),
             ("completion", HelpTopic::Completion),
         ] {
@@ -1998,6 +2797,36 @@ mod tests {
         assert!(Cli::parse(["fd", "--table", "--json"]).is_err());
         assert!(Cli::parse(["fd", "--quiet"]).is_err());
         assert!(Cli::parse(["fd", "--expect=all"]).is_err());
+        assert!(Cli::parse(["top", "--by=load"]).is_err());
+        assert!(Cli::parse(["top", "--scope=host"]).is_err());
+        assert!(Cli::parse(["top", "--limit=0"]).is_err());
+        assert!(Cli::parse(["top", "--limit=10001"]).is_err());
+        assert!(Cli::parse(["top", "--limit=10", "--limit=all"]).is_err());
+        assert!(Cli::parse(["top", "--table", "--json"]).is_err());
+        assert!(Cli::parse(["top", "name:api", "--query=name:worker"]).is_err());
+        assert!(Cli::parse(["top", "--sample-ms=99"]).is_err());
+        assert!(Cli::parse(["oom", "--min-score=nope"]).is_err());
+        assert!(Cli::parse(["oom", "--min-score=1001"]).is_err());
+        assert!(Cli::parse(["oom", "--min-score=1", "--min-score=2"]).is_err());
+        assert!(Cli::parse(["oom", "--limit=0"]).is_err());
+        assert!(Cli::parse(["oom", "--limit=10001"]).is_err());
+        assert!(Cli::parse(["oom", "--table", "--json"]).is_err());
+        assert!(Cli::parse(["oom", "name:api", "--query=name:worker"]).is_err());
+        assert!(Cli::parse(["oom", "--sample-ms=99"]).is_err());
+        assert!(Cli::parse(["oom", "--expect=all"]).is_err());
+        assert!(Cli::parse(["oom", "--quiet"]).is_err());
+        assert!(Cli::parse(["net", "--protocol=sctp"]).is_err());
+        assert!(Cli::parse(["net", "--state="]).is_err());
+        assert!(Cli::parse(["net", "--state=bad state"]).is_err());
+        assert!(Cli::parse(["net", "--state=x", "--state=y"]).is_err());
+        assert!(Cli::parse(["net", "--limit=0"]).is_err());
+        assert!(Cli::parse(["net", "--limit=10001"]).is_err());
+        assert!(Cli::parse(["net", "--table", "--json"]).is_err());
+        assert!(Cli::parse(["net", "api", "--query=worker"]).is_err());
+        assert!(Cli::parse(["net", "--expect=all"]).is_err());
+        assert!(Cli::parse(["net", "--quiet"]).is_err());
+        assert!(Cli::parse(["--redact"]).is_err());
+        assert!(Cli::parse(["--redact", "--redact", "--table"]).is_err());
         assert!(Cli::parse(["completion"]).is_err());
         assert!(Cli::parse(["completion", "powershell"]).is_err());
         assert!(Cli::parse(["completion", "bash", "zsh"]).is_err());
@@ -2019,6 +2848,9 @@ mod tests {
             (HelpTopic::Trace, "trace"),
             (HelpTopic::Deleted, "deleted"),
             (HelpTopic::Fd, "fd"),
+            (HelpTopic::Top, "top"),
+            (HelpTopic::Oom, "oom"),
+            (HelpTopic::Net, "net"),
             (HelpTopic::Diff, "diff"),
             (HelpTopic::Completion, "completion"),
         ] {

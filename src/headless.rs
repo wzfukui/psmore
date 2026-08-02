@@ -10,7 +10,8 @@ use sysinfo::{Pid, System};
 use crate::{
     app::aggregate_resources,
     model::{
-        ProcessInfo, ResourceAggregate, process_command_line, process_path, sanitize_terminal_text,
+        ProcessInfo, ResourceAggregate, process_command_for_output, process_path,
+        sanitize_terminal_text,
     },
     provider::{NativeProcessProvider, ProcessProvider, platform_name},
     query::ProcessQuery,
@@ -98,6 +99,82 @@ impl ProcessSnapshot {
             .filter(|process| {
                 let subtree = self.resource(process.pid);
                 let direct_children = self.children_of(process.pid).len();
+                query.matches(process, subtree, direct_children)
+            })
+            .map(|process| process.pid)
+            .collect()
+    }
+}
+
+pub(crate) struct CurrentProcessExclusion {
+    pid: Pid,
+    parent: Option<Pid>,
+    subtree: ResourceAggregate,
+    ancestors: HashSet<Pid>,
+}
+
+impl CurrentProcessExclusion {
+    pub(crate) fn capture(snapshot: &ProcessSnapshot) -> Self {
+        let pid = Pid::from_u32(std::process::id());
+        let parent = snapshot.process(pid).and_then(|process| process.parent);
+        let subtree = snapshot.resource(pid);
+        let mut ancestors = HashSet::new();
+        let mut current = Some(pid);
+        while let Some(candidate) = current {
+            if !ancestors.insert(candidate) {
+                break;
+            }
+            current = snapshot
+                .process(candidate)
+                .and_then(|process| process.parent);
+        }
+        Self {
+            pid,
+            parent,
+            subtree,
+            ancestors,
+        }
+    }
+
+    pub(crate) fn adjust_subtree(
+        &self,
+        pid: Pid,
+        mut resources: ResourceAggregate,
+    ) -> ResourceAggregate {
+        if self.ancestors.contains(&pid) {
+            resources.cpu = (finite(resources.cpu) - finite(self.subtree.cpu)).max(0.0);
+            resources.memory = resources.memory.saturating_sub(self.subtree.memory);
+            resources.read_rate = resources.read_rate.saturating_sub(self.subtree.read_rate);
+            resources.write_rate = resources.write_rate.saturating_sub(self.subtree.write_rate);
+            resources.process_count = resources
+                .process_count
+                .saturating_sub(self.subtree.process_count);
+        }
+        resources
+    }
+
+    pub(crate) fn adjust_direct_children(&self, pid: Pid, count: usize) -> usize {
+        if self.parent == Some(pid) {
+            count.saturating_sub(1)
+        } else {
+            count
+        }
+    }
+
+    pub(crate) fn matching_pid_set(
+        &self,
+        snapshot: &ProcessSnapshot,
+        query: &ProcessQuery,
+    ) -> HashSet<Pid> {
+        let root = Pid::from_u32(0);
+        snapshot
+            .processes()
+            .values()
+            .filter(|process| process.pid != root && process.pid != self.pid)
+            .filter(|process| {
+                let subtree = self.adjust_subtree(process.pid, snapshot.resource(process.pid));
+                let direct_children = self
+                    .adjust_direct_children(process.pid, snapshot.children_of(process.pid).len());
                 query.matches(process, subtree, direct_children)
             })
             .map(|process| process.pid)
@@ -217,7 +294,7 @@ pub(crate) fn render_json(snapshot: &ProcessSnapshot, query: &str) -> Result<Str
                 parent_pid: process.parent.map(Pid::as_u32),
                 name: process.name.clone(),
                 path: process_path(process),
-                command: process_command_line(process),
+                command: process_command_for_output(process),
                 executable: process.executable.clone(),
                 user: process.user.clone(),
                 cwd: process.cwd.clone(),
@@ -282,7 +359,7 @@ pub(crate) fn render_table(snapshot: &ProcessSnapshot, query: &str) -> Result<St
             human_rate(process.write_rate),
             sanitize_terminal_text(&process.user),
             sanitize_terminal_text(&process.status),
-            sanitize_terminal_text(&process_command_line(process)),
+            sanitize_terminal_text(&process_command_for_output(process)),
         ));
     }
     Ok(output)
@@ -338,15 +415,15 @@ pub(crate) fn render_check_table(
     Ok(output)
 }
 
-fn finite(value: f32) -> f32 {
+pub(crate) fn finite(value: f32) -> f32 {
     if value.is_finite() { value } else { 0.0 }
 }
 
-fn human_rate(value: u64) -> String {
+pub(crate) fn human_rate(value: u64) -> String {
     format!("{}/s", human_bytes(value))
 }
 
-fn human_bytes(value: u64) -> String {
+pub(crate) fn human_bytes(value: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut amount = value as f64;
     let mut unit = 0;

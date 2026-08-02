@@ -1,6 +1,5 @@
 use std::{
     collections::{HashMap, HashSet},
-    net::IpAddr,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -17,100 +16,62 @@ use crate::{
     provider::{NativeProcessProvider, ProcessProvider, platform_name},
 };
 
-const LISTEN_SCHEMA: &str = "psmore.listeners";
-const LISTEN_SCHEMA_VERSION: u32 = 1;
+const NET_SCHEMA: &str = "psmore.network-connections";
+const NET_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BindExposure {
-    Wildcard,
-    Network,
-    Loopback,
-    Local,
-    Unknown,
+enum EndpointKind {
+    Peer,
+    Listener,
+    Open,
 }
 
-impl BindExposure {
+impl EndpointKind {
+    fn classify(endpoint: &NetworkEndpoint) -> Self {
+        if has_peer(endpoint) {
+            Self::Peer
+        } else if endpoint.is_listener() {
+            Self::Listener
+        } else {
+            Self::Open
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
-            Self::Wildcard => "wildcard",
-            Self::Network => "network",
-            Self::Loopback => "loopback",
-            Self::Local => "local",
-            Self::Unknown => "unknown",
+            Self::Peer => "peer",
+            Self::Listener => "listener",
+            Self::Open => "open",
         }
     }
 
     fn table_label(self) -> &'static str {
         match self {
-            Self::Wildcard => "WILDCARD",
-            Self::Network => "NETWORK",
-            Self::Loopback => "loopback",
-            Self::Local => "local",
-            Self::Unknown => "unknown",
+            Self::Peer => "PEER",
+            Self::Listener => "LISTEN",
+            Self::Open => "OPEN",
         }
-    }
-
-    fn is_exposed(self) -> bool {
-        matches!(self, Self::Wildcard | Self::Network)
     }
 
     fn sort_rank(self) -> u8 {
         match self {
-            Self::Wildcard => 0,
-            Self::Network => 1,
-            Self::Loopback => 2,
-            Self::Local => 3,
-            Self::Unknown => 4,
+            Self::Peer => 0,
+            Self::Listener => 1,
+            Self::Open => 2,
         }
     }
 }
 
-fn inet_host(endpoint: &str) -> Option<&str> {
-    if let Some(rest) = endpoint.strip_prefix('[') {
-        return rest.split_once("]:").map(|(host, _)| host);
+fn has_peer(endpoint: &NetworkEndpoint) -> bool {
+    if endpoint.is_listener() {
+        return false;
     }
-    endpoint.rsplit_once(':').map(|(host, _)| host)
+    !endpoint.remote_endpoint.is_empty()
+        || matches!(endpoint.state.as_str(), "CONNECTED" | "CONNECTING")
 }
 
-fn endpoint_port(endpoint: &NetworkEndpoint) -> Option<u16> {
-    if endpoint.protocol == "UNIX" {
-        return None;
-    }
-    endpoint
-        .local_endpoint
-        .rsplit_once(':')
-        .and_then(|(_, port)| port.parse().ok())
-}
-
-fn bind_exposure(endpoint: &NetworkEndpoint) -> BindExposure {
-    if endpoint.protocol == "UNIX" {
-        return BindExposure::Local;
-    }
-    let Some(host) = inet_host(&endpoint.local_endpoint) else {
-        return BindExposure::Unknown;
-    };
-    let host = host.trim_matches(['[', ']']);
-    if matches!(host, "*" | "0.0.0.0" | "::") {
-        return BindExposure::Wildcard;
-    }
-    match host.parse::<IpAddr>() {
-        Ok(address) if is_loopback(address) => BindExposure::Loopback,
-        Ok(_) => BindExposure::Network,
-        Err(_) => BindExposure::Unknown,
-    }
-}
-
-fn is_loopback(address: IpAddr) -> bool {
-    match address {
-        IpAddr::V4(address) => address.is_loopback(),
-        IpAddr::V6(address) => {
-            address.is_loopback()
-                || address
-                    .to_ipv4_mapped()
-                    .map(|address| address.is_loopback())
-                    .unwrap_or(false)
-        }
-    }
+fn is_connected_peer(endpoint: &NetworkEndpoint) -> bool {
+    has_peer(endpoint) && !matches!(endpoint.state.as_str(), "CLOSED" | "CLOSE" | "UNKNOWN")
 }
 
 fn protocol_matches(protocol: ListenProtocol, endpoint: &NetworkEndpoint) -> bool {
@@ -133,11 +94,12 @@ fn endpoint_matches_query(
     let process_context = process
         .map(|process| {
             format!(
-                "{} {} {} {}",
+                "{} {} {} {} {}",
+                process.name,
                 process.user,
                 process_path(process),
                 process_command_line(process),
-                process.cwd
+                process.cwd,
             )
         })
         .unwrap_or_default();
@@ -151,25 +113,30 @@ fn endpoint_matches_query(
         endpoint.pid.map(Pid::as_u32).unwrap_or_default(),
         endpoint.fd,
         endpoint.namespace,
-        bind_exposure(endpoint).label(),
+        EndpointKind::classify(endpoint).label(),
         process_context,
     )
     .to_lowercase()
     .contains(&query.to_lowercase())
 }
 
-fn matching_listeners(
+fn matching_endpoints(
     endpoints: &[NetworkEndpoint],
     processes: &HashMap<Pid, ProcessInfo>,
     protocol: ListenProtocol,
-    exposed_only: bool,
+    connected_only: bool,
+    state: Option<&str>,
     query: &str,
 ) -> Vec<NetworkEndpoint> {
-    let mut listeners: Vec<NetworkEndpoint> = endpoints
+    let mut matches: Vec<NetworkEndpoint> = endpoints
         .iter()
-        .filter(|endpoint| endpoint.is_listener())
         .filter(|endpoint| protocol_matches(protocol, endpoint))
-        .filter(|endpoint| !exposed_only || bind_exposure(endpoint).is_exposed())
+        .filter(|endpoint| !connected_only || is_connected_peer(endpoint))
+        .filter(|endpoint| {
+            state
+                .map(|state| endpoint.state.eq_ignore_ascii_case(state))
+                .unwrap_or(true)
+        })
         .filter(|endpoint| {
             endpoint_matches_query(
                 endpoint,
@@ -179,27 +146,29 @@ fn matching_listeners(
         })
         .cloned()
         .collect();
-    listeners.sort_by(|left, right| {
+    matches.sort_by(|left, right| {
         (
-            bind_exposure(left).sort_rank(),
+            EndpointKind::classify(left).sort_rank(),
             protocol_rank(&left.protocol),
-            endpoint_port(left),
+            &left.state,
+            &left.remote_endpoint,
             &left.local_endpoint,
             &left.namespace,
             left.pid.map(Pid::as_u32),
             &left.fd,
         )
             .cmp(&(
-                bind_exposure(right).sort_rank(),
+                EndpointKind::classify(right).sort_rank(),
                 protocol_rank(&right.protocol),
-                endpoint_port(right),
+                &right.state,
+                &right.remote_endpoint,
                 &right.local_endpoint,
                 &right.namespace,
                 right.pid.map(Pid::as_u32),
                 &right.fd,
             ))
     });
-    listeners
+    matches
 }
 
 fn protocol_rank(protocol: &str) -> u8 {
@@ -211,22 +180,24 @@ fn protocol_rank(protocol: &str) -> u8 {
     }
 }
 
-fn unique_bind_key(endpoint: &NetworkEndpoint) -> (&str, &str, &str) {
+fn unique_route_key(endpoint: &NetworkEndpoint) -> (&str, &str, &str, &str, &str) {
     (
         &endpoint.protocol,
         &endpoint.local_endpoint,
+        &endpoint.remote_endpoint,
+        &endpoint.state,
         &endpoint.namespace,
     )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ListenPolicyStatus {
+pub(crate) enum NetPolicyStatus {
     Passed,
     Violated,
     Inconclusive,
 }
 
-impl ListenPolicyStatus {
+impl NetPolicyStatus {
     fn label(self) -> &'static str {
         match self {
             Self::Passed => "pass",
@@ -244,11 +215,12 @@ impl ListenPolicyStatus {
     }
 }
 
-pub(crate) struct CapturedListeners {
+pub(crate) struct CapturedNetworkConnections {
     generated_at_unix_ms: u64,
     query: String,
     protocol: ListenProtocol,
-    exposed_only: bool,
+    connected_only: bool,
+    state: Option<String>,
     result_limit: Option<usize>,
     system_process_count: usize,
     processes: HashMap<Pid, ProcessInfo>,
@@ -257,50 +229,53 @@ pub(crate) struct CapturedListeners {
     warning: Option<String>,
 }
 
-impl CapturedListeners {
-    pub(crate) fn evaluate_policy(&self, expectation: CheckExpectation) -> ListenPolicyStatus {
+impl CapturedNetworkConnections {
+    pub(crate) fn evaluate_policy(&self, expectation: CheckExpectation) -> NetPolicyStatus {
         if !self.endpoints.is_empty() {
             if expectation.passes(self.endpoints.len()) {
-                ListenPolicyStatus::Passed
+                NetPolicyStatus::Passed
             } else {
-                ListenPolicyStatus::Violated
+                NetPolicyStatus::Violated
             }
         } else if !self.collection_complete {
-            ListenPolicyStatus::Inconclusive
+            NetPolicyStatus::Inconclusive
         } else if expectation.passes(0) {
-            ListenPolicyStatus::Passed
+            NetPolicyStatus::Passed
         } else {
-            ListenPolicyStatus::Violated
+            NetPolicyStatus::Violated
         }
     }
 
     fn returned_count(&self) -> usize {
         self.result_limit
-            .map(|limit| self.endpoints.len().min(limit))
             .unwrap_or(self.endpoints.len())
+            .min(self.endpoints.len())
     }
 
     fn visible_endpoints(&self) -> impl Iterator<Item = &NetworkEndpoint> {
-        self.endpoints
-            .iter()
-            .take(self.result_limit.unwrap_or(self.endpoints.len()))
+        self.endpoints.iter().take(self.returned_count())
     }
 
-    fn unique_bind_count(&self) -> usize {
+    fn unique_route_count(&self) -> usize {
         self.endpoints
             .iter()
-            .map(unique_bind_key)
+            .map(unique_route_key)
             .collect::<HashSet<_>>()
             .len()
     }
 
-    fn exposed_bind_count(&self) -> usize {
+    fn peer_reference_count(&self) -> usize {
         self.endpoints
             .iter()
-            .filter(|endpoint| bind_exposure(endpoint).is_exposed())
-            .map(unique_bind_key)
-            .collect::<HashSet<_>>()
-            .len()
+            .filter(|endpoint| has_peer(endpoint))
+            .count()
+    }
+
+    fn listener_reference_count(&self) -> usize {
+        self.endpoints
+            .iter()
+            .filter(|endpoint| endpoint.is_listener())
+            .count()
     }
 
     fn known_owner_count(&self) -> usize {
@@ -312,12 +287,13 @@ impl CapturedListeners {
     }
 }
 
-pub(crate) fn capture_listeners(
+pub(crate) fn capture_network_connections(
     query: &str,
     protocol: ListenProtocol,
-    exposed_only: bool,
+    connected_only: bool,
+    state: Option<&str>,
     result_limit: Option<usize>,
-) -> CapturedListeners {
+) -> CapturedNetworkConnections {
     let mut provider = NativeProcessProvider::new();
     let processes: HashMap<Pid, ProcessInfo> = provider
         .refresh()
@@ -325,16 +301,27 @@ pub(crate) fn capture_listeners(
         .map(|process| (process.pid, process))
         .collect();
     let scan = scan_network(&processes);
-    let endpoints = matching_listeners(&scan.endpoints, &processes, protocol, exposed_only, query);
-    CapturedListeners {
+    let endpoints = matching_endpoints(
+        &scan.endpoints,
+        &processes,
+        protocol,
+        connected_only,
+        state,
+        query,
+    );
+    CapturedNetworkConnections {
         generated_at_unix_ms: unix_millis(),
         query: query.into(),
         protocol,
-        exposed_only,
+        connected_only,
+        state: state.map(str::to_string),
         result_limit,
         system_process_count: processes
             .len()
-            .saturating_sub(usize::from(processes.contains_key(&Pid::from_u32(0)))),
+            .saturating_sub(usize::from(processes.contains_key(&Pid::from_u32(0))))
+            .saturating_sub(usize::from(
+                processes.contains_key(&Pid::from_u32(std::process::id())),
+            )),
         processes,
         endpoints,
         collection_complete: scan.warning.is_none(),
@@ -343,22 +330,25 @@ pub(crate) fn capture_listeners(
 }
 
 #[derive(Debug, Serialize)]
-struct JsonListeners<'a> {
+struct JsonNetworkConnections<'a> {
     schema: &'static str,
     schema_version: u32,
     privacy_notice: &'static str,
+    interpretation: &'static str,
     tool: JsonTool,
     generated_at_unix_ms: u64,
     platform: &'static str,
     hostname: Option<String>,
     query: Option<&'a str>,
     protocol: &'static str,
-    exposed_only: bool,
+    connected_only: bool,
+    state: Option<&'a str>,
     result_limit: Option<usize>,
     system_process_count: usize,
-    unique_bind_count: usize,
-    exposed_bind_count: usize,
+    unique_route_count: usize,
     socket_reference_count: usize,
+    peer_reference_count: usize,
+    listener_reference_count: usize,
     returned_socket_reference_count: usize,
     rows_truncated: bool,
     known_owner_count: usize,
@@ -366,7 +356,7 @@ struct JsonListeners<'a> {
     collection_complete: bool,
     policy: Option<JsonPolicy<'a>>,
     warning: Option<&'a str>,
-    listeners: Vec<JsonListener>,
+    connections: Vec<JsonConnection>,
 }
 
 #[derive(Debug, Serialize)]
@@ -384,11 +374,13 @@ struct JsonPolicy<'a> {
 }
 
 #[derive(Debug, Serialize)]
-struct JsonListener {
-    exposure: &'static str,
-    exposed: bool,
+struct JsonConnection {
+    kind: &'static str,
+    peer_evidence: bool,
+    listener: bool,
     protocol: String,
     local_endpoint: String,
+    remote_endpoint: Option<String>,
     state: String,
     pid: Option<u32>,
     fd: String,
@@ -399,17 +391,19 @@ struct JsonListener {
     namespace: Option<String>,
 }
 
-fn json_listener(
+fn json_connection(
     endpoint: &NetworkEndpoint,
     processes: &HashMap<Pid, ProcessInfo>,
-) -> JsonListener {
+) -> JsonConnection {
     let process = endpoint.pid.and_then(|pid| processes.get(&pid));
-    let exposure = bind_exposure(endpoint);
-    JsonListener {
-        exposure: exposure.label(),
-        exposed: exposure.is_exposed(),
+    JsonConnection {
+        kind: EndpointKind::classify(endpoint).label(),
+        peer_evidence: has_peer(endpoint),
+        listener: endpoint.is_listener(),
         protocol: sanitize_terminal_text(&endpoint.protocol),
         local_endpoint: sanitize_terminal_text(&endpoint.local_endpoint),
+        remote_endpoint: (!endpoint.remote_endpoint.is_empty())
+            .then(|| sanitize_terminal_text(&endpoint.remote_endpoint)),
         state: sanitize_terminal_text(&endpoint.state),
         pid: endpoint.pid.map(Pid::as_u32),
         fd: sanitize_terminal_text(&endpoint.fd),
@@ -426,15 +420,16 @@ fn json_listener(
     }
 }
 
-pub(crate) fn render_listeners_json(
-    captured: &CapturedListeners,
+pub(crate) fn render_network_json(
+    captured: &CapturedNetworkConnections,
     expectation: Option<&str>,
-    policy_status: Option<ListenPolicyStatus>,
+    policy_status: Option<NetPolicyStatus>,
 ) -> Result<String, String> {
-    serde_json::to_string_pretty(&JsonListeners {
-        schema: LISTEN_SCHEMA,
-        schema_version: LISTEN_SCHEMA_VERSION,
-        privacy_notice: "Contains host, process, command-line, user, socket, and namespace information; review before sharing.",
+    serde_json::to_string_pretty(&JsonNetworkConnections {
+        schema: NET_SCHEMA,
+        schema_version: NET_SCHEMA_VERSION,
+        privacy_notice: "Contains host, process, command-line, user, socket, peer, and namespace information; review before sharing.",
+        interpretation: "local and remote endpoints are kernel socket evidence; no inbound or outbound initiation direction is inferred",
         tool: JsonTool {
             name: env!("CARGO_PKG_NAME"),
             version: env!("CARGO_PKG_VERSION"),
@@ -444,12 +439,14 @@ pub(crate) fn render_listeners_json(
         hostname: System::host_name(),
         query: (!captured.query.is_empty()).then_some(captured.query.as_str()),
         protocol: captured.protocol.label(),
-        exposed_only: captured.exposed_only,
+        connected_only: captured.connected_only,
+        state: captured.state.as_deref(),
         result_limit: captured.result_limit,
         system_process_count: captured.system_process_count,
-        unique_bind_count: captured.unique_bind_count(),
-        exposed_bind_count: captured.exposed_bind_count(),
+        unique_route_count: captured.unique_route_count(),
         socket_reference_count: captured.endpoints.len(),
+        peer_reference_count: captured.peer_reference_count(),
+        listener_reference_count: captured.listener_reference_count(),
         returned_socket_reference_count: captured.returned_count(),
         rows_truncated: captured.returned_count() < captured.endpoints.len(),
         known_owner_count: captured.known_owner_count(),
@@ -465,53 +462,55 @@ pub(crate) fn render_listeners_json(
                 expectation,
                 status: status.label(),
                 passed: status.passed(),
-                detail: (status == ListenPolicyStatus::Inconclusive).then_some(
-                    "zero visible listeners cannot prove absence because network collection was incomplete",
+                detail: (status == NetPolicyStatus::Inconclusive).then_some(
+                    "zero visible sockets cannot prove absence because network collection was incomplete",
                 ),
             }),
         warning: captured.warning.as_deref(),
-        listeners: captured
+        connections: captured
             .visible_endpoints()
-            .map(|endpoint| json_listener(endpoint, &captured.processes))
+            .map(|endpoint| json_connection(endpoint, &captured.processes))
             .collect(),
     })
     .map_err(|error| error.to_string())
 }
 
-pub(crate) fn render_listeners_table(
-    captured: &CapturedListeners,
+pub(crate) fn render_network_table(
+    captured: &CapturedNetworkConnections,
     expectation: Option<&str>,
-    policy_status: Option<ListenPolicyStatus>,
+    policy_status: Option<NetPolicyStatus>,
 ) -> String {
     let mut output = String::new();
     if let Some((expectation, status)) = expectation.zip(policy_status) {
         output.push_str(&format!(
-            "LISTEN CHECK {}  expected {}; matched {} socket reference(s)\n",
+            "NET CHECK {}  expected {}; matched {} socket reference(s)\n",
             match status {
-                ListenPolicyStatus::Passed => "PASS",
-                ListenPolicyStatus::Violated => "FAIL",
-                ListenPolicyStatus::Inconclusive => "INCONCLUSIVE",
+                NetPolicyStatus::Passed => "PASS",
+                NetPolicyStatus::Violated => "FAIL",
+                NetPolicyStatus::Inconclusive => "INCONCLUSIVE",
             },
             expectation,
             captured.endpoints.len(),
         ));
     }
     output.push_str(&format!(
-        "LISTENERS  {} bind(s), {} exposed, {} socket reference(s), {} owner(s), showing {}\n",
-        captured.unique_bind_count(),
-        captured.exposed_bind_count(),
+        "NETWORK  {} route(s), {} socket reference(s), {} peer, {} listener, {} owner(s), showing {}\n",
+        captured.unique_route_count(),
         captured.endpoints.len(),
+        captured.peer_reference_count(),
+        captured.listener_reference_count(),
         captured.known_owner_count(),
         captured.returned_count(),
     ));
     output.push_str(&format!(
-        "protocol {}  scope {}  filter {}  collection {}\n",
+        "protocol {}  scope {}  state {}  filter {}  collection {}\n",
         captured.protocol.label(),
-        if captured.exposed_only {
-            "exposed"
+        if captured.connected_only {
+            "connected/peer"
         } else {
-            "all"
+            "all sockets"
         },
+        captured.state.as_deref().unwrap_or("any"),
         if captured.query.is_empty() {
             "[none]".into()
         } else {
@@ -524,19 +523,27 @@ pub(crate) fn render_listeners_table(
         },
     ));
     if captured.endpoints.is_empty() {
-        output.push_str("  [no matching listener visible]\n");
+        output.push_str("  [no matching socket visible]\n");
     } else {
         output.push_str(
-            "EXPOSURE PROTO LOCAL                          STATE        PID FD       USER         PROCESS      COMMAND\n",
+            "KIND   PROTO STATE        LOCAL -> PEER                                        PID FD       USER         PROCESS      COMMAND\n",
         );
         for endpoint in captured.visible_endpoints() {
             let process = endpoint.pid.and_then(|pid| captured.processes.get(&pid));
+            let route = if endpoint.remote_endpoint.is_empty() {
+                endpoint.local_endpoint.clone()
+            } else {
+                format!(
+                    "{} -> {}",
+                    endpoint.local_endpoint, endpoint.remote_endpoint
+                )
+            };
             output.push_str(&format!(
-                "{:<8} {:<5} {:<30} {:<10} {:>7} {:<8} {:<12} {:<12} {}\n",
-                bind_exposure(endpoint).table_label(),
+                "{:<6} {:<5} {:<12} {:<52} {:>7} {:<8} {:<12} {:<12} {}\n",
+                EndpointKind::classify(endpoint).table_label(),
                 sanitize_terminal_text(&endpoint.protocol),
-                sanitize_terminal_text(&endpoint.local_endpoint),
                 sanitize_terminal_text(&endpoint.state),
+                sanitize_terminal_text(&route),
                 endpoint
                     .pid
                     .map(|pid| pid.as_u32().to_string())
@@ -553,7 +560,7 @@ pub(crate) fn render_listeners_table(
             ));
             if !endpoint.namespace.is_empty() {
                 output.push_str(&format!(
-                    "         namespace {}\n",
+                    "       namespace {}\n",
                     sanitize_terminal_text(&endpoint.namespace)
                 ));
             }
@@ -564,12 +571,10 @@ pub(crate) fn render_listeners_table(
                 captured.endpoints.len() - captured.returned_count()
             ));
         }
-        if captured.exposed_bind_count() > 0 {
-            output.push_str(
-                "REVIEW  Confirm every WILDCARD/NETWORK bind is intended and protected by host, network, and application controls.\n",
-            );
-        }
     }
+    output.push_str(
+        "INTERPRET  LOCAL -> PEER is endpoint evidence only; psmore does not infer who initiated an established route.\n",
+    );
     if let Some(warning) = &captured.warning {
         output.push_str(&format!("WARNING  {}\n", sanitize_terminal_text(warning)));
     }
@@ -589,15 +594,21 @@ mod tests {
     use super::*;
     use serde_json::Value;
 
-    fn endpoint(protocol: &str, local: &str, pid: Option<u32>) -> NetworkEndpoint {
+    fn endpoint(
+        protocol: &str,
+        state: &str,
+        local: &str,
+        remote: &str,
+        pid: Option<u32>,
+    ) -> NetworkEndpoint {
         NetworkEndpoint {
             pid: pid.map(Pid::from_u32),
             process: pid.map(|_| "api").unwrap_or("[owner unavailable]").into(),
             fd: pid.map(|_| "7").unwrap_or("-").into(),
             protocol: protocol.into(),
             local_endpoint: local.into(),
-            remote_endpoint: String::new(),
-            state: if protocol == "UDP" { "BOUND" } else { "LISTEN" }.into(),
+            remote_endpoint: remote.into(),
+            state: state.into(),
             namespace: "net:[123]".into(),
         }
     }
@@ -607,7 +618,7 @@ mod tests {
             pid: Pid::from_u32(42),
             parent: Some(Pid::from_u32(1)),
             name: "api".into(),
-            command: "/srv/api\n--port 8080".into(),
+            command: "/srv/api\n--peer 203.0.113.10".into(),
             executable: "/srv/api".into(),
             user: "deploy".into(),
             cwd: "/srv".into(),
@@ -621,18 +632,25 @@ mod tests {
         }
     }
 
-    fn captured(complete: bool) -> CapturedListeners {
-        CapturedListeners {
+    fn captured(complete: bool) -> CapturedNetworkConnections {
+        CapturedNetworkConnections {
             generated_at_unix_ms: 1_700_000_000_000,
             query: "api".into(),
             protocol: ListenProtocol::Any,
-            exposed_only: false,
+            connected_only: false,
+            state: None,
             result_limit: Some(1),
             system_process_count: 10,
             processes: [(Pid::from_u32(42), process())].into_iter().collect(),
             endpoints: vec![
-                endpoint("TCP", "0.0.0.0:8080", Some(42)),
-                endpoint("TCP", "127.0.0.1:9090", Some(42)),
+                endpoint(
+                    "TCP",
+                    "ESTABLISHED",
+                    "10.0.0.2:50000",
+                    "203.0.113.10:443",
+                    Some(42),
+                ),
+                endpoint("TCP", "LISTEN", "0.0.0.0:8080", "", Some(42)),
             ],
             collection_complete: complete,
             warning: (!complete).then(|| "protected processes".into()),
@@ -640,92 +658,144 @@ mod tests {
     }
 
     #[test]
-    fn classifies_bind_exposure_and_filters_listeners() {
-        assert_eq!(
-            bind_exposure(&endpoint("TCP", "0.0.0.0:80", Some(42))),
-            BindExposure::Wildcard
+    fn peer_classification_does_not_invent_direction() {
+        let established = endpoint(
+            "TCP",
+            "ESTABLISHED",
+            "10.0.0.2:50000",
+            "203.0.113.10:443",
+            Some(42),
         );
-        assert_eq!(
-            bind_exposure(&endpoint("TCP", "[::1]:80", Some(42))),
-            BindExposure::Loopback
+        assert!(has_peer(&established));
+        assert!(is_connected_peer(&established));
+        assert_eq!(EndpointKind::classify(&established), EndpointKind::Peer);
+        assert!(!has_peer(&endpoint(
+            "TCP",
+            "LISTEN",
+            "0.0.0.0:8080",
+            "",
+            Some(42)
+        )));
+        assert!(!has_peer(&endpoint(
+            "UDP",
+            "BOUND",
+            "0.0.0.0:5353",
+            "",
+            Some(42)
+        )));
+        assert!(has_peer(&endpoint(
+            "UNIX",
+            "CONNECTED",
+            "/tmp/api.sock",
+            "",
+            Some(42)
+        )));
+        let closed = endpoint(
+            "TCP",
+            "CLOSED",
+            "10.0.0.2:50000",
+            "203.0.113.10:443",
+            Some(42),
         );
-        assert_eq!(
-            bind_exposure(&endpoint("TCP", "[::ffff:127.0.0.1]:80", Some(42))),
-            BindExposure::Loopback
-        );
-        assert_eq!(
-            bind_exposure(&endpoint("UDP", "192.168.1.5:53", Some(42))),
-            BindExposure::Network
-        );
-        assert_eq!(
-            bind_exposure(&endpoint("UNIX", "/tmp/api.sock", Some(42))),
-            BindExposure::Local
-        );
+        assert!(has_peer(&closed));
+        assert!(!is_connected_peer(&closed));
+    }
 
+    #[test]
+    fn filters_protocol_peer_state_and_process_context() {
         let processes = [(Pid::from_u32(42), process())].into_iter().collect();
         let endpoints = vec![
-            endpoint("TCP", "0.0.0.0:8080", Some(42)),
-            endpoint("TCP", "127.0.0.1:9090", Some(42)),
-            endpoint("UDP", "[::]:5353", None),
-            endpoint("UNIX", "/tmp/api.sock", Some(42)),
+            endpoint(
+                "TCP",
+                "ESTABLISHED",
+                "10.0.0.2:50000",
+                "203.0.113.10:443",
+                Some(42),
+            ),
+            endpoint("TCP", "LISTEN", "0.0.0.0:8080", "", Some(42)),
+            endpoint("UDP", "BOUND", "0.0.0.0:5353", "", Some(42)),
         ];
-        let exposed = matching_listeners(&endpoints, &processes, ListenProtocol::Any, true, "");
-        assert_eq!(exposed.len(), 2);
-        assert!(
-            exposed
-                .iter()
-                .all(|endpoint| bind_exposure(endpoint).is_exposed())
+        let matches = matching_endpoints(
+            &endpoints,
+            &processes,
+            ListenProtocol::Tcp,
+            true,
+            Some("ESTABLISHED"),
+            "deploy",
         );
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].remote_endpoint, "203.0.113.10:443");
         assert_eq!(
-            matching_listeners(&endpoints, &processes, ListenProtocol::Tcp, false, "deploy").len(),
-            2
+            matching_endpoints(
+                &endpoints,
+                &processes,
+                ListenProtocol::Any,
+                false,
+                None,
+                "--peer 203.0.113.10",
+            )
+            .len(),
+            3
         );
     }
 
     #[test]
-    fn zero_matches_with_incomplete_network_scan_is_inconclusive() {
+    fn zero_matches_with_incomplete_scan_is_inconclusive() {
         let mut captured = captured(false);
         captured.endpoints.clear();
         assert_eq!(
             captured.evaluate_policy(CheckExpectation::None),
-            ListenPolicyStatus::Inconclusive
+            NetPolicyStatus::Inconclusive
         );
         assert_eq!(
             captured.evaluate_policy(CheckExpectation::Any),
-            ListenPolicyStatus::Inconclusive
+            NetPolicyStatus::Inconclusive
         );
     }
 
     #[test]
-    fn renders_versioned_exposure_owner_and_truncation_evidence() {
+    fn renders_versioned_route_owner_and_truncation_evidence() {
         let captured = captured(true);
         let json: Value = serde_json::from_str(
-            &render_listeners_json(
+            &render_network_json(
                 &captured,
                 Some("no matches"),
-                Some(ListenPolicyStatus::Violated),
+                Some(NetPolicyStatus::Violated),
             )
             .unwrap(),
         )
         .unwrap();
-        assert_eq!(json["schema"], LISTEN_SCHEMA);
+        assert_eq!(json["schema"], NET_SCHEMA);
         assert_eq!(json["schema_version"], 1);
-        assert_eq!(json["unique_bind_count"], 2);
-        assert_eq!(json["exposed_bind_count"], 1);
-        assert_eq!(json["socket_reference_count"], 2);
+        assert_eq!(json["unique_route_count"], 2);
+        assert_eq!(json["peer_reference_count"], 1);
+        assert_eq!(json["listener_reference_count"], 1);
         assert_eq!(json["returned_socket_reference_count"], 1);
         assert_eq!(json["rows_truncated"], true);
-        assert_eq!(json["listeners"][0]["exposure"], "wildcard");
-        assert_eq!(json["listeners"][0]["command"], "/srv/api --port 8080");
+        assert_eq!(json["connections"][0]["kind"], "peer");
+        assert_eq!(
+            json["connections"][0]["remote_endpoint"],
+            "203.0.113.10:443"
+        );
+        assert_eq!(
+            json["connections"][0]["command"],
+            "/srv/api --peer 203.0.113.10"
+        );
+        assert!(
+            json["interpretation"]
+                .as_str()
+                .unwrap()
+                .contains("no inbound or outbound")
+        );
 
-        let table = render_listeners_table(
+        let table = render_network_table(
             &captured,
             Some("no matches"),
-            Some(ListenPolicyStatus::Violated),
+            Some(NetPolicyStatus::Violated),
         );
-        assert!(table.contains("LISTEN CHECK FAIL"));
-        assert!(table.contains("WILDCARD"));
-        assert!(table.contains("use --limit all"));
-        assert!(!table.contains("/srv/api\n--port"));
+        assert!(table.contains("NET CHECK FAIL"));
+        assert!(table.contains("10.0.0.2:50000 -> 203.0.113.10:443"));
+        assert!(table.contains("does not infer who initiated"));
+        assert!(!table.contains("/srv/api\n--peer"));
     }
 }

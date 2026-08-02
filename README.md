@@ -46,14 +46,18 @@
 - `o` 将当前诊断上下文导出为带版本号的 JSON 报告，包括完整进程清单、资源聚合、当前查询及命中数、关注事项、最近事件和进程操作审计；已经打开的端口扫描、深度检查及已捕获基线会一并写入，但导出本身不会触发额外扫描
 - 支持无交互快照模式：`--table` 输出适合 SSH 现场查看的稳定表格，`--json` 输出带版本号的机器可读快照；两者复用 TUI 的完整查询语法与子树资源聚合
 - 无交互模式执行两次采样，默认间隔 500 ms，使 CPU 与磁盘 I/O 速率具有实际意义；可用 `--sample-ms` 在 100–60000 ms 之间调整
+- 所有无交互表格、JSON 和 JSONL 输出支持 `--redact`：在保留命令结构的同时遮盖常见密码、token、API key、认证 header、URL userinfo 和敏感查询参数
 - `psmore diff BEFORE.json AFTER.json` 将两份持久快照对比为启动/退出、PID 复用、父进程变化，以及 CPU、内存、I/O 和子树进程数增量；默认输出透明的分类榜单，增加 `--json` 可获得完整机器可读差异
 - `psmore check QUERY` 将任意结构化查询变成 CI/运维健康门禁：默认期望零命中，`--expect any` 可反向要求服务存在；支持表格、`psmore.check-result` JSON 和完全静默的 `--quiet`
 - `psmore inspect PID` 将 TUI 深度检查直接带到 SSH、脚本和事故工单：一次输出进程身份、完整命令、热点线程、socket、打开文件及平台运行上下文，也可导出 `psmore.process-inspection` JSON
 - `psmore port PORT` 直接回答“谁占用了这个端口”：将 TCP/UDP 本地端点关联到 PID、用户、完整命令、FD 和 Linux 网络 namespace，并可作为端口存在/释放健康门禁
 - `psmore listen` 从全局监听面反查进程和启动上下文，并将 wildcard、非回环网络、loopback 与 Unix socket 分类；`--exposed` 可直接聚焦需要安全复核的主机暴露面
+- `psmore net [FILTER]` 检索全局监听、已建立 TCP/UDP 对端和 Unix 连接，展示本地到对端路由、状态、PID/FD、完整进程上下文和 Linux 网络 namespace，并支持状态门禁
 - `psmore tree PID` 在非交互环境输出目标的完整父链和后代树，保留目录连接线、稳定同级排序、进程自身/完整子树资源及显式深度截断，也可导出嵌套 JSON
 - `psmore watch [QUERY]` 建立进程基线后持续输出启动、退出、PID 复用、父进程变化及动态查询进入/离开事件；支持实时刷新的表格和每行一个文档的版本化 JSONL
 - `psmore trace PID` 连续记录单个进程及完整服务子树的 CPU、内存和 I/O，给出相对基线/上一采样的增长、实际采样间隔和峰值汇总；进程退出或 PID 复用时安全终止
+- `psmore top [QUERY]` 将 TUI 热点排名带到 SSH 和脚本：按 CPU、内存、磁盘读或写排序，可在进程自身与完整服务子树口径之间切换，并输出稳定表格或版本化 JSON
+- `psmore oom [QUERY]` 在 Linux 上联合展示主机 MemAvailable/Swap、memory PSI、OOM kill 计数与进程 `oom_score`/调整值/cgroup 内存事件，区分“杀进程优先级”和“正在发生内存压力”
 - `psmore deleted` 定位“文件已删除但进程仍占用”的磁盘空间泄漏：展示 PID、FD、用户、完整命令、文件身份与大小，并按 device+inode 去重估算真正可释放空间
 - `psmore fd` 对全系统打开的文件描述符做风险排名：展示 PID、用户、完整命令、FD 数量以及 Linux 软/硬限制和使用率，可直接作为 FD 泄漏或耗尽的巡检门禁
 - 深度检查仅在打开或手动刷新面板时启动后台采样：macOS 调用一次 `lsof`，Linux 直接读取目标进程的 `/proc`，不会加入两秒一次的全局刷新
@@ -124,9 +128,28 @@ cargo run --release -- --json --query 'tree.mem>1g !state:zombie' > snapshot.jso
 cargo run --release -- --query 'name:python children>=1'
 ```
 
-安装后的二进制可将上述 `cargo run --release --` 简写为 `psmore`。`--table` 表头中的 `TCPU%`、`TMEM`、`TPROCS` 分别表示当前进程及全部后代的聚合 CPU、内存和进程数。`--json` 使用 `psmore.process-snapshot` schema v1，进程按 PID 稳定排序，并同时提供自身指标、直接子进程数和 `subtree` 聚合指标。命令行、路径、用户名和主机名可能包含敏感信息，分享前应检查。
+安装后的二进制可将上述 `cargo run --release --` 简写为 `psmore`。`--table` 表头中的 `TCPU%`、`TMEM`、`TPROCS` 分别表示当前进程及全部后代的聚合 CPU、内存和进程数。`--json` 使用 `psmore.process-snapshot` schema v1，进程按 PID 稳定排序，并同时提供自身指标、直接子进程数和 `subtree` 聚合指标。命令行、路径、用户名和主机名可能包含敏感信息；对外分享时建议启用 `--redact` 并人工复核。
 
 无交互模式的退出码约定：成功为 `0`，采集/输出错误为 `1`，参数或查询错误为 `2`，`check` 策略违反为 `3`。若输出管道的读取端提前关闭（例如 `psmore --table | head`），不会打印 Broken pipe 错误；`check` 仍保留原本的策略退出码。
+
+### 安全分享与命令脱敏
+
+`--redact` 可放在任意无交互命令前后，只影响最终输出，不改变进程匹配、身份校验、排序或差异判断：
+
+```bash
+# 分享单个进程诊断，隐藏 --password、--token、API_KEY 等常见密钥值
+psmore inspect 1234 --json --redact > process-1234.safe.json
+
+# 分享连接证据，同时遮盖进程命令中的 URL 密码和认证参数
+psmore net --connected --redact
+
+# 快照、流式事件和持久快照对比同样支持
+psmore --table --query name:api --redact
+psmore watch name:worker --jsonl --redact
+psmore diff before.json after.json --redact
+```
+
+脱敏会将识别到的值替换为 `[REDACTED]`，并尽量保留原有参数名、引号和 URL 结构。它是便于事故工单和团队协作的尽力保护，不是完整匿名化：主机名、用户名、文件路径、普通查询参数、IP 和端口仍会保留，分享前仍应检查输出。交互式 TUI 不接受 `--redact`，因为 TUI 不产生可直接分享的命令输出文件。
 
 ### 查询健康门禁
 
@@ -217,6 +240,37 @@ psmore 将 `0.0.0.0`、`::` 和 `*` 标为 `WILDCARD`，将绑定在任意非回
 
 指定 `--expect any|none` 后，确认违反策略时退出 `3`；零命中但权限或采集错误导致扫描不完整时返回 `inconclusive` 并退出 `1`，不会将不可见监听误判为不存在。`--quiet` 必须和 expectation 一起使用且完全静默。Linux 会跨可见网络 namespace 读取 `/proc` socket 表并按 inode 反查 PID/FD；macOS 使用系统 `lsof`。建议以与目标服务相同的用户运行，必要时再通过经过授权的提权方式扩大可见范围。
 
+### 全局连接与远端端点
+
+`listen` 回答“本机开放了什么”；需要继续回答“哪些进程正在与什么对端通信、连接处于什么状态”时，使用 `net`：
+
+```bash
+# TCP、UDP、Unix 的所有监听、绑定、打开和 peer 连接
+psmore net
+
+# 只保留具有远端端点或 connected 状态的连接，排除纯监听/绑定
+psmore net --connected
+
+# 精确筛选 TCP 状态，并按远端 IP、端口、进程或命令继续搜索
+psmore net --protocol tcp --state established
+psmore net 203.0.113.10 --connected
+psmore net worker --state close-wait
+
+# 返回所有匹配 socket 引用和完整进程上下文
+psmore net 443 --connected --limit all --json
+
+# egress/依赖基线：不允许任何可见进程连接到指定地址
+psmore net 198.51.100.20 --connected --expect none --quiet
+```
+
+FILTER 同时搜索协议、本地端点、对端端点、状态、PID、FD、进程名、用户、路径、完整命令、工作目录和 Linux network namespace。地址保持系统提供的数字形式，不执行 DNS 反查，避免现场命令被 DNS 延迟或名称漂移影响。`--state` 做大小写无关的精确匹配，并将 `time-wait` 规范化为 `TIME_WAIT`；常见状态包括 `ESTABLISHED`、`TIME_WAIT`、`CLOSE_WAIT`、`SYN_SENT`、`CONNECTED`、`BOUND` 和 `LISTEN`。
+
+`--connected` 的含义是“存在非终态 peer 证据”：TCP/UDP 有非空远端端点，或 Unix socket 状态为 connected/connecting，同时排除 `CLOSED`、`CLOSE`、`UNKNOWN`。不加该选项时这些仍会作为历史/打开 socket 证据保留，并可用 `--state` 精确检查。表格中的 `LOCAL -> PEER` 只表达内核当前记录的两端，不根据端口大小或地址猜测连接由本机主动发起还是被动接受；要证明方向需要连接跟踪、数据包或应用日志。
+
+同一路由可能有多个 FD、共享 socket 或多个可见所有者，因此 `unique_route_count` 按协议、本地、对端、状态和 namespace 去重，`socket_reference_count` 保留逐 PID/FD 证据。JSON 使用 `psmore.network-connections` schema v1，记录 peer/listener 分类、完整所有者上下文、筛选条件、截断、采集完整性和方向解释。
+
+健康门禁针对限制前的全部匹配引用；确认违反策略退出 `3`。如果零命中但权限或采集错误使 owner/namespace/socket 表不完整，结果为 `inconclusive` 并退出 `1`，不会把“看不见连接”当成“没有连接”。Linux 跨可见 network namespace 读取 `/proc` 并按 inode 关联 PID/FD；macOS 使用一次全局 `lsof` 扫描。
+
 ### 无交互进程关系树
 
 需要把“它是谁启动的、又启动了什么”粘贴到事故工单或在 SSH 管道中处理时，可以直接围绕 PID 截取上下文：
@@ -285,6 +339,62 @@ jq 'select(.kind == "sample") | [.elapsed_ms, .process.own.memory_bytes, .proces
 `--interval-ms` 是目标间隔，实际间隔还包含系统进程采集耗时，因此 JSON 同时给出 `configured_interval_ms` 和 `actual_interval_ms`，不会把重主机上的延迟伪装成精确周期。`--count N` 不包含立即生成的 baseline；默认无限。
 
 trace 在开始时固定 PID、启动时间、进程名和命令。目标正常退出或该 PID 被新进程复用时，会先输出明确终止事件，再输出 complete，且不会继续采样新实例；这是成功完成的观察，退出码为 `0`。目标一开始不可见，或采样过程中身份从可验证变为不可验证时退出 `1`。当平台从始至终都拿不到启动时间时，会明确标为 `unverified_fallback`，仅在名称和命令保持一致时继续。JSONL 含完整命令、路径、用户和主机信息，分享前应检查敏感内容。
+
+### SSH 热点排名
+
+只想快速回答“此刻谁最耗资源”时，不必进入 TUI，也不必先导出全量快照再用外部脚本排序：
+
+```bash
+# 默认按进程自身 CPU 排名前 20
+psmore top
+
+# 内存前 10 名；表格同时保留自身和完整子树指标供判断
+psmore top --by memory --limit 10
+
+# 只看部署用户已运行一分钟以上的进程
+psmore top 'user:deploy age>1m' --by cpu
+
+# 按完整服务子树的磁盘写入排名，返回全部匹配项
+psmore top name:api --scope tree --by write --limit all
+
+# 版本化 JSON 可直接交给 jq 或归档
+psmore top --scope tree --by memory --json | jq '.items[] | [.rank, .pid, .ranking_value, .command]'
+```
+
+`--by` 支持 `cpu`、`memory`、`read`、`write`，`--scope process|tree` 决定排名值来自进程自身还是当前进程与全部后代的聚合。默认采样 500ms，可用 `--sample-ms` 调整；CPU 和磁盘读写速率与快照、查询和 TUI 使用相同的两次采样口径。查询支持完整字段、阈值、单位和否定语法，并在排名前应用。
+
+表格明确显示排名口径、匹配数、返回数和实际采样间隔，同时为每一项保留自身/子树 CPU、内存、读写速率与子树进程数。指标相同时按小写进程名、PID 升序稳定排序，重复执行不会因 HashMap 顺序漂移。采集器自身始终排除，避免 `psmore` 的短时 CPU 和 I/O 污染结果；JSON 使用 `psmore.process-top` schema v1，并记录单位、排序方向、平局规则、截断状态和该排除规则。`--limit` 只控制返回行数，`--limit all` 返回全部匹配进程。
+
+子树排名会有意保留父子重叠：例如 API 主进程和某个 worker 都可能进入榜单，因为它们回答的是不同边界上的聚合问题。若要锁定一个业务边界，可先用 `name:`、`user:`、`cmd:` 等查询缩小范围，再使用 `psmore tree PID` 核对关系、`psmore trace PID` 观察趋势。
+
+### Linux OOM 与内存压力
+
+线上出现进程被 `SIGKILL`、容器重启、节点内存告警，或者想在发布前检查谁最可能被内核 OOM killer 选择时：
+
+```bash
+# 默认列出 oom_score >= 1 的前 20 个候选，并同时展示主机压力证据
+psmore oom
+
+# 只看部署用户的大型服务树，返回全部高优先级候选
+psmore oom 'user:deploy tree.mem>1g' --min-score 500 --limit all
+
+# 查看某个服务的 cgroup memory 上限和历史 OOM 事件
+psmore oom name:api --min-score 0
+
+# 巡检门禁：不允许出现 oom_score >= 700 的 API 进程
+psmore oom name:api --min-score 700 --expect none --quiet
+
+# 保存完整机器可读证据
+psmore oom --min-score 250 --json > oom-diagnostics.json
+```
+
+`oom_score` 是 Linux 内核在当前时刻选择牺牲进程时使用的相对优先级，范围通常为 0–1000；它高并不等于主机正在 OOM。psmore 因此把它标为 `selection_priority`，而不是故障严重度，并在同一结果中提供可用于确认真实压力的独立证据：`MemAvailable`、Swap 使用量、memory PSI 的 `some/full avg10/60/300`、`/proc/vmstat` 中开机以来的 `oom_kill` 计数。计数是累计值，非零只证明本次开机期间曾发生过事件，不证明它刚刚发生。
+
+候选行还包含 `oom_score_adj`、RSS、Swap、完整命令，以及 cgroup v2 的 `memory.current`、`memory.max`、`memory.events` 中 `oom`/`oom_kill`；旧式 cgroup v1 会尽可能读取 memory usage、limit 和 fail count。cgroup 事件同样是该 cgroup 生命周期内的累计证据。`oom_score_adj=-1000` 标为 `PROTECTED`，但其保护范围、祖先 cgroup 限制和系统策略仍应结合现场核对。
+
+`--min-score` 在完整查询之后筛选，`--limit` 只影响返回行数，健康门禁始终针对全部匹配候选。若查询命中的进程在采集期间退出或 `oom_score` 因权限不可读，零命中不能证明不存在，`--expect` 会返回 `inconclusive` 和退出码 `1`；确认违反策略退出 `3`。JSON 使用 `psmore.oom-diagnostics` schema v1，明确记录 score 覆盖、上下文覆盖、截断和解释文本。
+
+该命令依赖 Linux `/proc`、PSI 和 cgroup 文件系统；macOS 会明确返回“不支持”，可先用 `psmore top --by memory`、`psmore trace PID` 和系统内存压力工具排查，不会伪造 Linux OOM 分数。
 
 ### 文件描述符压力
 

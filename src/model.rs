@@ -1,4 +1,8 @@
-use std::{collections::HashMap, time::Instant};
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Instant,
+};
 
 use sysinfo::Pid;
 
@@ -37,9 +41,280 @@ pub(crate) fn sanitize_terminal_text(value: &str) -> String {
     output
 }
 
+static REDACT_OUTPUT_SECRETS: AtomicBool = AtomicBool::new(false);
+const REDACTED: &str = "[REDACTED]";
+
+pub(crate) fn set_output_secret_redaction(enabled: bool) {
+    REDACT_OUTPUT_SECRETS.store(enabled, Ordering::Relaxed);
+}
+
+pub(crate) fn output_secret_redaction_enabled() -> bool {
+    REDACT_OUTPUT_SECRETS.load(Ordering::Relaxed)
+}
+
+pub(crate) fn command_for_output(value: &str) -> String {
+    if output_secret_redaction_enabled() {
+        redact_command_secrets(value)
+    } else {
+        value.to_string()
+    }
+}
+
+pub(crate) fn process_command_for_output(process: &ProcessInfo) -> String {
+    command_for_output(&process_command_line(process))
+}
+
+fn command_token_ranges(value: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut start = None;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in value.char_indices() {
+        if start.is_none() {
+            if character.is_whitespace() {
+                continue;
+            }
+            start = Some(index);
+        }
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' && quote != Some('\'') {
+            escaped = true;
+            continue;
+        }
+        match quote {
+            Some(active) if character == active => quote = None,
+            Some(_) => {}
+            None if matches!(character, '\'' | '"') => quote = Some(character),
+            None if character.is_whitespace() => {
+                if let Some(start) = start.take() {
+                    ranges.push((start, index));
+                }
+            }
+            None => {}
+        }
+    }
+    if let Some(start) = start {
+        ranges.push((start, value.len()));
+    }
+    ranges
+}
+
+fn unquoted(value: &str) -> &str {
+    if value.len() >= 2 {
+        let first = value.as_bytes()[0];
+        let last = value.as_bytes()[value.len() - 1];
+        if matches!(first, b'\'' | b'"') && first == last {
+            return &value[1..value.len() - 1];
+        }
+    }
+    value
+}
+
+fn normalized_secret_key(value: &str) -> String {
+    value
+        .trim_matches(['\'', '"'])
+        .trim_start_matches('-')
+        .to_ascii_lowercase()
+        .replace('_', "-")
+}
+
+fn is_secret_key(value: &str) -> bool {
+    let key = normalized_secret_key(value);
+    matches!(
+        key.as_str(),
+        "password"
+            | "passwd"
+            | "passphrase"
+            | "token"
+            | "api-key"
+            | "apikey"
+            | "access-token"
+            | "refresh-token"
+            | "id-token"
+            | "secret"
+            | "client-secret"
+            | "secret-key"
+            | "access-key"
+            | "private-key"
+            | "authorization"
+            | "auth-token"
+            | "auth"
+            | "cookie"
+            | "session-token"
+            | "credential"
+    ) || key.ends_with("-password")
+        || key.ends_with("-passwd")
+        || key.ends_with("-token")
+        || key.ends_with("-api-key")
+        || key.ends_with("-secret")
+        || key.ends_with("-secret-key")
+        || key.ends_with("-access-key")
+}
+
+fn redacted_token(value: &str) -> String {
+    if value.len() >= 2 {
+        let first = value.as_bytes()[0];
+        let last = value.as_bytes()[value.len() - 1];
+        if matches!(first, b'\'' | b'"') && first == last {
+            let quote = first as char;
+            return format!("{quote}{REDACTED}{quote}");
+        }
+    }
+    REDACTED.into()
+}
+
+fn redact_assignment(value: &str) -> Option<String> {
+    let inner = unquoted(value);
+    let assignment = inner.find('=')?;
+    if inner[..assignment]
+        .chars()
+        .any(|character| matches!(character, '?' | '&'))
+        || inner[..assignment].contains("://")
+    {
+        return None;
+    }
+    if !is_secret_key(&inner[..assignment]) {
+        return None;
+    }
+    let assignment = value.find('=')?;
+    let prefix = &value[..=assignment];
+    let assigned_value = &value[assignment + 1..];
+    if assigned_value.len() >= 2 {
+        let first = assigned_value.as_bytes()[0];
+        let last = assigned_value.as_bytes()[assigned_value.len() - 1];
+        if matches!(first, b'\'' | b'"') && first == last {
+            let quote = first as char;
+            return Some(format!("{prefix}{quote}{REDACTED}{quote}"));
+        }
+    }
+    let trailing_quote = value
+        .chars()
+        .last()
+        .filter(|quote| matches!(quote, '\'' | '"') && value.starts_with(*quote));
+    Some(match trailing_quote {
+        Some(quote) => format!("{prefix}{REDACTED}{quote}"),
+        None => format!("{prefix}{REDACTED}"),
+    })
+}
+
+fn redact_header(value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    for header in [
+        "authorization:",
+        "proxy-authorization:",
+        "cookie:",
+        "x-api-key:",
+    ] {
+        if let Some(start) = lower.find(header) {
+            let end = start + header.len();
+            let trailing_quote = value
+                .chars()
+                .last()
+                .filter(|quote| matches!(quote, '\'' | '"') && value.starts_with(*quote));
+            return match trailing_quote {
+                Some(quote) => format!("{}{REDACTED}{quote}", &value[..end]),
+                None => format!("{}{REDACTED}", &value[..end]),
+            };
+        }
+    }
+    value.to_string()
+}
+
+fn redact_url_userinfo(value: &str) -> String {
+    let mut output = value.to_string();
+    let mut cursor = 0;
+    while let Some(relative_scheme) = output[cursor..].find("://") {
+        let authority_start = cursor + relative_scheme + 3;
+        let authority_end = output[authority_start..]
+            .char_indices()
+            .find(|(_, character)| {
+                matches!(character, '/' | '?' | '#' | '\'' | '"') || character.is_whitespace()
+            })
+            .map(|(index, _)| authority_start + index)
+            .unwrap_or(output.len());
+        let authority = &output[authority_start..authority_end];
+        let Some(at) = authority.rfind('@') else {
+            cursor = authority_end;
+            continue;
+        };
+        let Some(colon) = authority[..at].rfind(':') else {
+            cursor = authority_end;
+            continue;
+        };
+        let secret_start = authority_start + colon + 1;
+        let secret_end = authority_start + at;
+        output.replace_range(secret_start..secret_end, REDACTED);
+        cursor = secret_start + REDACTED.len() + 1;
+    }
+    output
+}
+
+fn redact_url_query(value: &str) -> String {
+    let mut output = value.to_string();
+    let mut cursor = 0;
+    while cursor < output.len() {
+        let Some(relative_start) = output[cursor..].find(['?', '&']) else {
+            break;
+        };
+        let key_start = cursor + relative_start + 1;
+        let Some(relative_equals) = output[key_start..].find('=') else {
+            break;
+        };
+        let equals = key_start + relative_equals;
+        let key = &output[key_start..equals];
+        let value_start = equals + 1;
+        let value_end = output[value_start..]
+            .char_indices()
+            .find(|(_, character)| {
+                matches!(character, '&' | '#' | '\'' | '"') || character.is_whitespace()
+            })
+            .map(|(index, _)| value_start + index)
+            .unwrap_or(output.len());
+        if is_secret_key(key) {
+            output.replace_range(value_start..value_end, REDACTED);
+            cursor = value_start + REDACTED.len();
+        } else {
+            cursor = value_end.max(value_start);
+        }
+    }
+    output
+}
+
+pub(crate) fn redact_command_secrets(value: &str) -> String {
+    let ranges = command_token_ranges(value);
+    let mut output = String::with_capacity(value.len());
+    let mut previous_end = 0;
+    let mut redact_next = false;
+    for (start, end) in ranges {
+        output.push_str(&value[previous_end..start]);
+        let token = &value[start..end];
+        let rendered = if redact_next {
+            redact_next = false;
+            redacted_token(token)
+        } else if let Some(redacted) = redact_assignment(token) {
+            redacted
+        } else {
+            let flag = unquoted(token);
+            if !flag.contains('=') && is_secret_key(flag) {
+                redact_next = true;
+            }
+            let token = redact_header(token);
+            let token = redact_url_userinfo(&token);
+            redact_url_query(&token)
+        };
+        output.push_str(&rendered);
+        previous_end = end;
+    }
+    output.push_str(&value[previous_end..]);
+    output
+}
+
 #[cfg(test)]
 mod terminal_text_tests {
-    use super::sanitize_terminal_text;
+    use super::{redact_command_secrets, sanitize_terminal_text};
 
     #[test]
     fn normalizes_controls_and_ps_octal_whitespace_escapes() {
@@ -51,6 +326,42 @@ mod terminal_text_tests {
         assert_eq!(
             sanitize_terminal_text(r"literal\\012value"),
             r"literal\\012value"
+        );
+    }
+
+    #[test]
+    fn redacts_secret_flags_assignments_headers_urls_and_query_values() {
+        let command = "server --password hunter2 --token='abc def' OPENAI_API_KEY=sk-live \
+            relay+tls://user:pass@host:443/api?access_token=url-token&mode=fast \
+            --header=\"Authorization: Bearer header-token\" --port 8080";
+        let redacted = redact_command_secrets(command);
+        for secret in ["hunter2", "abc def", "sk-live", "url-token", "header-token"] {
+            assert!(
+                !redacted.contains(secret),
+                "secret remained visible: {secret}"
+            );
+        }
+        assert!(!redacted.contains("user:pass@"));
+        assert!(redacted.contains("--password [REDACTED]"));
+        assert!(redacted.contains("--token='[REDACTED]'"));
+        assert!(redacted.contains("OPENAI_API_KEY=[REDACTED]"));
+        assert!(redacted.contains("relay+tls://user:[REDACTED]@host:443"));
+        assert!(redacted.contains("access_token=[REDACTED]&mode=fast"));
+        assert!(redacted.contains("Authorization:[REDACTED]"));
+        assert!(redacted.contains("--port 8080"));
+    }
+
+    #[test]
+    fn preserves_non_secret_arguments_and_handles_unterminated_quotes() {
+        assert_eq!(
+            redact_command_secrets(
+                "api --user deploy --path '/srv/my app' --password 'open secret"
+            ),
+            "api --user deploy --path '/srv/my app' --password [REDACTED]"
+        );
+        assert_eq!(
+            redact_command_secrets("curl https://example.test/?page=2&sort=name"),
+            "curl https://example.test/?page=2&sort=name"
         );
     }
 }
