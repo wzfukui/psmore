@@ -11,8 +11,8 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     actions::{
-        ProcessActionDialog, ProcessActionKind, ProcessActionRecord, ProcessActionTarget,
-        execute_process_action,
+        ProcessActionDialog, ProcessActionDialogMode, ProcessActionKind, ProcessActionRecord,
+        ProcessActionTarget, execute_process_action,
     },
     cli::{LogPriority, LogScope},
     headless_exe::{capture_executable, render_executable_json, render_executable_table},
@@ -20,6 +20,7 @@ use crate::{
         ExplainOptions, capture_dossier, render_dossier_json, render_dossier_summary_table,
     },
     headless_logs::{capture_logs, render_logs_json, render_logs_table},
+    headless_memory::{capture_memory, render_memory_json, render_memory_table},
     headless_service::{capture_service_context, render_service_json, render_service_table},
     history::ResourceHistory,
     inspection::inspect_process,
@@ -472,6 +473,13 @@ struct ExecutableContextTask {
     start_time: u64,
 }
 
+struct MemoryContextTask {
+    receiver: Receiver<Result<(String, serde_json::Value), String>>,
+    started_at: Instant,
+    pid: Pid,
+    start_time: u64,
+}
+
 struct LogsContextTask {
     receiver: Receiver<Result<(String, serde_json::Value), String>>,
     started_at: Instant,
@@ -503,6 +511,15 @@ pub(crate) struct ExecutableContextPanel {
     pub(crate) report: Option<serde_json::Value>,
     pub(crate) warning: Option<String>,
     pub(crate) hash: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MemoryContextPanel {
+    pub(crate) pid: Pid,
+    pub(crate) name: String,
+    pub(crate) content: String,
+    pub(crate) report: Option<serde_json::Value>,
+    pub(crate) warning: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -564,8 +581,11 @@ pub(crate) struct App {
     pub(crate) collapsed: HashSet<Pid>,
     pub(crate) search: String,
     pub(crate) searching: bool,
+    pub(crate) search_input: String,
     pub(crate) search_error: Option<String>,
     pub(crate) search_matches: usize,
+    pub(crate) pid_input: Option<String>,
+    pub(crate) pid_input_error: Option<String>,
     pub(crate) focus: Option<Pid>,
     pub(crate) last_refresh: Instant,
     pub(crate) marquee_offset: usize,
@@ -588,6 +608,9 @@ pub(crate) struct App {
     pub(crate) executable_context: Option<ExecutableContextPanel>,
     executable_context_task: Option<ExecutableContextTask>,
     pub(crate) executable_context_scroll: u16,
+    pub(crate) memory_context: Option<MemoryContextPanel>,
+    memory_context_task: Option<MemoryContextTask>,
+    pub(crate) memory_context_scroll: u16,
     pub(crate) logs_context: Option<LogsContextPanel>,
     logs_context_task: Option<LogsContextTask>,
     pub(crate) logs_context_scroll: u16,
@@ -643,8 +666,11 @@ impl App {
             collapsed: HashSet::new(),
             search: query,
             searching: false,
+            search_input: String::new(),
             search_error: None,
             search_matches: 0,
+            pid_input: None,
+            pid_input_error: None,
             focus: None,
             last_refresh: Instant::now(),
             marquee_offset: 0,
@@ -667,6 +693,9 @@ impl App {
             executable_context: None,
             executable_context_task: None,
             executable_context_scroll: 0,
+            memory_context: None,
+            memory_context_task: None,
+            memory_context_scroll: 0,
             logs_context: None,
             logs_context_task: None,
             logs_context_scroll: 0,
@@ -919,6 +948,60 @@ impl App {
             Some(Err(TryRecvError::Empty)) | None => {}
         }
 
+        let memory_result = self
+            .memory_context_task
+            .as_ref()
+            .map(|task| task.receiver.try_recv());
+        match memory_result {
+            Some(Ok(result)) => {
+                let task = self.memory_context_task.take();
+                let same_instance = task
+                    .as_ref()
+                    .map(|task| {
+                        self.processes
+                            .get(&task.pid)
+                            .map(|process| {
+                                task.start_time == 0
+                                    || process.start_time == 0
+                                    || process.start_time == task.start_time
+                            })
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if let Some(panel) = &mut self.memory_context {
+                    if !same_instance {
+                        panel.content.clear();
+                        panel.report = None;
+                        panel.warning = Some(
+                            "process exited or PID was reused while memory evidence was collected"
+                                .into(),
+                        );
+                    } else {
+                        match result {
+                            Ok((content, report)) => {
+                                panel.content = content;
+                                panel.report = Some(report);
+                                panel.warning = None;
+                            }
+                            Err(error) => {
+                                panel.content.clear();
+                                panel.report = None;
+                                panel.warning = Some(error);
+                            }
+                        }
+                    }
+                }
+                self.memory_context_scroll = 0;
+            }
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.memory_context_task = None;
+                if let Some(panel) = &mut self.memory_context {
+                    panel.warning = Some("memory evidence background worker stopped".into());
+                }
+            }
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
+
         let logs_result = self
             .logs_context_task
             .as_ref()
@@ -1065,6 +1148,17 @@ impl App {
             .unwrap_or_default()
     }
 
+    pub(crate) fn memory_context_is_scanning(&self) -> bool {
+        self.memory_context_task.is_some()
+    }
+
+    pub(crate) fn memory_context_elapsed(&self) -> Duration {
+        self.memory_context_task
+            .as_ref()
+            .map(|task| task.started_at.elapsed())
+            .unwrap_or_default()
+    }
+
     pub(crate) fn logs_context_is_scanning(&self) -> bool {
         self.logs_context_task.is_some()
     }
@@ -1131,6 +1225,12 @@ impl App {
         self.dossier_context_scroll = 0;
     }
 
+    fn close_memory_context(&mut self) {
+        self.memory_context = None;
+        self.memory_context_task = None;
+        self.memory_context_scroll = 0;
+    }
+
     fn start_inspection(&mut self, process: ProcessInfo, clear_previous: bool) {
         if self.inspection_task.is_some() {
             return;
@@ -1178,6 +1278,7 @@ impl App {
             return;
         };
         self.show_events = false;
+        self.close_memory_context();
         self.close_dossier_context();
         self.start_inspection(process, true);
     }
@@ -1272,6 +1373,7 @@ impl App {
         self.logs_context = None;
         self.logs_context_task = None;
         self.logs_context_scroll = 0;
+        self.close_memory_context();
         self.close_dossier_context();
         self.show_events = false;
         self.start_service_context(process, true);
@@ -1370,6 +1472,7 @@ impl App {
         self.logs_context = None;
         self.logs_context_task = None;
         self.logs_context_scroll = 0;
+        self.close_memory_context();
         self.close_dossier_context();
         self.show_events = false;
         self.start_executable_context(process, true, true);
@@ -1406,6 +1509,106 @@ impl App {
             panel.report = None;
         }
         self.refresh_executable_context();
+    }
+
+    fn start_memory_context(&mut self, process: ProcessInfo, clear_previous: bool) {
+        if self.memory_context_task.is_some() {
+            return;
+        }
+        if clear_previous {
+            self.memory_context = Some(MemoryContextPanel {
+                pid: process.pid,
+                name: process.name.clone(),
+                content: String::new(),
+                report: None,
+                warning: None,
+            });
+            self.memory_context_scroll = 0;
+        } else if let Some(panel) = &mut self.memory_context {
+            panel.content.clear();
+            panel.report = None;
+            panel.warning = None;
+        }
+        let pid = process.pid;
+        let start_time = process.start_time;
+        let (sender, receiver) = mpsc::channel();
+        match thread::Builder::new()
+            .name(format!("psmore-memory-context-{}", pid.as_u32()))
+            .spawn(move || {
+                let result = capture_memory(pid.as_u32(), Some(20)).and_then(|captured| {
+                    let table = render_memory_table(&captured);
+                    let json = render_memory_json(&captured)
+                        .map_err(|error| format!("cannot serialize memory evidence: {error}"))?;
+                    let report = serde_json::from_str(&json)
+                        .map_err(|error| format!("cannot parse memory evidence JSON: {error}"))?;
+                    Ok((table, report))
+                });
+                let _ = sender.send(result);
+            }) {
+            Ok(_) => {
+                self.memory_context_task = Some(MemoryContextTask {
+                    receiver,
+                    started_at: Instant::now(),
+                    pid,
+                    start_time,
+                });
+            }
+            Err(error) => {
+                if let Some(panel) = &mut self.memory_context {
+                    panel.warning = Some(format!("cannot start memory collection: {error}"));
+                }
+            }
+        }
+    }
+
+    fn open_memory_context(&mut self) {
+        let Some(process) = self
+            .selected_pid()
+            .and_then(|pid| self.processes.get(&pid))
+            .cloned()
+        else {
+            return;
+        };
+        self.show_attention = false;
+        self.attention_selected = None;
+        self.show_hotspots = false;
+        self.hotspot_selected = None;
+        self.show_network = false;
+        self.network_filter.clear();
+        self.network_searching = false;
+        self.show_snapshot_diff = false;
+        self.trend_pid = None;
+        self.inspection = None;
+        self.inspection_task = None;
+        self.service_context = None;
+        self.service_context_task = None;
+        self.service_context_scroll = 0;
+        self.executable_context = None;
+        self.executable_context_task = None;
+        self.executable_context_scroll = 0;
+        self.logs_context = None;
+        self.logs_context_task = None;
+        self.logs_context_scroll = 0;
+        self.close_dossier_context();
+        self.show_events = false;
+        self.start_memory_context(process, true);
+    }
+
+    fn refresh_memory_context(&mut self) {
+        if self.memory_context_task.is_some() {
+            return;
+        }
+        let Some(pid) = self.memory_context.as_ref().map(|panel| panel.pid) else {
+            self.open_memory_context();
+            return;
+        };
+        let Some(process) = self.processes.get(&pid).cloned() else {
+            if let Some(panel) = &mut self.memory_context {
+                panel.warning = Some("process has exited since this snapshot".into());
+            }
+            return;
+        };
+        self.start_memory_context(process, false);
     }
 
     fn start_logs_context(
@@ -1496,6 +1699,7 @@ impl App {
         self.executable_context = None;
         self.executable_context_task = None;
         self.executable_context_scroll = 0;
+        self.close_memory_context();
         self.close_dossier_context();
         self.show_events = false;
         self.start_logs_context(
@@ -1677,6 +1881,7 @@ impl App {
         self.logs_context = None;
         self.logs_context_task = None;
         self.logs_context_scroll = 0;
+        self.close_memory_context();
         self.show_events = false;
         self.start_dossier_context(
             process,
@@ -2125,13 +2330,14 @@ impl App {
         }
     }
 
-    fn finish_search(&mut self) {
+    fn apply_search_input(&mut self) {
         if !self.searching {
             return;
         }
         self.searching = false;
-        self.search.clear();
+        self.search = std::mem::take(&mut self.search_input);
         self.rebuild_visible();
+        self.select_first_match();
     }
 
     fn capture_baseline(&mut self) {
@@ -2175,6 +2381,11 @@ impl App {
                         .as_ref()
                         .and_then(|panel| panel.report.as_ref()),
                     executable_context_in_progress: self.executable_context_is_scanning(),
+                    memory_context: self
+                        .memory_context
+                        .as_ref()
+                        .and_then(|panel| panel.report.as_ref()),
+                    memory_context_in_progress: self.memory_context_is_scanning(),
                     logs_context: self
                         .logs_context
                         .as_ref()
@@ -2418,6 +2629,9 @@ impl App {
         self.attention_selected = None;
         self.search.clear();
         self.searching = false;
+        self.search_input.clear();
+        self.pid_input = None;
+        self.pid_input_error = None;
         self.focus = None;
         let mut current = Some(pid);
         while let Some(process_pid) = current {
@@ -2434,7 +2648,7 @@ impl App {
         }
     }
 
-    fn open_process_action_for(&mut self, pid: Pid) {
+    fn open_process_action_for_mode(&mut self, pid: Pid, mode: ProcessActionDialogMode) {
         let Some(process) = self.processes.get(&pid) else {
             self.notice = Some(StatusNotice {
                 message: format!("cannot control PID {pid}: process is no longer visible"),
@@ -2469,7 +2683,12 @@ impl App {
             target: ProcessActionTarget::from(process),
             selected: 0,
             confirming: false,
+            mode,
         });
+    }
+
+    fn open_process_action_for(&mut self, pid: Pid) {
+        self.open_process_action_for_mode(pid, ProcessActionDialogMode::All);
     }
 
     fn open_selected_process_action(&mut self) {
@@ -2478,13 +2697,19 @@ impl App {
         }
     }
 
+    fn open_selected_process_termination(&mut self) {
+        if let Some(pid) = self.selected_pid() {
+            self.open_process_action_for_mode(pid, ProcessActionDialogMode::Termination);
+        }
+    }
+
     fn move_process_action_selection(&mut self, delta: isize) {
         let Some(dialog) = &mut self.process_action else {
             return;
         };
+        let action_count = dialog.actions().len();
         dialog.selected = (dialog.selected as isize + delta)
-            .clamp(0, ProcessActionKind::ALL.len().saturating_sub(1) as isize)
-            as usize;
+            .clamp(0, action_count.saturating_sub(1) as isize) as usize;
         dialog.confirming = false;
     }
 
@@ -2492,7 +2717,8 @@ impl App {
         let Some(dialog) = &mut self.process_action else {
             return;
         };
-        if let Some(index) = ProcessActionKind::ALL
+        if let Some(index) = dialog
+            .actions()
             .iter()
             .position(|candidate| *candidate == action)
         {
@@ -2538,6 +2764,30 @@ impl App {
         if !self.paused {
             self.refresh();
         }
+    }
+
+    fn begin_pid_input(&mut self, digit: char) {
+        self.pid_input = Some(digit.to_string());
+        self.pid_input_error = None;
+    }
+
+    fn finish_pid_input(&mut self) {
+        let Some(input) = self.pid_input.as_deref() else {
+            return;
+        };
+        let pid_number = match input.parse::<u32>() {
+            Ok(pid) => pid,
+            Err(_) => {
+                self.pid_input_error = Some("PID must fit in an unsigned 32-bit number".into());
+                return;
+            }
+        };
+        let pid = Pid::from_u32(pid_number);
+        if !self.processes.contains_key(&pid) {
+            self.pid_input_error = Some(format!("PID {pid_number} is not visible"));
+            return;
+        }
+        self.jump_to_process(pid);
     }
 
     fn guidance_error_notice(&mut self, action: &str, error: std::io::Error) {
@@ -2635,6 +2885,7 @@ impl App {
         }
         if !self.searching
             && !self.network_searching
+            && self.pid_input.is_none()
             && key.modifiers.is_empty()
             && key.code == KeyCode::Char('o')
         {
@@ -2664,7 +2915,15 @@ impl App {
             } else {
                 match key.code {
                     KeyCode::Char('q') => return true,
-                    KeyCode::Esc | KeyCode::Char('p') => self.process_action = None,
+                    KeyCode::Esc => self.process_action = None,
+                    KeyCode::Char('p')
+                        if self
+                            .process_action
+                            .as_ref()
+                            .is_some_and(|dialog| !dialog.is_termination_only()) =>
+                    {
+                        self.process_action = None;
+                    }
                     KeyCode::Down | KeyCode::Tab => {
                         self.move_process_action_selection(1);
                     }
@@ -2687,6 +2946,32 @@ impl App {
                     }
                     _ => {}
                 }
+            }
+            return false;
+        }
+        if self.pid_input.is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.pid_input = None;
+                    self.pid_input_error = None;
+                }
+                KeyCode::Enter => self.finish_pid_input(),
+                KeyCode::Backspace => {
+                    if let Some(input) = &mut self.pid_input {
+                        input.pop();
+                    }
+                    self.pid_input_error = None;
+                }
+                KeyCode::Char(c) if c.is_ascii_digit() && key.modifiers.is_empty() => {
+                    if let Some(input) = &mut self.pid_input {
+                        input.push(c);
+                    }
+                    self.pid_input_error = None;
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return true;
+                }
+                _ => {}
             }
             return false;
         }
@@ -2890,6 +3175,10 @@ impl App {
                     self.close_dossier_context();
                     self.open_logs_context();
                 }
+                KeyCode::Char('M') => {
+                    self.close_dossier_context();
+                    self.open_memory_context();
+                }
                 KeyCode::Enter | KeyCode::Char('r') => self.refresh_dossier_context(),
                 KeyCode::Char('h') => self.toggle_dossier_hash(),
                 KeyCode::Char('L') => self.toggle_dossier_logs(),
@@ -2907,6 +3196,49 @@ impl App {
                 }
                 KeyCode::PageUp => {
                     self.dossier_context_scroll = self.dossier_context_scroll.saturating_sub(10);
+                }
+                KeyCode::Char(' ') => self.toggle_paused(),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
+                _ => {}
+            }
+            return false;
+        }
+        if self.memory_context.is_some() {
+            match key.code {
+                KeyCode::Char('q') => return true,
+                KeyCode::Esc | KeyCode::Char('M') => self.close_memory_context(),
+                KeyCode::Char('D') => {
+                    self.close_memory_context();
+                    self.open_dossier_context();
+                }
+                KeyCode::Char('i') => {
+                    self.close_memory_context();
+                    self.open_inspection();
+                }
+                KeyCode::Char('m') => {
+                    self.close_memory_context();
+                    self.open_service_context();
+                }
+                KeyCode::Char('v') => {
+                    self.close_memory_context();
+                    self.open_executable_context();
+                }
+                KeyCode::Char('l') => {
+                    self.close_memory_context();
+                    self.open_logs_context();
+                }
+                KeyCode::Enter | KeyCode::Char('r') => self.refresh_memory_context(),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.memory_context_scroll = self.memory_context_scroll.saturating_add(1);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.memory_context_scroll = self.memory_context_scroll.saturating_sub(1);
+                }
+                KeyCode::PageDown => {
+                    self.memory_context_scroll = self.memory_context_scroll.saturating_add(10);
+                }
+                KeyCode::PageUp => {
+                    self.memory_context_scroll = self.memory_context_scroll.saturating_sub(10);
                 }
                 KeyCode::Char(' ') => self.toggle_paused(),
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
@@ -2940,6 +3272,7 @@ impl App {
                     self.logs_context_scroll = 0;
                     self.open_dossier_context();
                 }
+                KeyCode::Char('M') => self.open_memory_context(),
                 KeyCode::Enter | KeyCode::Char('r') => self.refresh_logs_context(),
                 KeyCode::Char('s') => self.cycle_logs_scope(),
                 KeyCode::Char('p') => self.cycle_logs_priority(),
@@ -2988,6 +3321,7 @@ impl App {
                     self.service_context_scroll = 0;
                     self.open_dossier_context();
                 }
+                KeyCode::Char('M') => self.open_memory_context(),
                 KeyCode::Enter | KeyCode::Char('r') => self.refresh_service_context(),
                 KeyCode::Down | KeyCode::Char('j') => {
                     self.service_context_scroll = self.service_context_scroll.saturating_add(1);
@@ -3033,6 +3367,7 @@ impl App {
                     self.executable_context_scroll = 0;
                     self.open_dossier_context();
                 }
+                KeyCode::Char('M') => self.open_memory_context(),
                 KeyCode::Enter | KeyCode::Char('r') => self.refresh_executable_context(),
                 KeyCode::Char('h') => self.toggle_executable_hash(),
                 KeyCode::Down | KeyCode::Char('j') => {
@@ -3071,6 +3406,7 @@ impl App {
                     self.inspection_scroll = 0;
                     self.open_dossier_context();
                 }
+                KeyCode::Char('M') => self.open_memory_context(),
                 KeyCode::Enter | KeyCode::Char('r') => self.refresh_inspection(),
                 KeyCode::Down | KeyCode::Char('j') => {
                     self.inspection_scroll = self.inspection_scroll.saturating_add(1);
@@ -3105,40 +3441,14 @@ impl App {
             match key.code {
                 KeyCode::Esc => {
                     self.searching = false;
-                    self.search.clear();
-                    self.rebuild_visible();
+                    self.search_input.clear();
                 }
-                KeyCode::Enter => {
-                    // `/` is a transient locator. Keep the selected process,
-                    // then restore the complete tree for relationship work.
-                    self.finish_search();
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.move_selection(1);
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.move_selection(-1);
-                }
-                KeyCode::PageDown => {
-                    self.move_selection(self.page_size as isize);
-                }
-                KeyCode::PageUp => {
-                    self.move_selection(-(self.page_size as isize));
-                }
-                KeyCode::Left => {
-                    self.reveal_parent();
-                }
-                KeyCode::Right => {
-                    self.toggle_selected_expanded();
-                }
+                KeyCode::Enter => self.apply_search_input(),
                 KeyCode::Backspace => {
-                    self.search.pop();
-                    self.rebuild_visible();
+                    self.search_input.pop();
                 }
                 KeyCode::Char(c) if key.modifiers.is_empty() => {
-                    self.search.push(c);
-                    self.rebuild_visible();
-                    self.select_first_match();
+                    self.search_input.push(c);
                 }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
                 _ => {}
@@ -3146,9 +3456,13 @@ impl App {
             return false;
         }
         match key.code {
+            KeyCode::Esc if !self.search.is_empty() => {
+                self.search.clear();
+                self.rebuild_visible();
+            }
             KeyCode::Char('q') | KeyCode::Esc => return true,
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
-            KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
+            KeyCode::Up => self.move_selection(-1),
             KeyCode::PageDown => self.move_selection(self.page_size as isize),
             KeyCode::PageUp => self.move_selection(-(self.page_size as isize)),
             KeyCode::Left => {
@@ -3157,8 +3471,10 @@ impl App {
             KeyCode::Right => self.toggle_selected_expanded(),
             KeyCode::Char('/') => {
                 self.searching = true;
-                self.search.clear();
-                self.rebuild_visible();
+                self.search_input.clear();
+            }
+            KeyCode::Char(c) if c.is_ascii_digit() && key.modifiers.is_empty() => {
+                self.begin_pid_input(c);
             }
             KeyCode::Char('f') => self.toggle_focus(),
             KeyCode::Char('s') => self.cycle_sort_mode(),
@@ -3194,9 +3510,11 @@ impl App {
             KeyCode::Char('h') => self.open_hotspots(),
             KeyCode::Char('a') => self.open_attention(),
             KeyCode::Char('D') => self.open_dossier_context(),
+            KeyCode::Char('M') => self.open_memory_context(),
             KeyCode::Char('m') => self.open_service_context(),
             KeyCode::Char('v') => self.open_executable_context(),
             KeyCode::Char('l') => self.open_logs_context(),
+            KeyCode::Char('k') => self.open_selected_process_termination(),
             KeyCode::Char('p') => self.open_selected_process_action(),
             KeyCode::Char('?') => self.guidance.open_help(),
             KeyCode::Enter => self.open_inspection(),

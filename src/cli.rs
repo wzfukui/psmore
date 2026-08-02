@@ -9,6 +9,8 @@ pub(crate) enum LaunchMode {
     CheckJson,
     InspectTable,
     InspectJson,
+    MemoryTable,
+    MemoryJson,
     ExeTable,
     ExeJson,
     StaleTable,
@@ -58,6 +60,7 @@ pub(crate) enum LaunchMode {
 pub(crate) enum HelpTopic {
     Check,
     Inspect,
+    Memory,
     Exe,
     Stale,
     Service,
@@ -330,6 +333,8 @@ pub(crate) struct Cli {
     pub(crate) diff_output: Option<String>,
     pub(crate) diff_force: bool,
     pub(crate) inspect_pid: Option<u32>,
+    pub(crate) memory_pid: Option<u32>,
+    pub(crate) memory_limit: Option<usize>,
     pub(crate) exe_pid: Option<u32>,
     pub(crate) exe_hash: bool,
     pub(crate) stale_limit: Option<usize>,
@@ -414,6 +419,8 @@ impl Default for Cli {
             diff_output: None,
             diff_force: false,
             inspect_pid: None,
+            memory_pid: None,
+            memory_limit: Some(20),
             exe_pid: None,
             exe_hash: true,
             stale_limit: Some(100),
@@ -510,6 +517,7 @@ impl Cli {
                 "check" => Some((parse_check(&arguments[1..]), HelpTopic::Check)),
                 "listen" => Some((parse_listen(&arguments[1..]), HelpTopic::Listen)),
                 "inspect" => Some((parse_inspect(&arguments[1..]), HelpTopic::Inspect)),
+                "memory" => Some((parse_memory(&arguments[1..]), HelpTopic::Memory)),
                 "exe" => Some((parse_exe(&arguments[1..]), HelpTopic::Exe)),
                 "stale" => Some((parse_stale(&arguments[1..]), HelpTopic::Stale)),
                 "service" => Some((parse_service(&arguments[1..]), HelpTopic::Service)),
@@ -2744,6 +2752,98 @@ fn set_inspect_output_mode(
     Ok(())
 }
 
+fn parse_memory(arguments: &[String]) -> Result<Cli, String> {
+    let mut cli = Cli {
+        mode: LaunchMode::MemoryTable,
+        ..Cli::default()
+    };
+    let mut output_mode = None;
+    let mut limit_set = false;
+    let mut pids = Vec::new();
+    let mut arguments = arguments.iter().cloned().peekable();
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "-h" | "--help" => cli.mode = LaunchMode::Help,
+            "-V" | "--version" => cli.mode = LaunchMode::Version,
+            "--table" => {
+                set_memory_output_mode(&mut cli.mode, &mut output_mode, LaunchMode::MemoryTable)?
+            }
+            "--json" => {
+                set_memory_output_mode(&mut cli.mode, &mut output_mode, LaunchMode::MemoryJson)?
+            }
+            "--limit" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "memory --limit requires 1-10000 or all".to_string())?;
+                set_memory_limit(&mut cli, &mut limit_set, &value)?;
+            }
+            _ if argument.starts_with("--limit=") => set_memory_limit(
+                &mut cli,
+                &mut limit_set,
+                argument.trim_start_matches("--limit="),
+            )?,
+            _ if argument.starts_with('-') => {
+                return Err(format!("unknown memory option: {argument}"));
+            }
+            _ => pids.push(argument),
+        }
+    }
+    if matches!(cli.mode, LaunchMode::Help | LaunchMode::Version) {
+        return Ok(cli);
+    }
+    if pids.len() != 1 {
+        return Err(format!(
+            "memory requires exactly one PID; received {}",
+            pids.len()
+        ));
+    }
+    let pid = pids[0]
+        .parse::<u32>()
+        .map_err(|_| format!("invalid PID: {}", pids[0]))?;
+    if pid == 0 {
+        return Err("memory requires a real process PID greater than 0".into());
+    }
+    if pid > i32::MAX as u32 {
+        return Err(format!("PID {pid} exceeds the supported system PID range"));
+    }
+    cli.memory_pid = Some(pid);
+    Ok(cli)
+}
+
+fn set_memory_output_mode(
+    mode: &mut LaunchMode,
+    output_mode: &mut Option<LaunchMode>,
+    requested: LaunchMode,
+) -> Result<(), String> {
+    if output_mode.is_some_and(|existing| existing != requested) {
+        return Err("memory --table and --json cannot be used together".into());
+    }
+    *output_mode = Some(requested);
+    if !matches!(mode, LaunchMode::Help | LaunchMode::Version) {
+        *mode = requested;
+    }
+    Ok(())
+}
+
+fn set_memory_limit(cli: &mut Cli, value_set: &mut bool, value: &str) -> Result<(), String> {
+    if *value_set {
+        return Err("memory --limit may only be specified once".into());
+    }
+    cli.memory_limit = if value.eq_ignore_ascii_case("all") {
+        None
+    } else {
+        let limit = value
+            .parse::<usize>()
+            .map_err(|_| format!("invalid memory --limit value: {value}; use 1-10000 or all"))?;
+        if !(1..=10_000).contains(&limit) {
+            return Err("memory --limit must be between 1 and 10000, or all".into());
+        }
+        Some(limit)
+    };
+    *value_set = true;
+    Ok(())
+}
+
 fn parse_exe(arguments: &[String]) -> Result<Cli, String> {
     let mut cli = Cli {
         mode: LaunchMode::ExeTable,
@@ -3792,6 +3892,7 @@ USAGE:
 COMMANDS:
   check       Evaluate a process query as an operations health gate
   inspect     Inspect one process, threads, sockets, files, and context
+  memory      Attribute one process RSS, PSS, swap, regions, and mappings
   explain     Build one prioritized process dossier from multiple evidence sources
   exe         Verify a process executable, disk drift, package, and signing
   stale       Find Linux processes still holding deleted or replaced executables
@@ -3871,6 +3972,29 @@ The PID identity is revalidated after collection; confirmed PID reuse is refused
 EXAMPLES:
   psmore inspect 1234
   psmore inspect 1234 --json > process-1234.json
+"
+        }
+        Some(HelpTopic::Memory) => {
+            "psmore memory - attribute memory for one process instance
+
+USAGE:
+  psmore memory PID [--limit N|all] [--table|--json]
+
+OPTIONS:
+      --limit N|all  Maximum category and mapped-file rows per section [default: 20]
+      --table        Human-readable summary, findings, categories, and mappings [default]
+      --json         Versioned psmore.process-memory JSON
+      --redact       Mask common secret values in the process command line
+
+Linux reads smaps_rollup, status, and maps for RSS/PSS, anonymous/file/shared
+resident memory, swap, limits, virtual categories, and top file mappings.
+macOS uses vmmap summary evidence for physical footprint and resident/dirty/
+swapped region categories. Linux mapped-file bytes are virtual, not resident;
+macOS summary mode does not claim per-file attribution.
+PID identity is revalidated and confirmed reuse is refused.
+EXAMPLES:
+  psmore memory 1234
+  psmore memory 1234 --limit all --json > memory-1234.json
 "
         }
         Some(HelpTopic::Explain) => {
@@ -4424,6 +4548,8 @@ mod tests {
                 diff_output: None,
                 diff_force: false,
                 inspect_pid: None,
+                memory_pid: None,
+                memory_limit: Some(20),
                 exe_pid: None,
                 exe_hash: true,
                 stale_limit: Some(100),
@@ -5076,6 +5202,7 @@ mod tests {
         for (command, topic) in [
             ("check", HelpTopic::Check),
             ("inspect", HelpTopic::Inspect),
+            ("memory", HelpTopic::Memory),
             ("explain", HelpTopic::Explain),
             ("exe", HelpTopic::Exe),
             ("stale", HelpTopic::Stale),
@@ -5317,6 +5444,13 @@ mod tests {
         assert!(Cli::parse(["completion", "powershell"]).is_err());
         assert!(Cli::parse(["completion", "bash", "zsh"]).is_err());
         assert!(Cli::parse(["completion", "--unknown"]).is_err());
+        assert!(Cli::parse(["memory"]).is_err());
+        assert!(Cli::parse(["memory", "0"]).is_err());
+        assert!(Cli::parse(["memory", "1", "2"]).is_err());
+        assert!(Cli::parse(["memory", "1", "--table", "--json"]).is_err());
+        assert!(Cli::parse(["memory", "1", "--limit=0"]).is_err());
+        assert!(Cli::parse(["memory", "1", "--limit=10001"]).is_err());
+        assert!(Cli::parse(["memory", "1", "--limit=1", "--limit=all"]).is_err());
     }
 
     #[test]
@@ -5327,6 +5461,7 @@ mod tests {
         for (topic, command) in [
             (HelpTopic::Check, "check"),
             (HelpTopic::Inspect, "inspect"),
+            (HelpTopic::Memory, "memory"),
             (HelpTopic::Explain, "explain"),
             (HelpTopic::Exe, "exe"),
             (HelpTopic::Stale, "stale"),

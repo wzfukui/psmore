@@ -111,6 +111,9 @@ grep -q 'logs' "$prefix/share/fish/vendor_completions.d/psmore.fish" || fail 'fi
 grep -q 'explain' "$prefix/share/bash-completion/completions/psmore" || fail 'bash completion is missing the explain command'
 grep -q 'explain' "$prefix/share/zsh/site-functions/_psmore" || fail 'zsh completion is missing the explain command'
 grep -q 'explain' "$prefix/share/fish/vendor_completions.d/psmore.fish" || fail 'fish completion is missing the explain command'
+grep -q 'memory' "$prefix/share/bash-completion/completions/psmore" || fail 'bash completion is missing the memory command'
+grep -q 'memory' "$prefix/share/zsh/site-functions/_psmore" || fail 'zsh completion is missing the memory command'
+grep -q 'memory' "$prefix/share/fish/vendor_completions.d/psmore.fish" || fail 'fish completion is missing the memory command'
 file_report="$temp_dir/file-report.json"
 "$prefix/bin/psmore" file "$prefix/bin/psmore" --json --limit 1 > "$file_report"
 grep -q '"schema": "psmore.file-usage"' "$file_report" || fail 'installed file command returned an unexpected schema'
@@ -122,6 +125,11 @@ grep -q '"schema": "psmore.service-context"' "$service_report" || fail 'installe
 exe_report="$temp_dir/exe-report.json"
 "$prefix/bin/psmore" exe "$$" --json --no-hash > "$exe_report"
 grep -q '"schema": "psmore.executable-image"' "$exe_report" || fail 'installed exe command returned an unexpected schema'
+
+memory_report="$temp_dir/memory-report.json"
+"$prefix/bin/psmore" memory "$$" --json --limit 1 > "$memory_report"
+grep -q '"schema": "psmore.process-memory"' "$memory_report" || fail 'installed memory command returned an unexpected schema'
+grep -q '"process_identity": "verified"' "$memory_report" || fail 'installed memory command did not verify the target process identity'
 
 logs_report="$temp_dir/logs-report.json"
 "$prefix/bin/psmore" logs "$$" --scope process --since 1s --limit 1 --json > "$logs_report"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise psmore's dossier and raw-evidence workspaces in a real PTY."""
+"""Exercise PID location, safe actions, and evidence workspaces in a real PTY."""
 
 from __future__ import annotations
 
@@ -67,12 +67,27 @@ def main() -> int:
         fail(f"timed out waiting for {needle!r}; terminal tail:\n{tail}")
 
     try:
-        time.sleep(0.5)
-        os.write(master, f"/pid:{pid}\r".encode())
+        read_until(b"digits PID", 10.0)
+        os.write(master, f"{pid}".encode())
+        time.sleep(0.2)
+        os.write(master, b"\r")
+        read_until(f"[{pid}]".encode(), 5.0)
+        os.write(master, b"/")
+        os.write(master, f"pid:{pid}".encode())
+        time.sleep(0.2)
+        os.write(master, b"\r")
         time.sleep(0.2)
         os.write(master, b"D")
         read_until(b"PSMORE PROCESS DOSSIER", 30.0)
         read_until(b"EVIDENCE OVERVIEW", 5.0)
+
+        os.write(master, b"M")
+        read_until(b"PSMORE PROCESS MEMORY", 30.0)
+        read_until(b"sampled RSS", 5.0)
+        read_until(b"MEMORY CATEGORIES", 5.0)
+
+        os.write(master, b"D")
+        read_until(b"PSMORE PROCESS DOSSIER", 30.0)
 
         os.write(master, b"v")
         read_until(b"PSMORE EXECUTABLE IMAGE", 25.0)
@@ -89,6 +104,13 @@ def main() -> int:
         os.write(master, b"m")
         read_until(b"PSMORE SERVICE CONTEXT", 25.0)
 
+        os.write(master, b"m")
+        time.sleep(0.2)
+        os.write(master, b"k")
+        read_until(f"[{pid}]".encode(), 5.0)
+        read_until(b"No signal is sent here", 5.0)
+        os.write(master, b"\r")
+        read_until(b"Press y to send the signal", 5.0)
         os.write(master, b"q")
         process.wait(timeout=5.0)
         if process.returncode != 0:
@@ -106,7 +128,10 @@ def main() -> int:
     finally:
         os.close(master)
 
-    print(f"Verified TUI dossier -> image -> manager -> logs -> manager workflow for PID {pid}")
+    print(
+        "Verified TUI PID locate -> delayed search apply -> dossier -> memory -> dossier -> image -> "
+        f"manager -> logs -> manager -> two-step end dialog for PID {pid}"
+    )
     return 0
 
 

@@ -36,13 +36,22 @@ to require consecutive passing evaluations.
 Inspect one process, its runtime context, threads, sockets, files, limits, and
 security evidence.
 .TP
+.B memory PID
+Attribute one process instance's memory. Linux reports precise RSS, PSS,
+anonymous, file, shared, private, swap, virtual-region, and mapped-file
+evidence. macOS reports physical footprint and vmmap resident, dirty, and
+swapped categories. Use
+.B --limit
+to bound category and mapped-file rows per section.
+.TP
 .B explain PID
 Build one process dossier by collecting inspection, service-manager,
 executable-image, and bounded native-log evidence in parallel. Rank review
 signals by severity while retaining each source report and its coverage. It
-also reports conservative CPU-sample, thread/socket volume, open-file soft-limit,
-and Linux systemd TasksMax/MemoryMax pressure signals when the required evidence
-is visible. A sampled CPU signal is not treated as sustained load.
+also reports conservative CPU-sample, thread/socket volume, open-file
+soft-limit, and Linux systemd TasksMax/MemoryMax pressure signals when the
+required evidence is visible. A sampled CPU signal is not treated as sustained
+load.
 Use
 .B --no-logs
 or
@@ -275,25 +284,43 @@ Show global or command-specific help.
 Show the psmore version.
 .SH TUI KEYS
 .TP
-.BR Up / Down , " j / k"
+.BR Up / Down
 Move the selection. The viewport follows the selected row.
 .TP
 .BR Left / Right
 Reveal parent context or expand/collapse the selected process subtree.
 .TP
+.B 0-9
+Start direct PID entry. Enter locates the exact process and restores the full
+tree with its ancestor path exposed; Backspace edits and Escape cancels.
+.TP
 .B /
-Search and locate matching processes. Enter accepts the located result; normal
-navigation leaves locate mode while retaining the result context.
+Enter search input without changing the current tree. While editing, all
+printable characters including j and k belong to the query. Enter applies the
+query and returns to selection mode; k can then act on the selected result.
+Escape cancels input, or clears an already active search.
 .TP
 .B Space
 Pause or resume live refresh.
 .TP
+.B k
+Open the focused end-process dialog for the selected process. Choose graceful
+TERM or immediate KILL, review the target, then press y on the second screen to
+send the signal. The PID start time is revalidated before every action.
+.TP
 .B D
 Build a process dossier for the selected process in the background. The panel
 prioritizes signals from deep inspection, service ownership, executable-image,
-and bounded native-log evidence. Enter or r refreshes; i, m, v, and l open the
-corresponding raw evidence; L toggles log collection; h toggles SHA-256; D or
-Escape closes the workspace.
+and bounded native-log evidence. Enter or r refreshes; i, M, m, v, and l open
+related evidence; L toggles log collection; h toggles SHA-256; D or Escape
+closes the workspace.
+.TP
+.B M
+Open memory attribution for the selected process in the background. Linux
+separates RSS, PSS, anonymous/file/shared pages, swap, virtual categories, and
+mapped files; macOS separates physical footprint from shared-inclusive vmmap
+region totals. Enter or r refreshes; D opens the process dossier; M or Escape
+closes the workspace.
 .TP
 .B m
 Open the selected process service-context workspace. Resolve the owning systemd
@@ -386,15 +413,33 @@ scan. psmore and its collection helper are excluded. Incomplete visibility is
 reported explicitly and never used to prove that a path has no users.
 .PP
 The
+.B memory
+command is read-only and revalidates PID identity after collection. Linux
+reads
+.IR /proc/PID/smaps_rollup ,
+.IR /proc/PID/status ,
+and
+.IR /proc/PID/maps .
+Its category and mapped-file byte counts are virtual address ranges, not
+resident attribution. macOS uses
+.BR vmmap (1)
+summary mode; physical footprint and region resident bytes are reported as
+different measures because region totals include shared mappings. Missing or
+permission-limited evidence remains explicit. The versioned
+.B psmore.process-memory
+report can contain commands, users, memory layout, and mapped paths.
+.PP
+The
 .B explain
 command runs the process inspection, service-manager, executable-image, and
 native-log collectors in parallel. It validates every nested PID and start time
 against one initial process identity and refreshes the target after collection;
 confirmed PID reuse is refused. Partial evidence remains visible and is never
 treated as proof of absence. Ranked signals are review priorities with stable
-codes and JSON evidence paths, not asserted root causes. Open-file pressure uses
-visible descriptor counts against RLIMIT_NOFILE; systemd task and memory pressure
-signals use TasksCurrent/TasksMax and MemoryCurrent/MemoryMax. The versioned
+codes and JSON evidence paths, not asserted root causes. Open-file pressure
+uses visible descriptor counts against RLIMIT_NOFILE; systemd task and memory
+pressure signals use TasksCurrent/TasksMax and MemoryCurrent/MemoryMax. The
+versioned
 .B psmore.process-dossier
 report can contain all sensitive fields from its source reports.
 .PP

@@ -15,6 +15,7 @@ mod headless_file;
 mod headless_inspect;
 mod headless_listen;
 mod headless_logs;
+mod headless_memory;
 mod headless_net;
 mod headless_oom;
 mod headless_port;
@@ -84,6 +85,7 @@ use crate::{
         ListenPolicyStatus, capture_listeners, render_listeners_json, render_listeners_table,
     },
     headless_logs::{capture_logs, render_logs_json, render_logs_table},
+    headless_memory::{capture_memory, render_memory_json, render_memory_table},
     headless_net::{
         NetPolicyStatus, capture_network_connections, render_network_json, render_network_table,
     },
@@ -357,6 +359,24 @@ fn main() -> ExitCode {
                     LaunchMode::InspectTable => render_inspection_table(&inspection),
                     LaunchMode::InspectJson => {
                         render_inspection_json(&inspection).map_err(io::Error::other)?
+                    }
+                    _ => unreachable!(),
+                };
+                write_stdout(&output)?;
+                Ok(())
+            })();
+            runtime_result(result)
+        }
+        LaunchMode::MemoryTable | LaunchMode::MemoryJson => {
+            let Some(pid) = cli.memory_pid else {
+                return usage_error("memory requires exactly one PID");
+            };
+            let result = (|| -> Result<(), Box<dyn Error>> {
+                let captured = capture_memory(pid, cli.memory_limit).map_err(io::Error::other)?;
+                let output = match cli.mode {
+                    LaunchMode::MemoryTable => render_memory_table(&captured),
+                    LaunchMode::MemoryJson => {
+                        render_memory_json(&captured).map_err(io::Error::other)?
                     }
                     _ => unreachable!(),
                 };
@@ -2078,6 +2098,15 @@ Max address space         unlimited            unlimited            bytes\n";
             },
             "hashing_enabled": true
         });
+        let memory_context = serde_json::json!({
+            "schema": "psmore.process-memory",
+            "schema_version": 1,
+            "process": { "pid": 42, "name": "worker" },
+            "summary": {
+                "resident_bytes": 67108864,
+                "proportional_set_size_bytes": 50331648
+            }
+        });
         let logs_context = serde_json::json!({
             "schema": "psmore.process-logs",
             "schema_version": 1,
@@ -2119,6 +2148,8 @@ Max address space         unlimited            unlimited            bytes\n";
                 service_context_in_progress: false,
                 executable_context: Some(&executable_context),
                 executable_context_in_progress: false,
+                memory_context: Some(&memory_context),
+                memory_context_in_progress: false,
                 logs_context: Some(&logs_context),
                 logs_context_in_progress: false,
                 dossier_context: Some(&dossier_context),
@@ -2134,7 +2165,7 @@ Max address space         unlimited            unlimited            bytes\n";
                 .expect("parse exported report");
 
         assert_eq!(report["schema"], "psmore.diagnostic-report");
-        assert_eq!(report["schema_version"], 7);
+        assert_eq!(report["schema_version"], 8);
         assert_eq!(report["tool"]["name"], "psmore");
         assert_eq!(report["platform"], platform_name());
         assert_eq!(report["selected_pid"], 42);
@@ -2155,11 +2186,11 @@ Max address space         unlimited            unlimited            bytes\n";
             false
         );
         assert_eq!(
-            report["collection_status"]["logs_context_in_progress"],
+            report["collection_status"]["memory_context_in_progress"],
             false
         );
         assert_eq!(
-            report["collection_status"]["dossier_context_in_progress"],
+            report["collection_status"]["logs_context_in_progress"],
             false
         );
         assert_eq!(
@@ -2218,6 +2249,14 @@ Max address space         unlimited            unlimited            bytes\n";
         assert_eq!(
             report["selected_executable_context"]["comparison"]["status"],
             "same_image"
+        );
+        assert_eq!(
+            report["selected_memory_context"]["schema"],
+            "psmore.process-memory"
+        );
+        assert_eq!(
+            report["selected_memory_context"]["summary"]["proportional_set_size_bytes"],
+            50_331_648
         );
         assert_eq!(
             report["selected_logs_context"]["schema"],

@@ -351,8 +351,12 @@ fn draw_process_action_overlay(frame: &mut Frame, app: &App, area: Rect) {
             ]),
         ]);
     } else {
-        title = " process actions  ↑↓/Tab choose  Enter confirm  Esc/p close ".into();
-        for (index, action) in ProcessActionKind::ALL.iter().copied().enumerate() {
+        title = if dialog.is_termination_only() {
+            " end process  ↑↓/Tab choose  Enter review  Esc close ".into()
+        } else {
+            " process actions  ↑↓/Tab choose  Enter review  Esc/p close ".into()
+        };
+        for (index, action) in dialog.actions().iter().copied().enumerate() {
             let marker = if index == dialog.selected { "▸" } else { " " };
             let style = if index == dialog.selected {
                 Style::default()
@@ -375,7 +379,7 @@ fn draw_process_action_overlay(frame: &mut Frame, app: &App, area: Rect) {
         lines.extend([
             Line::from(""),
             Line::from(Span::styled(
-                "Every action requires a separate y confirmation and is recorded in activity/report.",
+                "No signal is sent here: review the next screen, then press y to confirm.",
                 Style::default().fg(Color::DarkGray),
             )),
         ]);
@@ -617,7 +621,7 @@ fn draw_inspection_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         .min(u16::MAX as usize) as u16;
     app.inspection_scroll = app.inspection_scroll.min(max_scroll);
     let title = format!(
-        " inspect {} [{}]{}  Enter/r refresh  ↑↓ scroll  D dossier  Esc close ",
+        " inspect {} [{}]{}  Enter/r refresh  ↑↓ scroll  M memory  D dossier  Esc close ",
         inspection.name, inspection.pid, inspection_status
     );
     frame.render_widget(Clear, popup);
@@ -736,7 +740,7 @@ fn draw_dossier_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
     };
     let hash = if panel.hash { "hash on" } else { "hash off" };
     let title = format!(
-        " dossier {} [{}]{}  {}  {}  r refresh  s/p/w logs  h hash  L logs  i/m/v/l evidence  D/Esc close ",
+        " dossier {} [{}]{}  {}  {}  r refresh  s/p/w logs  h hash  L logs  i/M/m/v/l evidence  D/Esc close ",
         panel.name, panel.pid, scanning, logs, hash
     );
     frame.render_widget(Clear, popup);
@@ -744,6 +748,106 @@ fn draw_dossier_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         Paragraph::new(lines)
             .block(Block::default().borders(Borders::ALL).title(title))
             .scroll((app.dossier_context_scroll, 0))
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
+fn draw_memory_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
+    let Some(panel) = app.memory_context.clone() else {
+        return;
+    };
+    let width = area.width.saturating_sub(2).clamp(1, 160);
+    let height = area.height.saturating_sub(2).max(1);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let mut lines = Vec::new();
+    if app.memory_context_is_scanning() {
+        let elapsed = app.memory_context_elapsed();
+        lines.push(Line::from(Span::styled(
+            format!(
+                " {} attributing process memory in the background ({:.1}s)",
+                activity_spinner(elapsed),
+                elapsed.as_secs_f64()
+            ),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+    }
+    if let Some(warning) = panel.warning.as_deref() {
+        lines.push(Line::from(Span::styled(
+            format!(" WARNING  {warning}"),
+            Style::default().fg(Color::LightRed),
+        )));
+        lines.push(Line::from(""));
+    }
+    for line in panel.content.lines() {
+        let trimmed = line.trim_start();
+        let style = if line.starts_with("PSMORE PROCESS MEMORY")
+            || matches!(line, "ATTENTION" | "COLLECTION SOURCES")
+            || line.starts_with("MEMORY CATEGORIES")
+            || line.starts_with("TOP FILE MAPPINGS")
+        {
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD)
+        } else if trimmed.starts_with("WARN") || line.starts_with("warning ") {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else if trimmed.starts_with("NOTE") {
+            Style::default().fg(Color::LightCyan)
+        } else if line.starts_with("process ")
+            || line.starts_with("collection ")
+            || line.starts_with("sampled RSS ")
+            || line.starts_with("peak RSS ")
+            || line.starts_with("anonymous ")
+            || line.starts_with("virtual layout ")
+        {
+            Style::default().fg(Color::LightGreen)
+        } else if trimmed.starts_with("CATEGORY") || trimmed.starts_with("VIRTUAL") {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(Span::styled(line.to_owned(), style)));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " No process memory evidence available",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    let content_height = height.saturating_sub(2) as usize;
+    let content_width = width.saturating_sub(2).max(1) as usize;
+    let visual_lines = lines
+        .iter()
+        .map(|line| line.width().max(1).div_ceil(content_width))
+        .sum::<usize>();
+    let max_scroll = visual_lines
+        .saturating_sub(content_height)
+        .min(u16::MAX as usize) as u16;
+    app.memory_context_scroll = app.memory_context_scroll.min(max_scroll);
+    let scanning = if app.memory_context_is_scanning() {
+        "  scanning"
+    } else {
+        ""
+    };
+    let title = format!(
+        " memory {} [{}]{}  Enter/r refresh  ↑↓ scroll  D dossier  i/m/v/l evidence  M/Esc close ",
+        panel.name, panel.pid, scanning
+    );
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .scroll((app.memory_context_scroll, 0))
             .wrap(Wrap { trim: false }),
         popup,
     );
@@ -825,7 +929,7 @@ fn draw_service_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         ""
     };
     let title = format!(
-        " manager {} [{}]{}  Enter/r refresh  ↑↓ scroll  D dossier  v verify  l logs  m/Esc close ",
+        " manager {} [{}]{}  Enter/r refresh  ↑↓ scroll  M memory  D dossier  v verify  l logs  m/Esc close ",
         panel.name, panel.pid, scanning
     );
     frame.render_widget(Clear, popup);
@@ -925,7 +1029,7 @@ fn draw_executable_context_overlay(frame: &mut Frame, app: &mut App, area: Rect)
     };
     let hash = if panel.hash { "hash on" } else { "hash off" };
     let title = format!(
-        " verify image {} [{}]{}  {}  Enter/r refresh  h hash  D dossier  m manager  l logs  v/Esc close ",
+        " verify image {} [{}]{}  {}  Enter/r refresh  h hash  M memory  D dossier  m manager  l logs  v/Esc close ",
         panel.name, panel.pid, scanning, hash
     );
     frame.render_widget(Clear, popup);
@@ -1028,7 +1132,7 @@ fn draw_logs_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         ""
     };
     let title = format!(
-        " logs {} [{}]{}  scope {}  <= {}  {}  r refresh  s scope  p level  w window  D dossier  m/v context  l/Esc close ",
+        " logs {} [{}]{}  scope {}  <= {}  {}  r refresh  s scope  p level  w window  M memory  D dossier  m/v context  l/Esc close ",
         panel.name,
         panel.pid,
         scanning,
@@ -2151,11 +2255,12 @@ fn guidance_page(page: usize) -> Vec<Line<'static>> {
                 Style::default().fg(Color::Gray),
             )),
             Line::from(""),
-            guidance_key("↑↓ / j k", "move through stable process rows"),
+            guidance_key("↑ / ↓", "move through stable process rows"),
             guidance_key("← / →", "reveal parent; expand or collapse children"),
+            guidance_key("0-9", "type a PID, then press Enter to locate it directly"),
             guidance_key(
                 "/",
-                "find by text or query CPU, memory, age, user, and subtree",
+                "type a query, then Enter to apply it and select results",
             ),
             guidance_key("f", "focus the selected parent chain and service subtree"),
             guidance_key(
@@ -2192,6 +2297,7 @@ fn guidance_page(page: usize) -> Vec<Line<'static>> {
                 "systemd or launchd ownership, state, config, and next commands",
             ),
             guidance_key("l", "bounded native logs for this process or service"),
+            guidance_key("M", "attribute RSS, PSS, swap, regions, and mapped files"),
             guidance_key("D", "one process dossier with prioritized evidence"),
             guidance_key("b / d / x", "capture baseline, compare, and clear"),
             guidance_key("Space / r", "freeze the scene; sample manually"),
@@ -2209,6 +2315,7 @@ fn guidance_page(page: usize) -> Vec<Line<'static>> {
                 Style::default().fg(Color::Gray),
             )),
             Line::from(""),
+            guidance_key("k", "end the selected process through a two-step dialog"),
             guidance_key("p", "TERM, KILL, STOP, or CONT with explicit confirmation"),
             guidance_key("e", "recent process changes and action audit"),
             guidance_key("o", "export a private, versioned diagnostic report"),
@@ -2217,7 +2324,7 @@ fn guidance_page(page: usize) -> Vec<Line<'static>> {
             guidance_key("q / Ctrl-C", "leave psmore"),
             Line::from(""),
             Line::from(Span::styled(
-                " CLI companions: doctor, explain, inspect, exe, service, logs, tree, net, trace, diff",
+                " CLI companions: doctor, explain, inspect, memory, exe, service, logs, tree, net, trace, diff",
                 Style::default().fg(Color::Yellow),
             )),
         ],
@@ -2365,17 +2472,25 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         ])
         .split(area);
     app.page_size = chunks[0].height.saturating_sub(2).max(1) as usize;
-    let mut title = match (&app.focus, app.searching) {
-        (Some(pid), true) => format!(" psmore  focus={}  search: {}", pid, app.search),
-        (Some(pid), false) if !app.search.is_empty() => {
-            format!(" psmore  focus={}  filter: {}", pid, app.search)
+    let mut title = if let Some(pid_input) = &app.pid_input {
+        format!(" psmore  locate PID: {pid_input}")
+    } else {
+        match (&app.focus, app.searching) {
+            (Some(pid), true) => {
+                format!(" psmore  focus={}  search input: {}", pid, app.search_input)
+            }
+            (Some(pid), false) if !app.search.is_empty() => {
+                format!(" psmore  focus={}  filter: {}", pid, app.search)
+            }
+            (Some(pid), false) => format!(" psmore  focus={} ", pid),
+            (None, true) => format!(" psmore  search input: {}", app.search_input),
+            (None, false) if !app.search.is_empty() => format!(" psmore  filter: {}", app.search),
+            (None, false) => format!(" psmore  {} process relationships ", platform_name()),
         }
-        (Some(pid), false) => format!(" psmore  focus={} ", pid),
-        (None, true) => format!(" psmore  search: {}", app.search),
-        (None, false) if !app.search.is_empty() => format!(" psmore  filter: {}", app.search),
-        (None, false) => format!(" psmore  {} process relationships ", platform_name()),
     };
-    if !app.search.is_empty() {
+    if let Some(error) = &app.pid_input_error {
+        title.push_str(&format!("  {error} "));
+    } else if !app.searching && !app.search.is_empty() {
         if let Some(error) = &app.search_error {
             title.push_str(&format!("  query error: {error} "));
         } else {
@@ -2426,7 +2541,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
                     path_width,
                 )
             );
-            let same_name_as_selected = app.searching
+            let same_name_as_selected = !app.search.is_empty()
                 && Some(row.pid) != selected_pid
                 && selected_name
                     .as_deref()
@@ -2540,16 +2655,14 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         .as_ref()
         .map(|baseline| format!("base {}s", baseline.captured_at.elapsed().as_secs()))
         .unwrap_or_else(|| "no base".into());
-    let shortcut_line = if app.searching {
-        if let Some(error) = &app.search_error {
-            format!(" query error: {error} | Backspace edit | Enter finish | Esc clear ")
-        } else {
-            " query: words | name:/user:/state: | cpu>20 | mem>500m | tree.mem>2g | !negate | Enter finish | Esc clear ".into()
-        }
+    let shortcut_line: String = if app.pid_input.is_some() {
+        " PID: type digits | Enter locate | Backspace edit | Esc cancel ".into()
+    } else if app.searching {
+        " search input (tree unchanged): words | name:/user:/state: | cpu>20 | mem>500m | tree.mem>2g | Enter apply | Esc cancel ".into()
     } else if !app.search.is_empty() {
-        " filter active | / new search or clear | ↑↓/jk move | Enter inspect | q quit ".into()
+        " search active | ↑↓ move | k end selected | / new search | Esc clear | Enter inspect | q quit ".into()
     } else {
-        " ↑↓/jk move | ←/→ tree | / find | D dossier | a attention | h hot | m manager | v image | l logs | p actions | t trend | n network | b base | d diff | o report | ? help ".into()
+        " ↑↓ move | ←/→ tree | digits PID | / find | k end | p actions | D dossier | M memory | a attention | h hot | m manager | v image | l logs | ? help ".into()
     };
     let footer = Paragraph::new(vec![
         Line::from(format!(
@@ -2585,6 +2698,8 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         draw_trend_overlay(frame, app, area);
     } else if app.dossier_context.is_some() {
         draw_dossier_context_overlay(frame, app, area);
+    } else if app.memory_context.is_some() {
+        draw_memory_context_overlay(frame, app, area);
     } else if app.logs_context.is_some() {
         draw_logs_context_overlay(frame, app, area);
     } else if app.executable_context.is_some() {
@@ -2605,12 +2720,21 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        process::{Child, Command},
+        thread,
+        time::Duration,
+    };
+
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::*;
     use crate::{
-        app::{DossierContextPanel, ExecutableContextPanel, LogsContextPanel, ServiceContextPanel},
+        app::{
+            DossierContextPanel, ExecutableContextPanel, LogsContextPanel, MemoryContextPanel,
+            ServiceContextPanel,
+        },
         cli::{LogPriority, LogScope},
         onboarding::{Guidance, TIPS},
     };
@@ -2627,6 +2751,15 @@ mod tests {
             output.push('\n');
         }
         output
+    }
+
+    struct ChildGuard(Child);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
 
     #[test]
@@ -2812,6 +2945,68 @@ mod tests {
     }
 
     #[test]
+    fn memory_context_overlay_renders_scrolls_and_closes() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        let current_pid = sysinfo::get_current_pid().unwrap();
+        app.memory_context = Some(MemoryContextPanel {
+            pid: current_pid,
+            name: "worker".into(),
+            content: [
+                "PSMORE PROCESS MEMORY",
+                "process worker [42]  user deploy  state Run  identity verified",
+                "collection complete  sources 3/3",
+                "sampled RSS 640 MiB  precise RSS 638 MiB  PSS 600 MiB  footprint unknown  virtual 2.00 GiB",
+                "anonymous 600 MiB  file 38 MiB  shmem 0 B  private 610 MiB  shared 28 MiB  swap 64 MiB  locked 0 B",
+                "ATTENTION",
+                "  WARN memory.swap_present              64 MiB is swapped",
+                "MEMORY CATEGORIES  returned 2/2",
+                "  heap                              1.00 GiB      unknown      unknown      unknown       20",
+            ]
+            .join("\n"),
+            report: Some(serde_json::json!({"schema": "psmore.process-memory"})),
+            warning: None,
+        });
+        let backend = TestBackend::new(130, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let output = buffer_text(&terminal);
+        assert!(output.contains(&format!("memory worker [{current_pid}]")));
+        assert!(output.contains("memory.swap_present"));
+        assert!(output.contains("MEMORY CATEGORIES"));
+
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.memory_context_scroll, 1);
+        app.on_key(KeyEvent::new(KeyCode::Char('M'), KeyModifiers::NONE));
+        assert!(app.memory_context.is_none());
+        assert!(!app.memory_context_is_scanning());
+    }
+
+    #[test]
+    fn memory_key_opens_context_for_the_selected_process() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        let current_pid = sysinfo::get_current_pid().unwrap();
+        app.selected = app
+            .visible
+            .iter()
+            .position(|row| row.pid == current_pid)
+            .expect("current test process should be visible");
+
+        app.on_key(KeyEvent::new(KeyCode::Char('M'), KeyModifiers::NONE));
+        let panel = app
+            .memory_context
+            .as_ref()
+            .expect("M should open process memory context");
+        assert_eq!(panel.pid, current_pid);
+        assert!(app.memory_context_is_scanning());
+
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.memory_context.is_none());
+        assert!(!app.memory_context_is_scanning());
+    }
+
+    #[test]
     fn executable_context_overlay_renders_toggles_hash_and_closes() {
         let mut app = App::new_for_test(Guidance::welcome_for_test());
         app.guidance.overlay = None;
@@ -2945,6 +3140,151 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.logs_context.is_none());
         assert!(!app.logs_context_is_scanning());
+    }
+
+    #[test]
+    fn typing_digits_locates_an_exact_pid_and_restores_the_full_tree() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        let current_pid = sysinfo::get_current_pid().unwrap();
+        let current_pid_text = current_pid.to_string();
+
+        for digit in current_pid_text.chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(digit), KeyModifiers::NONE));
+        }
+        assert_eq!(app.pid_input.as_deref(), Some(current_pid_text.as_str()));
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(buffer_text(&terminal).contains("locate PID:"));
+
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.pid_input.is_none());
+        assert!(app.search.is_empty());
+        assert_eq!(app.selected_pid(), Some(current_pid));
+        assert!(app.visible.iter().any(|row| row.pid == current_pid));
+    }
+
+    #[test]
+    fn search_editing_treats_j_and_k_as_text_not_process_shortcuts() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        let visible_before: Vec<Pid> = app.visible.iter().map(|row| row.pid).collect();
+        app.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        for character in "jdk".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+
+        assert!(app.searching);
+        assert_eq!(app.search_input, "jdk");
+        assert!(app.search.is_empty());
+        assert_eq!(
+            app.visible.iter().map(|row| row.pid).collect::<Vec<_>>(),
+            visible_before
+        );
+        assert!(app.process_action.is_none());
+
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.searching);
+        assert!(app.search_input.is_empty());
+        assert_eq!(app.search, "jdk");
+        assert!(app.process_action.is_none());
+
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.search.is_empty());
+    }
+
+    #[test]
+    fn missing_pid_stays_editable_until_cancelled() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        for digit in u32::MAX.to_string().chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(digit), KeyModifiers::NONE));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.pid_input.is_some());
+        assert!(
+            app.pid_input_error
+                .as_deref()
+                .is_some_and(|error| error.contains("not visible"))
+        );
+
+        app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert!(app.pid_input_error.is_none());
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.pid_input.is_none());
+    }
+
+    #[test]
+    fn kill_key_requires_second_confirmation_before_sending_a_signal() {
+        let child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn isolated target process");
+        let mut child = ChildGuard(child);
+        let pid = Pid::from_u32(child.0.id());
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        app.refresh();
+        let visible_before: Vec<Pid> = app.visible.iter().map(|row| row.pid).collect();
+        app.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        for character in format!("pid:{pid}").chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        assert!(app.search.is_empty());
+        assert_eq!(
+            app.visible.iter().map(|row| row.pid).collect::<Vec<_>>(),
+            visible_before
+        );
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.selected_pid(), Some(pid));
+        assert!(!app.searching);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        let dialog = app.process_action.as_ref().expect("k should open a dialog");
+        assert!(dialog.is_termination_only());
+        assert_eq!(dialog.actions(), &ProcessActionKind::TERMINATION);
+        assert_eq!(dialog.selected_action(), ProcessActionKind::Terminate);
+        assert!(!dialog.confirming);
+
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.process_action.as_ref().unwrap().confirming);
+        assert!(child.0.try_wait().expect("check child").is_none());
+
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        let dialog = app.process_action.as_ref().unwrap();
+        assert_eq!(dialog.selected_action(), ProcessActionKind::Kill);
+        assert!(dialog.confirming);
+        assert!(child.0.try_wait().expect("check child again").is_none());
+
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.process_action.is_none());
+        assert!(app.action_history.is_empty());
+
+        app.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(child.0.try_wait().expect("check before y").is_none());
+        app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(app.process_action.is_none());
+        assert_eq!(app.action_history.len(), 1);
+        assert_eq!(app.action_history[0].outcome, ProcessActionOutcome::Sent);
+        let exited = (0..50).any(|_| {
+            if child
+                .0
+                .try_wait()
+                .expect("check confirmed target")
+                .is_some()
+            {
+                true
+            } else {
+                thread::sleep(Duration::from_millis(10));
+                false
+            }
+        });
+        assert!(exited, "confirmed TERM did not stop the isolated target");
     }
 
     #[test]

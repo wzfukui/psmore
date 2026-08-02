@@ -14,6 +14,7 @@ pub(crate) enum ProcessActionKind {
 
 impl ProcessActionKind {
     pub(crate) const ALL: [Self; 4] = [Self::Terminate, Self::Kill, Self::Stop, Self::Continue];
+    pub(crate) const TERMINATION: [Self; 2] = [Self::Terminate, Self::Kill];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -52,6 +53,12 @@ impl ProcessActionKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProcessActionDialogMode {
+    All,
+    Termination,
+}
+
 impl fmt::Display for ProcessActionKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.label())
@@ -82,11 +89,24 @@ pub(crate) struct ProcessActionDialog {
     pub(crate) target: ProcessActionTarget,
     pub(crate) selected: usize,
     pub(crate) confirming: bool,
+    pub(crate) mode: ProcessActionDialogMode,
 }
 
 impl ProcessActionDialog {
+    pub(crate) fn actions(&self) -> &'static [ProcessActionKind] {
+        match self.mode {
+            ProcessActionDialogMode::All => &ProcessActionKind::ALL,
+            ProcessActionDialogMode::Termination => &ProcessActionKind::TERMINATION,
+        }
+    }
+
+    pub(crate) fn is_termination_only(&self) -> bool {
+        self.mode == ProcessActionDialogMode::Termination
+    }
+
     pub(crate) fn selected_action(&self) -> ProcessActionKind {
-        ProcessActionKind::ALL[self.selected.min(ProcessActionKind::ALL.len() - 1)]
+        let actions = self.actions();
+        actions[self.selected.min(actions.len() - 1)]
     }
 }
 

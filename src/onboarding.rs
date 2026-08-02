@@ -34,7 +34,7 @@ pub(crate) const TIPS: &[Tip] = &[
     Tip {
         title: "Query the whole service tree",
         body: "Filters understand aggregated descendants. Try tree.mem>2g or tree.procs>=20 to find heavyweight service boundaries.",
-        keys: "/ query  |  Enter finish locator",
+        keys: "/ input  |  Enter apply query  |  Esc clear result",
     },
     Tip {
         title: "Find evidence before guessing",
@@ -77,6 +77,11 @@ pub(crate) const TIPS: &[Tip] = &[
         keys: "l logs  |  s scope  |  p priority  |  w window",
     },
     Tip {
+        title: "Attribute memory instead of guessing",
+        body: "Separate RSS, PSS, physical footprint, anonymous/file/shared pages, swap, and virtual mappings. Linux also ranks mapped files; macOS ranks vmmap regions.",
+        keys: "M memory  |  r refresh  |  Up/Down scroll",
+    },
+    Tip {
         title: "Build one process dossier",
         body: "Collect process, service-manager, executable-image, and bounded log evidence in parallel, then review prioritized signals without losing their source paths.",
         keys: "D dossier  |  r refresh  |  L logs on/off  |  h hash",
@@ -88,8 +93,8 @@ pub(crate) const TIPS: &[Tip] = &[
     },
     Tip {
         title: "Process actions are identity-safe",
-        body: "TERM, KILL, STOP, and CONT require a second confirmation and re-check PID start time before sending a signal.",
-        keys: "p actions  |  y confirm  |  Esc cancel",
+        body: "Use k for the focused TERM/KILL dialog or p for all actions. Every signal requires a separate confirmation and a PID start-time re-check.",
+        keys: "k end  |  p actions  |  y confirm  |  Esc cancel",
     },
 ];
 

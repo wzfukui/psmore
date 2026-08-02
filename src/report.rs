@@ -24,7 +24,7 @@ use crate::{
 };
 
 const REPORT_SCHEMA: &str = "psmore.diagnostic-report";
-const REPORT_SCHEMA_VERSION: u32 = 7;
+const REPORT_SCHEMA_VERSION: u32 = 8;
 
 pub(crate) struct ReportInput<'a> {
     pub(crate) platform: &'static str,
@@ -48,6 +48,8 @@ pub(crate) struct ReportInput<'a> {
     pub(crate) service_context_in_progress: bool,
     pub(crate) executable_context: Option<&'a serde_json::Value>,
     pub(crate) executable_context_in_progress: bool,
+    pub(crate) memory_context: Option<&'a serde_json::Value>,
+    pub(crate) memory_context_in_progress: bool,
     pub(crate) logs_context: Option<&'a serde_json::Value>,
     pub(crate) logs_context_in_progress: bool,
     pub(crate) dossier_context: Option<&'a serde_json::Value>,
@@ -80,6 +82,7 @@ struct DiagnosticReport {
     selected_inspection: Option<InspectionReport>,
     selected_service_context: Option<serde_json::Value>,
     selected_executable_context: Option<serde_json::Value>,
+    selected_memory_context: Option<serde_json::Value>,
     selected_logs_context: Option<serde_json::Value>,
     selected_process_dossier: Option<serde_json::Value>,
     baseline: Option<BaselineReport>,
@@ -97,6 +100,7 @@ struct CollectionStatusReport {
     inspection_in_progress: bool,
     service_context_in_progress: bool,
     executable_context_in_progress: bool,
+    memory_context_in_progress: bool,
     logs_context_in_progress: bool,
     dossier_context_in_progress: bool,
 }
@@ -594,7 +598,7 @@ fn build_report(input: ReportInput<'_>, generated_at: u64) -> DiagnosticReport {
     DiagnosticReport {
         schema: REPORT_SCHEMA,
         schema_version: REPORT_SCHEMA_VERSION,
-        privacy_notice: "May contain command lines, paths, user names, host names, thread names, socket endpoints, and captured native log messages; review before sharing.",
+        privacy_notice: "May contain command lines, paths, user names, host names, thread names, socket endpoints, memory layout and mapped-file evidence, service context, executable hashes, signatures, and captured native log messages; review before sharing.",
         tool: ToolReport {
             name: env!("CARGO_PKG_NAME"),
             version: env!("CARGO_PKG_VERSION"),
@@ -616,6 +620,7 @@ fn build_report(input: ReportInput<'_>, generated_at: u64) -> DiagnosticReport {
             inspection_in_progress: input.inspection_in_progress,
             service_context_in_progress: input.service_context_in_progress,
             executable_context_in_progress: input.executable_context_in_progress,
+            memory_context_in_progress: input.memory_context_in_progress,
             logs_context_in_progress: input.logs_context_in_progress,
             dossier_context_in_progress: input.dossier_context_in_progress,
         },
@@ -647,6 +652,7 @@ fn build_report(input: ReportInput<'_>, generated_at: u64) -> DiagnosticReport {
         selected_inspection: input.inspection.map(inspection_report),
         selected_service_context: input.service_context.cloned(),
         selected_executable_context: input.executable_context.cloned(),
+        selected_memory_context: input.memory_context.cloned(),
         selected_logs_context: input.logs_context.cloned(),
         selected_process_dossier: input.dossier_context.cloned(),
         baseline,
