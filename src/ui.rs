@@ -107,47 +107,103 @@ fn wrapped_lines(text: &str, width: usize) -> usize {
     text.width().max(1).div_ceil(width)
 }
 
+fn wrap_text_lines(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut used = 0usize;
+
+    for ch in text.chars() {
+        let char_width = ch.width().unwrap_or(1);
+        if !current.is_empty() && used.saturating_add(char_width) > width {
+            lines.push(current);
+            current = String::new();
+            used = 0;
+        }
+        current.push(ch);
+        used = used.saturating_add(char_width);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+fn selected_process_detail_lines(app: &App, language: UiLanguage, width: usize) -> Vec<String> {
+    let pid = match app.selected_pid() {
+        Some(pid) => pid,
+        None => {
+            return vec![text(language, "No processes found", "没有找到进程").to_string()];
+        }
+    };
+    let Some(p) = app.processes.get(&pid) else {
+        return vec![text(language, "No processes found", "没有找到进程").to_string()];
+    };
+    let command = process_command_line(p);
+    let children = app.children.get(&Some(pid)).map(|c| c.len()).unwrap_or(0);
+    let subtree = app.resources.get(&pid).copied().unwrap_or_default();
+
+    let self_summary = format!(
+        "PID {}  PPID {}  {} {}  {} {}  CPU {:.1}%  {} {} MB  {} {}  {} {}  {} {}s",
+        pid,
+        p.parent
+            .map(|parent| parent.to_string())
+            .unwrap_or_else(|| "-".into()),
+        text(language, "children", "子进程"),
+        children,
+        text(language, "status", "状态"),
+        p.status,
+        p.cpu,
+        text(language, "MEM", "内存"),
+        p.memory / 1024 / 1024,
+        text(language, "R", "读"),
+        format_bytes_rate(p.read_rate),
+        text(language, "W", "写"),
+        format_bytes_rate(p.write_rate),
+        text(language, "runtime", "运行"),
+        p.runtime
+    );
+    let tree_summary = format!(
+        "{} {} {} ({})  CPU {:.1}%  {} {} MB  {} {}  {} {}",
+        text(language, "TREE", "子树"),
+        subtree.process_count,
+        text(language, "proc", "进程"),
+        text(language, "self + descendants", "自身及后代"),
+        subtree.cpu,
+        text(language, "MEM", "内存"),
+        subtree.memory / 1024 / 1024,
+        text(language, "R", "读"),
+        format_bytes_rate(subtree.read_rate),
+        text(language, "W", "写"),
+        format_bytes_rate(subtree.write_rate)
+    );
+
+    let merged_line = format!("{self_summary}  |  {tree_summary}");
+    let mut lines = if width == 0 || merged_line.width() <= width {
+        vec![merged_line]
+    } else {
+        vec![self_summary, tree_summary]
+    };
+    lines.extend(wrap_text_lines(&command, width));
+    lines
+}
+
 fn detail_height(app: &App, area: ratatui::layout::Rect) -> u16 {
     let Some(pid) = app.selected_pid() else {
         return 4;
     };
-    let Some(process) = app.processes.get(&pid) else {
+    if !app.processes.contains_key(&pid) {
         return 4;
-    };
+    }
     let width = area.width.saturating_sub(2).max(1) as usize;
-    let command = process_command_line(process);
-    let children = app
-        .children
-        .get(&Some(pid))
-        .map(|items| items.len())
-        .unwrap_or(0);
-    let subtree = app.resources.get(&pid).copied().unwrap_or_default();
-    let summary = format!(
-        "PID {}  PPID {}  children {}  status {}  CPU {:.1}%  MEM {} MB  R {}  W {}  runtime {}s",
-        pid,
-        process
-            .parent
-            .map(|parent| parent.to_string())
-            .unwrap_or_else(|| "-".into()),
-        children,
-        process.status,
-        process.cpu,
-        process.memory / 1024 / 1024,
-        format_bytes_rate(process.read_rate),
-        format_bytes_rate(process.write_rate),
-        process.runtime
-    );
-    let tree = format!(
-        "TREE {} proc (self + descendants)  CPU {:.1}%  MEM {} MB  R {}  W {}",
-        subtree.process_count,
-        subtree.cpu,
-        subtree.memory / 1024 / 1024,
-        format_bytes_rate(subtree.read_rate),
-        format_bytes_rate(subtree.write_rate)
-    );
-    let content_lines = wrapped_lines(&summary, width)
-        + wrapped_lines(&tree, width)
-        + wrapped_lines(&command, width);
+    let language = app.language();
+    let lines = selected_process_detail_lines(app, language, width);
+    let content_lines: usize = lines.iter().map(|line| wrapped_lines(line, width)).sum();
     let desired = (content_lines + 2).max(4) as u16;
     desired.min(area.height.saturating_sub(5).max(4))
 }
@@ -3397,64 +3453,13 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     tree_state.select(Some(app.selected));
     frame.render_stateful_widget(tree, chunks[0], &mut tree_state);
 
-    let detail = if let Some(pid) = app.selected_pid() {
-        let p = &app.processes[&pid];
-        let command = process_command_line(p);
-        let children = app.children.get(&Some(pid)).map(|c| c.len()).unwrap_or(0);
-        let subtree = app.resources.get(&pid).copied().unwrap_or_default();
-        let mut detail_lines = vec![Line::from(vec![
-            Span::styled(
-                format!("PID {}", pid),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(format!(
-                "  PPID {}  {} {}  {} {}  CPU {:.1}%  {} {} MB  {} {}  {} {}  {} {}s",
-                p.parent
-                    .map(|p| p.to_string())
-                    .unwrap_or_else(|| "-".into()),
-                text(language, "children", "子进程"),
-                children,
-                text(language, "status", "状态"),
-                p.status,
-                p.cpu,
-                text(language, "MEM", "内存"),
-                p.memory / 1024 / 1024,
-                text(language, "R", "读"),
-                format_bytes_rate(p.read_rate),
-                text(language, "W", "写"),
-                format_bytes_rate(p.write_rate),
-                text(language, "runtime", "运行"),
-                p.runtime
-            )),
-        ])];
-        detail_lines.push(Line::from(vec![
-            Span::styled(
-                text(language, "TREE", "子树"),
-                Style::default()
-                    .fg(Color::LightMagenta)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(format!(
-                " {} {} ({})  CPU {:.1}%  {} {} MB  {} {}  {} {}",
-                subtree.process_count,
-                text(language, "proc", "进程"),
-                text(language, "self + descendants", "自身及后代"),
-                subtree.cpu,
-                text(language, "MEM", "内存"),
-                subtree.memory / 1024 / 1024,
-                text(language, "R", "读"),
-                format_bytes_rate(subtree.read_rate),
-                text(language, "W", "写"),
-                format_bytes_rate(subtree.write_rate)
-            )),
-        ]));
-        detail_lines.push(Line::from(command));
-        Text::from(detail_lines)
-    } else {
-        Text::from(text(language, "No processes found", "没有找到进程"))
-    };
+    let detail_width = chunks[1].width.saturating_sub(2).max(1) as usize;
+    let detail = Text::from(
+        selected_process_detail_lines(app, language, detail_width)
+            .into_iter()
+            .map(Line::from)
+            .collect::<Vec<_>>(),
+    );
     frame.render_widget(
         Paragraph::new(detail)
             .block(Block::default().borders(Borders::ALL).title(text(
@@ -3578,6 +3583,7 @@ mod tests {
             ServiceContextPanel,
         },
         cli::{LogPriority, LogScope},
+        i18n::UiLanguage,
         model::{OpenFileInfo, ProcessInspection, SocketInfo, ThreadInfo},
         onboarding::{Guidance, TIPS},
     };
@@ -4192,6 +4198,21 @@ mod tests {
         assert!(app.search.is_empty());
         assert_eq!(app.selected_pid(), Some(current_pid));
         assert!(app.visible.iter().any(|row| row.pid == current_pid));
+    }
+
+    #[test]
+    fn selected_process_detail_lines_adapt_to_width_for_merge_vs_wrap() {
+        let app = App::new_for_test(Guidance::welcome_for_test());
+        let wide_lines = selected_process_detail_lines(&app, UiLanguage::English, 260);
+        let narrow_lines = selected_process_detail_lines(&app, UiLanguage::English, 60);
+
+        assert!(!wide_lines.is_empty());
+        assert!(wide_lines[0].contains(" | "));
+        assert!(wide_lines[0].contains("PID "));
+        assert!(!narrow_lines.is_empty());
+        assert!(narrow_lines[0].contains("PID "));
+        assert!(!narrow_lines[0].contains(" | "));
+        assert!(narrow_lines[1].contains("TREE"));
     }
 
     #[test]

@@ -162,9 +162,9 @@ cargo install psmore --locked
 
 ```bash
 # Linux；macOS 将 sha256sum 换成 shasum -a 256
-sha256sum -c psmore-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
-tar -xzf psmore-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
-cd psmore-v0.1.0-x86_64-unknown-linux-gnu
+sha256sum -c psmore-v0.1.1-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf psmore-v0.1.1-x86_64-unknown-linux-gnu.tar.gz
+cd psmore-v0.1.1-x86_64-unknown-linux-gnu
 
 # 默认安装到 ~/.local，不使用 sudo，不修改 shell 启动文件
 ./install.sh --dry-run
