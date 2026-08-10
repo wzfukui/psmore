@@ -121,6 +121,8 @@ install -m 0755 "$repo_root/scripts/install.sh" "$package_dir/install.sh"
 install -m 0755 "$repo_root/scripts/uninstall.sh" "$package_dir/uninstall.sh"
 install -m 0644 "$repo_root/docs/psmore.1" "$package_dir/share/man/man1/psmore.1"
 install -m 0644 "$repo_root/README.md" "$package_dir/README.md"
+install -m 0644 "$repo_root/CHANGELOG.md" "$package_dir/CHANGELOG.md"
+install -m 0644 "$repo_root/LICENSE" "$package_dir/LICENSE"
 printf '%s\n' "$version" > "$package_dir/VERSION"
 
 "$binary" completion bash > "$package_dir/share/bash-completion/completions/psmore"

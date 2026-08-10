@@ -8,9 +8,18 @@ description = "A relationship-first process diagnostics workbench for macOS and 
 readme = "README.md"
 homepage = "https://github.com/wzfukui/psmore"
 repository = "https://github.com/wzfukui/psmore.git"
+license = "MIT"
 keywords = ["process", "diagnostics", "tui", "macos", "linux"]
 categories = ["command-line-utilities", "development-tools::debugging"]
-publish = false
+include = [
+    "src/**",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "docs/**",
+]
 
 [dependencies]
 crossterm = "0.29"

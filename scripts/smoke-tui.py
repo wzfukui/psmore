@@ -98,7 +98,9 @@ def main() -> int:
         os.write(master, b"\t")
         read_until(b"HOT THREADS", 30.0)
         os.write(master, b"\t")
-        read_until(b"PORTS & CONNECTIONS", 5.0)
+        # Ratatui performs incremental terminal updates. The unchanged "O" in
+        # HOT -> PORTS may therefore remain on screen without being re-emitted.
+        read_until(b"RTS & CONNECTIONS", 5.0)
         os.write(master, b"\t")
         read_until(b"/dev/null", 5.0)
         os.write(master, b"\x1b")

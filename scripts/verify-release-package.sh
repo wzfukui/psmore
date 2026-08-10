@@ -76,6 +76,10 @@ package_dir="$temp_dir/$archive_root"
 [ -x "$package_dir/install.sh" ] || fail 'install.sh is missing or not executable'
 [ -x "$package_dir/uninstall.sh" ] || fail 'uninstall.sh is missing or not executable'
 [ -x "$package_dir/bin/psmore" ] || fail 'psmore binary is missing or not executable'
+[ -f "$package_dir/README.md" ] || fail 'README.md is missing'
+[ -f "$package_dir/CHANGELOG.md" ] || fail 'CHANGELOG.md is missing'
+[ -f "$package_dir/LICENSE" ] || fail 'LICENSE is missing'
+grep -q '^MIT License$' "$package_dir/LICENSE" || fail 'archive does not contain the MIT license'
 
 version=$(sed -n '1p' "$package_dir/VERSION")
 [ -n "$version" ] || fail 'VERSION is empty'

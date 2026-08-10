@@ -27,6 +27,8 @@ jobs:
         run: cargo +"$RUST_VERSION" fmt --all -- --check
       - name: Clippy
         run: cargo +"$RUST_VERSION" clippy --all-targets --locked -- -D warnings
+      - name: Verify crates.io package
+        run: cargo +"$RUST_VERSION" package --locked
       - name: Shell syntax
         run: bash -n scripts/*.sh
       - name: Diff hygiene

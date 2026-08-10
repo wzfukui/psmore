@@ -14,7 +14,7 @@ CLI 的 `--help` 和 TUI 内按 `?` 打开的现场手册也会展示这些信�
 
 ## 特性
 
-当前原型验证的产品靶子：
+核心能力：
 
 - 上方以树展示进程父子关系，PID 0 是用于承接系统根、不可见父进程和采集期间消失进程的虚拟根节点
 - 下方显示当前节点的 PID、PPID、子进程数、状态、CPU、内存、磁盘读写速率、运行时间、路径和命令
@@ -138,6 +138,26 @@ DENY   name~^(Updater|Helper)$
 
 ## 安装
 
+### Homebrew
+
+macOS 或 Linux 用户可以通过项目 Tap 安装：
+
+```bash
+brew install wzfukui/tap/psmore
+```
+
+### Cargo
+
+已安装 Rust 1.85 或更高版本时，可以直接从 crates.io 安装：
+
+```bash
+cargo install psmore --locked
+```
+
+默认目标通常是 `~/.cargo/bin/psmore`；请确保 `~/.cargo/bin` 已加入 `PATH`。
+
+### GitHub Release
+
 发布归档不要求目标机器安装 Rust。下载与系统架构匹配的 `psmore-vVERSION-TARGET.tar.gz` 及同名 `.sha256` 后，先校验再安装：
 
 ```bash
@@ -158,7 +178,7 @@ cd psmore-v0.1.0-x86_64-unknown-linux-gnu
 
 可以用 `--prefix /absolute/path` 指定安装位置，或设置 `PSMORE_PREFIX`；`--no-completions` 只安装二进制、man page 和卸载器。安装后的 man page 位于 `$PREFIX/share/man/man1/psmore.1`，bash、zsh、fish 补全分别安装到各自约定的 `$PREFIX/share` 目录。若 `~/.local/bin` 尚未加入 `PATH`，安装器会给出明确提示。
 
-从当前源码安装需要 Rust 1.85 或更高版本：
+从当前源码安装：
 
 ```bash
 cargo install --path . --locked
@@ -166,7 +186,7 @@ psmore --version
 psmore --help
 ```
 
-默认目标通常是 `~/.cargo/bin/psmore`；请确保 `~/.cargo/bin` 已加入 `PATH`。开发中的本地覆盖安装可使用 `cargo install --path . --locked --force`。psmore 不要求 root；以更高权限运行只会扩大受操作系统权限控制的进程、FD 和网络可见范围。
+开发中的本地覆盖安装可使用 `cargo install --path . --locked --force`。psmore 不要求 root；以更高权限运行只会扩大受操作系统权限控制的进程、FD 和网络可见范围。
 
 源码仓库可为当前机器生成与 CI 相同结构的原生归档，并执行隔离的安装/卸载验证：
 
@@ -175,7 +195,7 @@ scripts/package-release.sh
 scripts/verify-release-package.sh dist/psmore-v*.tar.gz
 ```
 
-发布归档记录源码 commit、dirty 状态、目标架构、Rust 版本和固定时间源，并生成 SHA-256 校验文件。SHA-256 用于确认下载完整性，不代替发布者身份签名；应从可信的发布页面同时取得归档和校验文件。详细发布流程和许可证边界见 [`docs/RELEASING.md`](docs/RELEASING.md)。
+发布归档记录源码 commit、dirty 状态、目标架构、Rust 版本和固定时间源，并生成 SHA-256 校验文件。SHA-256 用于确认下载完整性，不代替发布者身份签名；应从可信的发布页面同时取得归档和校验文件。详细发布流程见 [`docs/RELEASING.md`](docs/RELEASING.md)。
 
 ## 运行
 
@@ -878,3 +898,7 @@ doctor 对比使用稳定 finding code 识别同一类信号，分别列出新�
 - 进程操作遵循当前用户权限，不会提权。确认时如果目标已退出、启动时间不可用或 PID 已被复用，操作会拒绝并留下原因；信号只发送给选中 PID，不会隐式发送给整个子树或进程组。
 - Linux 原生日志来自 journald，普通用户只能看到其权限允许的记录；macOS 原生日志来自 Unified Logging。两者都会限制时间窗和返回条数，但日志消息仍可能包含业务数据或密钥，`--redact` 只是辅助措施。
 - 诊断报告 schema v8 先写临时文件再原子改名，并在 Unix 平台使用 `0600` 权限。报告可嵌入已采集的 process dossier 和内存归因，并可能包含完整命令行、文件路径、用户名、主机名、线程名、socket 端点、systemd/launchd 服务上下文、原生日志、内存布局、可执行映像哈希与签名和人工操作审计，分享前应先检查敏感信息。
+
+## 许可证
+
+psmore 使用 [MIT License](LICENSE)。
