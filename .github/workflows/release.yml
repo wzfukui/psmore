@@ -70,6 +70,18 @@ jobs:
           cd dist
           sha256sum ./*.tar.gz > SHA256SUMS
       - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "psmore ${{ github.ref_name }}"
+          body: |
+            ## psmore release ${{ github.ref_name }}
+            This release is built automatically by the Release workflow.
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/SHA256SUMS
+          generate_release_notes: true
+          make_latest: true
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes --title "psmore $GITHUB_REF_NAME"
+          GITHUB_TOKEN: ${{ github.token }}
