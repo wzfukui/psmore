@@ -3504,31 +3504,30 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         text(language, " ↑↓ move | ←/→ tree | digits PID | / find | F filters | k end | p actions | D dossier | M memory | a attention | h hot | m manager | v image | l logs | L language | ? help ", " ↑↓ 移动 | ←/→ 进程树 | 数字定位 PID | / 搜索 | F 过滤器 | k 结束 | p 操作 | D 档案 | M 内存 | a 关注 | h 热点 | m 管理器 | v 映像 | l 日志 | L 语言 | ? 帮助 ").into()
     };
-    let footer = Paragraph::new(vec![
-        Line::from(format!(
-            " {} {} | {} {}/{} | {} | {} | {} {} | +{} -{} ↪{} | F2 {} | q {} ",
-            total_processes,
-            text(language, "proc", "进程"),
-            text(language, "page", "页"),
-            current_page,
-            total_pages,
-            live_state,
-            baseline_state,
-            text(language, "sort", "排序"),
-            sort_label(language, app.sort_mode),
-            app.last_changes.started,
-            app.last_changes.exited,
-            app.last_changes.reparented,
-            language.label(),
-            text(language, "quit", "退出"),
-        )),
-        Line::from(shortcut_line),
-    ])
+    let footer = Paragraph::new(vec![Line::from(format!(
+        " {} {} | {} {}/{} | {} | {} | {} {} | +{} -{} ↪{} | F2 {} | q {}  {}",
+        total_processes,
+        text(language, "proc", "进程"),
+        text(language, "page", "页"),
+        current_page,
+        total_pages,
+        live_state,
+        baseline_state,
+        text(language, "sort", "排序"),
+        sort_label(language, app.sort_mode),
+        app.last_changes.started,
+        app.last_changes.exited,
+        app.last_changes.reparented,
+        language.label(),
+        text(language, "quit", "退出"),
+        shortcut_line,
+    ))])
     .style(Style::default().fg(if app.paused {
         Color::Yellow
     } else {
         Color::DarkGray
-    }));
+    }))
+    .wrap(Wrap { trim: false });
     frame.render_widget(footer, chunks[2]);
 
     if app.show_filter_manager {
