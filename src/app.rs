@@ -184,6 +184,259 @@ mod filter_tests {
             vec![0, 1, 10]
         );
     }
+
+    #[test]
+    fn clear_search_keeps_selected_pid_visible_in_full_tree() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.processes = [
+            process(0, None, "kernel / system", ""),
+            process(1, Some(0), "launchd", "/sbin/launchd"),
+            process(200, Some(1), "herdr", "/usr/bin/herdr"),
+            process(300, Some(200), "zsh", "/bin/zsh"),
+            process(400, Some(300), "claude", "/usr/local/bin/claude"),
+            process(500, Some(1), "another", "/usr/bin/another"),
+        ]
+        .into_iter()
+        .map(|process| (process.pid, process))
+        .collect();
+        app.children.clear();
+        for process in app.processes.values() {
+            app.children
+                .entry(process.parent)
+                .or_default()
+                .push(process.pid);
+        }
+        app.resources = aggregate_resources(&app.processes, &app.children);
+        app.expanded = [0].into_iter().map(Pid::from_u32).collect();
+        app.search = "name:herdr".into();
+        app.rebuild_visible();
+
+        let herdr = Pid::from_u32(200);
+        assert!(app.visible.iter().any(|row| row.pid == herdr));
+        app.selected = app
+            .visible
+            .iter()
+            .position(|row| row.pid == herdr)
+            .expect("herdr should be visible in search mode");
+
+        // In normal (non-search) mode herdr is hidden due a collapsed ancestor.
+        app.collapsed.insert(Pid::from_u32(1));
+
+        let anchor = app
+            .selected_pid()
+            .expect("search selection should have anchor pid");
+        app.search.clear();
+        app.ensure_visible_ancestor_chain(anchor);
+        app.rebuild_visible();
+        let visible_index = app.visible.iter().position(|row| row.pid == anchor);
+        if let Some(index) = visible_index {
+            app.selected = index;
+        } else {
+            app.selected = app.selected.min(app.visible.len().saturating_sub(1));
+        }
+
+        assert_eq!(app.selected_pid(), Some(herdr));
+        assert!(app.visible.iter().any(|row| row.pid == Pid::from_u32(1)));
+        assert!(!app.collapsed.contains(&Pid::from_u32(1)));
+        assert!(app.expanded.contains(&Pid::from_u32(1)));
+    }
+
+    #[test]
+    fn clear_search_esc_keeps_anchor_in_place_even_with_many_siblings() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        let herdr_pid = Pid::from_u32(200);
+        let mut processes = vec![
+            process(0, None, "kernel / system", ""),
+            process(1, Some(0), "launchd", "/sbin/launchd"),
+        ];
+
+        for i in 10..80 {
+            processes.push(process(i, Some(1), "other", &format!("/usr/bin/other{i}")));
+        }
+        processes.push(process(
+            herdr_pid.as_u32(),
+            Some(1),
+            "herdr",
+            "/usr/bin/herdr",
+        ));
+        for i in 81..120 {
+            processes.push(process(i, Some(1), "other", &format!("/usr/bin/other{i}")));
+        }
+        processes.push(process(300, Some(herdr_pid.as_u32()), "zsh", "/bin/zsh"));
+
+        app.processes = processes
+            .into_iter()
+            .map(|process| (process.pid, process))
+            .collect();
+        app.children.clear();
+        for process in app.processes.values() {
+            app.children
+                .entry(process.parent)
+                .or_default()
+                .push(process.pid);
+        }
+        app.resources = aggregate_resources(&app.processes, &app.children);
+
+        // 默认展开足够多，以便搜索上下文完整展示。
+        app.expanded = [0, 1, 200].into_iter().map(Pid::from_u32).collect();
+
+        app.search = "name:herdr".into();
+        app.rebuild_visible();
+
+        let search_anchor = app
+            .visible
+            .iter()
+            .position(|row| row.pid == herdr_pid)
+            .expect("herdr should be visible in search mode");
+        app.selected = search_anchor;
+
+        app.collapsed.insert(Pid::from_u32(1));
+
+        let anchor_pid = app.selected_pid();
+        app.search.clear();
+        if let Some(anchor_pid) = anchor_pid {
+            app.ensure_visible_ancestor_chain(anchor_pid);
+        }
+        app.rebuild_visible();
+        if let Some(anchor_pid) = anchor_pid {
+            app.restore_selection_to_anchor(anchor_pid);
+        }
+
+        let full_anchor = app
+            .visible
+            .iter()
+            .position(|row| row.pid == herdr_pid)
+            .expect("herdr should return in full tree");
+        let visible_after = app.visible.len();
+        assert_eq!(app.selected_pid(), Some(herdr_pid));
+        assert_eq!(app.selected, full_anchor);
+        assert!(full_anchor < visible_after - 1);
+        assert!(app.expanded.contains(&Pid::from_u32(1)));
+        assert!(!app.collapsed.contains(&Pid::from_u32(1)));
+    }
+
+    #[test]
+    fn clear_search_esc_keeps_selected_descendant_of_match() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        let herdr_pid = Pid::from_u32(200);
+        let grand_pid = Pid::from_u32(220);
+        let mut processes = vec![
+            process(0, None, "kernel / system", ""),
+            process(1, Some(0), "launchd", "/sbin/launchd"),
+            process(herdr_pid.as_u32(), Some(1), "herdr", "/usr/bin/herdr"),
+            process(215, Some(herdr_pid.as_u32()), "node", "/opt/bin/node"),
+            process(grand_pid.as_u32(), Some(215), "codex", "/usr/bin/codex"),
+            process(300, Some(grand_pid.as_u32()), "worker", "/usr/bin/worker"),
+            process(301, Some(grand_pid.as_u32()), "worker", "/usr/bin/worker"),
+        ];
+        for i in 10..140 {
+            processes.push(process(i, Some(1), "other", &format!("/usr/bin/other{i}")));
+        }
+        app.processes = processes
+            .into_iter()
+            .map(|process| (process.pid, process))
+            .collect();
+        app.children.clear();
+        for process in app.processes.values() {
+            app.children
+                .entry(process.parent)
+                .or_default()
+                .push(process.pid);
+        }
+        app.resources = aggregate_resources(&app.processes, &app.children);
+        app.expanded = [0, 1, herdr_pid.as_u32(), 215]
+            .into_iter()
+            .map(Pid::from_u32)
+            .collect();
+
+        app.search = "name:herdr".into();
+        app.rebuild_visible();
+        let anchor = grand_pid;
+        app.selected = app
+            .visible
+            .iter()
+            .position(|row| row.pid == anchor)
+            .expect("selected descendant should be visible in search result");
+        app.collapsed.insert(Pid::from_u32(1));
+
+        let anchor_pid = app.selected_pid().expect("ancestor chain anchor exists");
+        app.search.clear();
+        app.ensure_visible_ancestor_chain(anchor_pid);
+        app.rebuild_visible();
+        let visible_index = app.visible.iter().position(|row| row.pid == anchor_pid);
+        assert!(visible_index.is_some());
+        app.restore_selection_to_anchor(anchor_pid);
+        assert_eq!(app.selected_pid(), Some(anchor));
+        assert_eq!(
+            app.visible.iter().position(|row| row.pid == anchor),
+            Some(app.selected)
+        );
+        assert!(!app.expanded.is_empty());
+        assert!(app.expanded.contains(&Pid::from_u32(1)));
+        assert!(!app.collapsed.contains(&Pid::from_u32(1)));
+    }
+
+    #[test]
+    fn clear_search_esc_keeps_anchor_visible_row_position() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        let herdr_pid = Pid::from_u32(3210);
+        let mut processes = vec![
+            process(0, None, "kernel / system", ""),
+            process(1, Some(0), "launchd", "/sbin/launchd"),
+        ];
+
+        for i in 10..110 {
+            processes.push(process(i, Some(1), "other", &format!("/usr/bin/other{i}")));
+        }
+        processes.push(process(
+            herdr_pid.as_u32(),
+            Some(1),
+            "herdr",
+            "/usr/bin/herdr",
+        ));
+        for i in 111..140 {
+            processes.push(process(i, Some(1), "other", &format!("/usr/bin/other{i}")));
+        }
+
+        app.processes = processes
+            .into_iter()
+            .map(|process| (process.pid, process))
+            .collect();
+        app.children.clear();
+        for process in app.processes.values() {
+            app.children
+                .entry(process.parent)
+                .or_default()
+                .push(process.pid);
+        }
+        app.resources = aggregate_resources(&app.processes, &app.children);
+        app.sort_mode = SortMode::Stable;
+        app.expanded = [0, 1].into_iter().map(Pid::from_u32).collect();
+
+        app.search = "name:herdr".into();
+        app.rebuild_visible();
+        let search_herdr = app
+            .visible
+            .iter()
+            .position(|row| row.pid == herdr_pid)
+            .expect("herdr should be visible while searching");
+        app.selected = search_herdr;
+        app.tree_offset = search_herdr.saturating_sub(2);
+
+        app.page_size = 10;
+        app.collapsed.insert(Pid::from_u32(1));
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        let full_herdr = app
+            .visible
+            .iter()
+            .position(|row| row.pid == herdr_pid)
+            .expect("herdr should remain visible after clear");
+        let visible_row = full_herdr.saturating_sub(app.tree_offset);
+        assert_eq!(app.selected, full_herdr);
+        assert_eq!(visible_row, 2);
+        assert_eq!(app.selected_pid(), Some(herdr_pid));
+    }
 }
 
 pub(crate) fn sort_processes(
@@ -733,6 +986,7 @@ pub(crate) struct App {
     pub(crate) selected: usize,
     pub(crate) expanded: HashSet<Pid>,
     pub(crate) collapsed: HashSet<Pid>,
+    pub(crate) tree_offset: usize,
     pub(crate) search: String,
     pub(crate) searching: bool,
     pub(crate) search_input: String,
@@ -853,6 +1107,7 @@ impl App {
             selected: 0,
             expanded: HashSet::new(),
             collapsed: HashSet::new(),
+            tree_offset: 0,
             search: query,
             searching: false,
             search_input: String::new(),
@@ -2510,6 +2765,44 @@ impl App {
         self.visible.get(self.selected).map(|row| row.pid)
     }
 
+    fn ensure_visible_ancestor_chain(&mut self, pid: Pid) {
+        let mut current = Some(pid);
+        let mut seen = HashSet::new();
+        while let Some(current_pid) = current {
+            if !seen.insert(current_pid) {
+                break;
+            }
+            self.expanded.insert(current_pid);
+            self.collapsed.remove(&current_pid);
+            current = self
+                .processes
+                .get(&current_pid)
+                .and_then(|process| process.parent);
+        }
+    }
+
+    fn restore_selection_to_anchor(&mut self, anchor_pid: Pid) {
+        if let Some(index) = self.visible.iter().position(|row| row.pid == anchor_pid) {
+            self.selected = index;
+            return;
+        }
+        self.focus = None;
+        self.ensure_visible_ancestor_chain(anchor_pid);
+        self.rebuild_visible();
+        self.selected = self
+            .visible
+            .iter()
+            .position(|row| row.pid == anchor_pid)
+            .unwrap_or(self.selected.min(self.visible.len().saturating_sub(1)));
+    }
+
+    fn ensure_tree_view_row(&mut self, preferred_row: usize) {
+        let view_height = self.page_size.max(1);
+        let target_row = preferred_row.min(view_height.saturating_sub(1));
+        let max_offset = self.visible.len().saturating_sub(view_height);
+        self.tree_offset = self.selected.saturating_sub(target_row).min(max_offset);
+    }
+
     fn selected_context(&self) -> Option<String> {
         let pid = self.selected_pid()?;
         let process = self.processes.get(&pid)?;
@@ -4085,8 +4378,19 @@ impl App {
         }
         match key.code {
             KeyCode::Esc if !self.search.is_empty() => {
+                let anchor_pid = self.selected_pid();
+                let current_row = self
+                    .selected
+                    .saturating_sub(self.tree_offset.min(self.selected));
                 self.search.clear();
+                if let Some(anchor_pid) = anchor_pid {
+                    self.ensure_visible_ancestor_chain(anchor_pid);
+                }
                 self.rebuild_visible();
+                if let Some(anchor_pid) = anchor_pid {
+                    self.restore_selection_to_anchor(anchor_pid);
+                    self.ensure_tree_view_row(current_row);
+                }
             }
             KeyCode::Char('q') => return true,
             // Escape is intentionally inert on the bare process tree. It is

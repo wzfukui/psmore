@@ -1874,13 +1874,14 @@ fn draw_trend_overlay(frame: &mut Frame, app: &App, area: Rect) {
             .unwrap_or(1)
             .max(1);
         let series = [
-            ("READ self", own_read, Color::Cyan),
-            ("READ tree", tree_read, Color::LightCyan),
-            ("WRITE self", own_write, Color::Yellow),
-            ("WRITE tree", tree_write, Color::LightRed),
+            ("READ self", own_read.as_slice(), Color::Cyan),
+            ("READ tree", tree_read.as_slice(), Color::LightCyan),
+            ("WRITE self", own_write.as_slice(), Color::Yellow),
+            ("WRITE tree", tree_write.as_slice(), Color::LightRed),
         ];
-        for (index, (label, values, color)) in series.into_iter().enumerate() {
-            let (now, average, maximum) = memory_stats(&values);
+        for (index, (label, values, color)) in series.iter().enumerate() {
+            let (label, values, color) = (*label, *values, *color);
+            let (now, average, maximum) = memory_stats(values);
             frame.render_widget(
                 Sparkline::default()
                     .block(Block::default().borders(Borders::TOP).title(format!(
@@ -1889,7 +1890,7 @@ fn draw_trend_overlay(frame: &mut Frame, app: &App, area: Rect) {
                         format_bytes_rate(average),
                         format_bytes_rate(maximum)
                     )))
-                    .data(&values)
+                    .data(values)
                     .max(io_scale)
                     .bar_set(symbols::bar::NINE_LEVELS)
                     .style(Style::default().fg(color)),
@@ -3449,9 +3450,16 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         })
         .collect();
     let tree = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
-    let mut tree_state = ListState::default();
+    let mut tree_state = if app.visible.is_empty() {
+        ListState::default()
+    } else {
+        ListState::default()
+            .with_offset(app.tree_offset.min(app.visible.len().saturating_sub(1)))
+            .with_selected(Some(app.selected))
+    };
     tree_state.select(Some(app.selected));
     frame.render_stateful_widget(tree, chunks[0], &mut tree_state);
+    app.tree_offset = tree_state.offset();
 
     let detail_width = chunks[1].width.saturating_sub(2).max(1) as usize;
     let detail = Text::from(
@@ -3579,13 +3587,32 @@ mod tests {
     use crate::{
         app::{
             DossierContextPanel, ExecutableContextPanel, LogsContextPanel, MemoryContextPanel,
-            ServiceContextPanel,
+            ServiceContextPanel, aggregate_resources,
         },
         cli::{LogPriority, LogScope},
         i18n::UiLanguage,
-        model::{OpenFileInfo, ProcessInspection, SocketInfo, ThreadInfo},
+        model::{OpenFileInfo, ProcessInfo, ProcessInspection, SocketInfo, ThreadInfo},
         onboarding::{Guidance, TIPS},
     };
+
+    fn ui_process(pid: u32, parent: Option<u32>, name: &str, executable: &str) -> ProcessInfo {
+        ProcessInfo {
+            pid: Pid::from_u32(pid),
+            parent: parent.map(Pid::from_u32),
+            name: name.into(),
+            command: executable.into(),
+            executable: executable.into(),
+            user: "joe".into(),
+            cwd: "/".into(),
+            cpu: 0.0,
+            memory: 0,
+            read_rate: 0,
+            write_rate: 0,
+            start_time: 1,
+            runtime: 1,
+            status: "Sleep".into(),
+        }
+    }
 
     fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
         let buffer = terminal.backend().buffer();
@@ -4241,6 +4268,70 @@ mod tests {
 
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.search.is_empty());
+    }
+
+    #[test]
+    fn on_key_esc_keeps_anchor_when_search_filter_is_cleared() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        let herdr_pid = Pid::from_u32(200);
+        let mut processes = vec![
+            ui_process(0, None, "kernel / system", ""),
+            ui_process(1, Some(0), "launchd", "/sbin/launchd"),
+            ui_process(herdr_pid.as_u32(), Some(1), "herdr", "/usr/bin/herdr"),
+            ui_process(300, Some(herdr_pid.as_u32()), "zsh", "/bin/zsh"),
+            ui_process(
+                301,
+                Some(herdr_pid.as_u32()),
+                "claude",
+                "/usr/local/bin/claude",
+            ),
+        ];
+        for i in 10..120 {
+            processes.push(ui_process(
+                i,
+                Some(herdr_pid.as_u32()),
+                "worker",
+                &format!("/usr/bin/worker{i}"),
+            ));
+        }
+        app.processes = processes.into_iter().map(|p| (p.pid, p)).collect();
+        app.children.clear();
+        for process in app.processes.values() {
+            app.children
+                .entry(process.parent)
+                .or_default()
+                .push(process.pid);
+        }
+        app.resources = aggregate_resources(&app.processes, &app.children);
+        app.expanded = [0, 1, 200].into_iter().map(Pid::from_u32).collect();
+
+        app.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        for character in "name:herdr".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.selected = app
+            .visible
+            .iter()
+            .position(|row| row.pid == herdr_pid)
+            .expect("herdr should be visible when search is active");
+        assert_eq!(app.search, "name:herdr");
+
+        app.collapsed.insert(Pid::from_u32(1));
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        let visible_herdr = app
+            .visible
+            .iter()
+            .position(|row| row.pid == herdr_pid)
+            .expect("herdr should remain visible after clearing search");
+        assert_eq!(app.search, "");
+        assert_eq!(app.selected, visible_herdr);
+        assert_eq!(app.selected_pid(), Some(herdr_pid));
+        assert!(!app.expanded.is_empty());
+        assert!(app.expanded.contains(&Pid::from_u32(1)));
+        assert!(!app.collapsed.contains(&Pid::from_u32(1)));
     }
 
     #[test]
