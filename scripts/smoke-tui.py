@@ -93,6 +93,15 @@ def main() -> int:
         time.sleep(0.2)
         os.write(master, b"\r")
         time.sleep(0.2)
+        os.write(master, b"\r")
+        read_until(b"Overview", 5.0)
+        os.write(master, b"\t")
+        read_until(b"HOT THREADS", 30.0)
+        os.write(master, b"\t")
+        read_until(b"PORTS & CONNECTIONS", 5.0)
+        os.write(master, b"\t")
+        read_until(b"/dev/null", 5.0)
+        os.write(master, b"\x1b")
         os.write(master, b"D")
         read_until(b"PSMORE PROCESS DOSSIER", 30.0)
         read_until(b"EVIDENCE OVERVIEW", 5.0)
@@ -146,7 +155,7 @@ def main() -> int:
         config_directory.cleanup()
 
     print(
-        "Verified TUI persistent filter -> safe bare-tree Escape -> PID locate -> delayed search apply -> dossier -> memory -> dossier -> image -> "
+        "Verified TUI persistent filter -> safe bare-tree Escape -> PID locate -> delayed search apply -> tabbed inspection cards -> dossier -> memory -> dossier -> image -> "
         f"manager -> logs -> manager -> two-step end dialog for PID {pid}"
     )
     return 0

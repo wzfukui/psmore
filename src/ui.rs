@@ -13,7 +13,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     actions::{ProcessActionKind, ProcessActionOutcome, ProcessActionRecord},
-    app::App,
+    app::{App, InspectionTab},
     filters::FilterAction,
     i18n::{UiLanguage, text},
     model::{
@@ -690,22 +690,32 @@ fn safe_thread_name(name: &str) -> String {
         .collect()
 }
 
-fn push_thread_lines(lines: &mut Vec<Line<'static>>, inspection: &ProcessInspection) {
-    if inspection.thread_count == 0 && inspection.thread_warning.is_none() {
-        return;
-    }
-    lines.push(Line::from(""));
+fn push_thread_lines(
+    lines: &mut Vec<Line<'static>>,
+    inspection: &ProcessInspection,
+    language: UiLanguage,
+) {
     let sampling = if inspection.thread_sample_ms > 0 {
-        format!("{}ms sample", inspection.thread_sample_ms)
+        match language {
+            UiLanguage::English => format!("{}ms sample", inspection.thread_sample_ms),
+            UiLanguage::Chinese => format!("{}ms 采样", inspection.thread_sample_ms),
+        }
     } else {
-        "scheduler estimate".into()
+        text(language, "scheduler estimate", "调度器估值").into()
     };
     lines.push(Line::from(Span::styled(
-        format!(
-            "HOT THREADS (showing {}/{}; {sampling})",
-            inspection.threads.len(),
-            inspection.thread_count
-        ),
+        match language {
+            UiLanguage::English => format!(
+                "HOT THREADS (showing {}/{}; {sampling})",
+                inspection.threads.len(),
+                inspection.thread_count
+            ),
+            UiLanguage::Chinese => format!(
+                "热点线程（显示 {}/{}；{sampling}）",
+                inspection.threads.len(),
+                inspection.thread_count
+            ),
+        },
         Style::default()
             .fg(Color::LightCyan)
             .add_modifier(Modifier::BOLD),
@@ -718,7 +728,11 @@ fn push_thread_lines(lines: &mut Vec<Line<'static>>, inspection: &ProcessInspect
     }
     if inspection.threads.is_empty() {
         lines.push(Line::from(Span::styled(
-            "  No thread details visible",
+            text(
+                language,
+                "  No thread details visible",
+                "  暂无可见线程详情",
+            ),
             Style::default().fg(Color::DarkGray),
         )));
         return;
@@ -754,74 +768,196 @@ fn push_thread_lines(lines: &mut Vec<Line<'static>>, inspection: &ProcessInspect
     }
 }
 
-fn inspection_lines(inspection: &ProcessInspection) -> Vec<Line<'static>> {
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("USER ", Style::default().fg(Color::Cyan)),
-            Span::raw(inspection.user.clone()),
-        ]),
-        Line::from(vec![
-            Span::styled("CWD  ", Style::default().fg(Color::Cyan)),
-            Span::raw(inspection.cwd.clone()),
-        ]),
-    ];
+fn inspection_lines(
+    inspection: &ProcessInspection,
+    tab: InspectionTab,
+    language: UiLanguage,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
     if let Some(warning) = &inspection.warning {
         lines.push(Line::from(Span::styled(
             format!("WARNING  {warning}"),
             Style::default().fg(Color::LightRed),
         )));
+        lines.push(Line::from(""));
     }
-    push_thread_lines(&mut lines, inspection);
-    push_inspection_fields(&mut lines, "RUNTIME CONTEXT", &inspection.runtime);
-    push_inspection_fields(&mut lines, "SECURITY", &inspection.security);
-    push_inspection_fields(&mut lines, "NAMESPACES", &inspection.namespaces);
-    push_inspection_fields(&mut lines, "RESOURCE LIMITS", &inspection.limits);
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        format!("NETWORK ({})", inspection.sockets.len()),
-        Style::default()
-            .fg(Color::LightCyan)
-            .add_modifier(Modifier::BOLD),
-    )));
-    if inspection.sockets.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  No sockets visible",
-            Style::default().fg(Color::DarkGray),
-        )));
-    } else {
-        for socket in &inspection.sockets {
-            let state = if socket.state.is_empty() {
-                "-"
-            } else {
-                &socket.state
-            };
-            lines.push(Line::from(format!(
-                "  {:<6} {:<12} fd {:<6} {}",
-                socket.protocol, state, socket.fd, socket.endpoint
-            )));
+
+    match tab {
+        InspectionTab::Overview => {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    text(language, "USER ", "用户 "),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::raw(inspection.user.clone()),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    text(language, "CWD  ", "目录 "),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::raw(inspection.cwd.clone()),
+            ]));
+            push_inspection_fields(
+                &mut lines,
+                text(language, "RUNTIME CONTEXT", "运行上下文"),
+                &inspection.runtime,
+            );
+            push_inspection_fields(
+                &mut lines,
+                text(language, "SECURITY", "安全上下文"),
+                &inspection.security,
+            );
+            push_inspection_fields(
+                &mut lines,
+                text(language, "NAMESPACES", "命名空间"),
+                &inspection.namespaces,
+            );
+            push_inspection_fields(
+                &mut lines,
+                text(language, "RESOURCE LIMITS", "资源限制"),
+                &inspection.limits,
+            );
         }
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        format!("OPEN FILE DESCRIPTORS ({})", inspection.files.len()),
-        Style::default()
-            .fg(Color::LightCyan)
-            .add_modifier(Modifier::BOLD),
-    )));
-    if inspection.files.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  No file descriptors visible",
-            Style::default().fg(Color::DarkGray),
-        )));
-    } else {
-        for file in &inspection.files {
-            lines.push(Line::from(format!(
-                "  fd {:<6} {:<6} {:<2} {}",
-                file.fd, file.kind, file.access, file.name
+        InspectionTab::Threads => push_thread_lines(&mut lines, inspection, language),
+        InspectionTab::Ports => {
+            lines.push(Line::from(Span::styled(
+                match language {
+                    UiLanguage::English => {
+                        format!("PORTS & CONNECTIONS ({})", inspection.sockets.len())
+                    }
+                    UiLanguage::Chinese => {
+                        format!("端口与连接（{}）", inspection.sockets.len())
+                    }
+                },
+                Style::default()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
             )));
+            if inspection.sockets.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    text(language, "  No sockets visible", "  暂无可见端口或连接"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            } else {
+                for socket in &inspection.sockets {
+                    let state = if socket.state.is_empty() {
+                        "-"
+                    } else {
+                        &socket.state
+                    };
+                    lines.push(Line::from(format!(
+                        "  {:<6} {:<12} fd {:<6} {}",
+                        socket.protocol, state, socket.fd, socket.endpoint
+                    )));
+                }
+            }
+        }
+        InspectionTab::Files => {
+            lines.push(Line::from(Span::styled(
+                match language {
+                    UiLanguage::English => {
+                        format!("OPEN FILE DESCRIPTORS ({})", inspection.files.len())
+                    }
+                    UiLanguage::Chinese => {
+                        format!("打开的文件描述符（{}）", inspection.files.len())
+                    }
+                },
+                Style::default()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            if inspection.files.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    text(
+                        language,
+                        "  No file descriptors visible",
+                        "  暂无可见文件描述符",
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            } else {
+                for file in &inspection.files {
+                    lines.push(Line::from(format!(
+                        "  fd {:<6} {:<6} {:<2} {}",
+                        file.fd, file.kind, file.access, file.name
+                    )));
+                }
+            }
         }
     }
     lines
+}
+
+fn inspection_tabs_line(
+    inspection: &ProcessInspection,
+    active: InspectionTab,
+    language: UiLanguage,
+    available_width: u16,
+) -> Line<'static> {
+    let full_labels = [
+        text(language, "Overview", "概览").to_string(),
+        format!(
+            "{} {}",
+            text(language, "Threads", "线程"),
+            inspection.thread_count
+        ),
+        format!(
+            "{} {}",
+            text(language, "Ports", "端口"),
+            inspection.sockets.len()
+        ),
+        format!(
+            "{} {}",
+            text(language, "Files", "文件"),
+            inspection.files.len()
+        ),
+    ];
+    if available_width < 32 {
+        return Line::from(vec![
+            Span::styled(
+                format!(" {}/4 ", active.index() + 1),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                full_labels[active.index()].clone(),
+                Style::default()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" · Tab →", Style::default().fg(Color::DarkGray)),
+        ]);
+    }
+    let compact_labels = [
+        text(language, "Info", "概览").to_string(),
+        text(language, "Thr", "线程").to_string(),
+        text(language, "Net", "端口").to_string(),
+        text(language, "File", "文件").to_string(),
+    ];
+    let labels = if available_width < 58 {
+        compact_labels
+    } else {
+        full_labels
+    };
+    let mut spans = Vec::new();
+    for (index, label) in labels.into_iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+        }
+        let style = if index == active.index() {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        spans.push(Span::styled(format!(" {label} "), style));
+    }
+    Line::from(spans)
 }
 
 fn draw_inspection_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -837,7 +973,8 @@ fn draw_inspection_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         height,
     );
     let language = app.language();
-    let mut lines = inspection_lines(inspection);
+    let active_tab = app.inspection_tab;
+    let mut lines = inspection_lines(inspection, active_tab, language);
     let inspection_status = if app.inspection_is_scanning() {
         let elapsed = app.inspection_elapsed();
         lines.insert(0, Line::from(""));
@@ -865,8 +1002,42 @@ fn draw_inspection_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         ""
     };
-    let content_height = height.saturating_sub(2) as usize;
-    let content_width = width.saturating_sub(2).max(1) as usize;
+    let title = match language {
+        UiLanguage::English => format!(
+            " inspect {} [{}]{} ",
+            inspection.name, inspection.pid, inspection_status
+        ),
+        UiLanguage::Chinese => format!(
+            " 深度检查 {} [{}]{} ",
+            inspection.name, inspection.pid, inspection_status
+        ),
+    };
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::LightCyan))
+        .title(title);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(inspection_tabs_line(
+            inspection,
+            active_tab,
+            language,
+            sections[0].width,
+        )),
+        sections[0],
+    );
+    let content_height = sections[1].height as usize;
+    let content_width = sections[1].width.max(1) as usize;
     let visual_lines = lines
         .iter()
         .map(|line| line.width().max(1).div_ceil(content_width))
@@ -875,23 +1046,20 @@ fn draw_inspection_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         .saturating_sub(content_height)
         .min(u16::MAX as usize) as u16;
     app.inspection_scroll = app.inspection_scroll.min(max_scroll);
-    let title = match language {
-        UiLanguage::English => format!(
-            " inspect {} [{}]{}  Enter/r refresh  ↑↓ scroll  M memory  D dossier  Esc close ",
-            inspection.name, inspection.pid, inspection_status
-        ),
-        UiLanguage::Chinese => format!(
-            " 深度检查 {} [{}]{}  Enter/r 刷新  ↑↓ 滚动  M 内存  D 档案  Esc 关闭 ",
-            inspection.name, inspection.pid, inspection_status
-        ),
-    };
-    frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(title))
             .scroll((app.inspection_scroll, 0))
             .wrap(Wrap { trim: false }),
-        popup,
+        sections[1],
+    );
+    frame.render_widget(
+        Paragraph::new(text(
+            language,
+            " Tab card · Shift+Tab back · ↑↓ scroll · Enter/r refresh · M memory · D dossier · Esc close",
+            " Tab 切换卡片 · Shift+Tab 返回 · ↑↓ 滚动 · Enter/r 刷新 · M 内存 · D 档案 · Esc 关闭",
+        ))
+        .style(Style::default().fg(Color::DarkGray)),
+        sections[2],
     );
 }
 
@@ -3410,6 +3578,7 @@ mod tests {
             ServiceContextPanel,
         },
         cli::{LogPriority, LogScope},
+        model::{OpenFileInfo, ProcessInspection, SocketInfo, ThreadInfo},
         onboarding::{Guidance, TIPS},
     };
 
@@ -3504,6 +3673,100 @@ mod tests {
         let english = buffer_text(&terminal);
         assert!(english.contains("WELCOME TO PSMORE"));
         assert!(english.contains("UNDERSTAND THE PROCESS TREE"));
+    }
+
+    #[test]
+    fn inspection_uses_separate_tabbed_cards_for_context_threads_ports_and_files() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        app.inspection = Some(ProcessInspection {
+            pid: Pid::from_u32(42),
+            name: "worker".into(),
+            user: "deploy".into(),
+            cwd: "/srv/worker".into(),
+            threads: vec![ThreadInfo {
+                id: 4201,
+                name: "worker-loop".into(),
+                state: "Running".into(),
+                cpu_percent: 12.5,
+                priority: 20,
+                nice: Some(0),
+                processor: Some(3),
+            }],
+            thread_count: 3,
+            sockets: vec![SocketInfo {
+                fd: "7".into(),
+                protocol: "TCP".into(),
+                endpoint: "127.0.0.1:8080".into(),
+                state: "LISTEN".into(),
+            }],
+            files: vec![OpenFileInfo {
+                fd: "9".into(),
+                kind: "REG".into(),
+                access: "r".into(),
+                name: "/tmp/example.log".into(),
+            }],
+            ..ProcessInspection::default()
+        });
+        let backend = TestBackend::new(72, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let overview = buffer_text(&terminal);
+        assert!(overview.contains("Overview"));
+        assert!(overview.contains("Threads 3"));
+        assert!(overview.contains("Ports 1"));
+        assert!(overview.contains("Files 1"));
+        assert!(overview.contains("/srv/worker"));
+        assert!(!overview.contains("worker-loop"));
+
+        app.inspection_scroll = 5;
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.inspection_tab, InspectionTab::Threads);
+        assert_eq!(app.inspection_scroll, 0);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let threads = buffer_text(&terminal);
+        assert!(threads.contains("HOT THREADS"));
+        assert!(threads.contains("worker-loop"));
+        assert!(!threads.contains("127.0.0.1:8080"));
+
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.inspection_tab, InspectionTab::Ports);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let ports = buffer_text(&terminal);
+        assert!(ports.contains("PORTS & CONNECTIONS"));
+        assert!(ports.contains("127.0.0.1:8080"));
+        assert!(!ports.contains("/tmp/example.log"));
+
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.inspection_tab, InspectionTab::Files);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let files = buffer_text(&terminal);
+        assert!(files.contains("OPEN FILE DESCRIPTORS"));
+        assert!(files.contains("/tmp/example.log"));
+        assert!(!files.contains("worker-loop"));
+
+        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(app.inspection_tab, InspectionTab::Ports);
+
+        let compact_backend = TestBackend::new(40, 9);
+        let mut compact_terminal = Terminal::new(compact_backend).unwrap();
+        compact_terminal
+            .draw(|frame| draw(frame, &mut app))
+            .unwrap();
+        let compact = buffer_text(&compact_terminal);
+        assert!(compact.contains("Info"));
+        assert!(compact.contains("Thr"));
+        assert!(compact.contains("Net"));
+        assert!(compact.contains("File"));
+        assert!(compact.contains("127.0.0.1:8080"));
+
+        let tiny_backend = TestBackend::new(28, 8);
+        let mut tiny_terminal = Terminal::new(tiny_backend).unwrap();
+        tiny_terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let tiny = buffer_text(&tiny_terminal);
+        assert!(tiny.contains("3/4"));
+        assert!(tiny.contains("Ports 1"));
     }
 
     #[test]

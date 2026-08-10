@@ -551,6 +551,44 @@ struct NetworkTask {
     started_at: Instant,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum InspectionTab {
+    #[default]
+    Overview,
+    Threads,
+    Ports,
+    Files,
+}
+
+impl InspectionTab {
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::Overview => 0,
+            Self::Threads => 1,
+            Self::Ports => 2,
+            Self::Files => 3,
+        }
+    }
+
+    const fn next(self) -> Self {
+        match self {
+            Self::Overview => Self::Threads,
+            Self::Threads => Self::Ports,
+            Self::Ports => Self::Files,
+            Self::Files => Self::Overview,
+        }
+    }
+
+    const fn previous(self) -> Self {
+        match self {
+            Self::Overview => Self::Files,
+            Self::Threads => Self::Overview,
+            Self::Ports => Self::Threads,
+            Self::Files => Self::Ports,
+        }
+    }
+}
+
 struct InspectionTask {
     receiver: Receiver<ProcessInspection>,
     started_at: Instant,
@@ -723,6 +761,7 @@ pub(crate) struct App {
     pub(crate) last_changes: ChangeSummary,
     pub(crate) inspection: Option<ProcessInspection>,
     inspection_task: Option<InspectionTask>,
+    pub(crate) inspection_tab: InspectionTab,
     pub(crate) inspection_scroll: u16,
     pub(crate) service_context: Option<ServiceContextPanel>,
     service_context_task: Option<ServiceContextTask>,
@@ -842,6 +881,7 @@ impl App {
             last_changes: ChangeSummary::default(),
             inspection: None,
             inspection_task: None,
+            inspection_tab: InspectionTab::default(),
             inspection_scroll: 0,
             service_context: None,
             service_context_task: None,
@@ -1410,6 +1450,7 @@ impl App {
                 cwd: process.cwd.clone(),
                 ..ProcessInspection::default()
             });
+            self.inspection_tab = InspectionTab::default();
             self.inspection_scroll = 0;
         }
         let pid = process.pid;
@@ -3987,6 +4028,14 @@ impl App {
                 }
                 KeyCode::Char('M') => self.open_memory_context(),
                 KeyCode::Enter | KeyCode::Char('r') => self.refresh_inspection(),
+                KeyCode::Tab => {
+                    self.inspection_tab = self.inspection_tab.next();
+                    self.inspection_scroll = 0;
+                }
+                KeyCode::BackTab => {
+                    self.inspection_tab = self.inspection_tab.previous();
+                    self.inspection_scroll = 0;
+                }
                 KeyCode::Down | KeyCode::Char('j') => {
                     self.inspection_scroll = self.inspection_scroll.saturating_add(1);
                 }
