@@ -35,16 +35,18 @@ scripts/verify-release-package.sh dist/psmore-v*-$(rustc -vV | sed -n 's/^host: 
 
 ## crates.io
 
-首个版本发布前确认名称仍可用，并执行与 CI 相同的本地检查：
+crate 已发布在 <https://crates.io/crates/psmore>。每次推送 `vX.Y.Z` tag，Release workflow 的 `publish-crates` job 会通过 crates.io Trusted Publishing（GitHub OIDC）自动发布，仓库中不保存长期 `CARGO_REGISTRY_TOKEN`。
+
+一次性配置：在 <https://crates.io/crates/psmore/settings> 添加 GitHub Actions 受信发布者，owner 填 `wzfukui`、仓库填 `psmore`、workflow 文件名填 `release.yml`、不设置 environment。job 运行时先申请 OIDC token，经 `rust-lang/crates-io-auth-action` 换成短期 crates.io token，job 结束时自动吊销。
+
+发布前检查（CI 质量门禁已包含）：
 
 ```bash
 cargo package --locked
 cargo publish --locked --dry-run
 ```
 
-确认 GitHub Release 和 tag 对应同一 commit 后，再运行 `cargo publish --locked`。crates.io 的版本不可覆盖，因此只有 Cargo 版本、tag、变更记录、许可证和打包清单全部一致时才发布。
-
-首发完成后，在 crates.io 为 GitHub 仓库配置 Trusted Publishing。后续可由 tag workflow 使用 GitHub OIDC 发布，避免维护长期 `CARGO_REGISTRY_TOKEN`；在受信发布者配置完成前，保持 crate 发布为人工明确步骤。
+人工兜底（如 workflow 故障）：本地 `cargo login`，确认 GitHub Release 和 tag 对应同一 commit 后运行 `cargo publish --locked`。crates.io 的版本不可覆盖，因此只有 Cargo 版本、tag、变更记录、许可证和打包清单全部一致时才发布。
 
 ## Homebrew Tap
 

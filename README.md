@@ -46,10 +46,14 @@ brew install wzfukui/tap/psmore
 
 ### Cargo
 
+With Rust 1.85 or newer installed, install directly from crates.io:
+
 ```bash
 cargo install psmore --locked
 psmore --version
 ```
+
+The binary lands in `~/.cargo/bin/psmore` by default; make sure `~/.cargo/bin` is on your `PATH`.
 
 ### GitHub Release archive
 

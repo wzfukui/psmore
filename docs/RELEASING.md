@@ -59,22 +59,24 @@ Workflow permissions are minimal: repository `contents: write` permission is ena
 
 ## crates.io
 
-Before first publish:
+The crate is published at <https://crates.io/crates/psmore>. Each `vX.Y.Z` tag triggers the `publish-crates` job in the Release workflow, which publishes via crates.io Trusted Publishing (GitHub OIDC). No long-lived `CARGO_REGISTRY_TOKEN` is stored in the repository.
+
+One-time setup: on <https://crates.io/crates/psmore/settings>, add a Trusted Publishing entry for GitHub Actions with owner `wzfukui`, repository `psmore`, workflow filename `release.yml`, and no environment. The job requests an OIDC token, exchanges it for a short-lived crates.io token via `rust-lang/crates-io-auth-action`, and the token is revoked automatically when the job ends.
+
+Pre-publish checks (already part of the CI quality gate):
 
 ```bash
 cargo package --locked
 cargo publish --locked --dry-run
 ```
 
-After `v` tag and GitHub release point to the same commit, run:
+Manual fallback (e.g. workflow outage): run `cargo login` locally, wait until the GitHub Release and tag point to the same commit, then run:
 
 ```bash
 cargo publish --locked
 ```
 
 `Cargo` package versions are immutable. Ensure version/changelog/license/package metadata are fully aligned before publishing.
-
-If/when trusted publishing is configured for GitHub OIDC, release steps can move from manual token-based publishing to signed CI publishing.
 
 ## Homebrew tap
 
