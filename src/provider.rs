@@ -94,6 +94,17 @@ pub(crate) struct NativeProcessProvider {
     last_sample: Option<Instant>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct HostMetrics {
+    pub(crate) hostname: String,
+    pub(crate) load_one: f64,
+    pub(crate) cpu_percent: f32,
+    pub(crate) memory_used: u64,
+    pub(crate) memory_total: u64,
+    pub(crate) swap_used: u64,
+    pub(crate) swap_total: u64,
+}
+
 impl NativeProcessProvider {
     pub(crate) fn new() -> Self {
         Self {
@@ -101,6 +112,20 @@ impl NativeProcessProvider {
             users: Users::new_with_refreshed_list(),
             io_instances: HashMap::new(),
             last_sample: None,
+        }
+    }
+
+    pub(crate) fn host_metrics(&self) -> HostMetrics {
+        HostMetrics {
+            // Absence stays an empty sentinel so the UI can localize the
+            // fallback label in the user's language.
+            hostname: System::host_name().unwrap_or_default(),
+            load_one: System::load_average().one,
+            cpu_percent: self.system.global_cpu_usage(),
+            memory_used: self.system.used_memory(),
+            memory_total: self.system.total_memory(),
+            swap_used: self.system.used_swap(),
+            swap_total: self.system.total_swap(),
         }
     }
 }
@@ -121,6 +146,10 @@ impl ProcessProvider for NativeProcessProvider {
             .last_sample
             .replace(sampled_at)
             .map(|previous| sampled_at.saturating_duration_since(previous));
+        // Host-wide CPU and memory ride the same refresh cycle as the
+        // process list so the status bar never needs a second System.
+        self.system.refresh_memory();
+        self.system.refresh_cpu_usage();
         // A process relationship tool should not silently mix Linux tasks
         // (threads) into the process tree. Besides being noisy, task IDs are
         // short-lived and can look like stale child processes between samples.

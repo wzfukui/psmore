@@ -1,11 +1,12 @@
-use std::time::Duration;
+use std::{collections::VecDeque, time::Duration};
 
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     symbols,
     text::{Line, Span, Text},
+    widgets::block::Title,
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Sparkline, Wrap},
 };
 use sysinfo::Pid;
@@ -14,6 +15,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     actions::{ProcessActionKind, ProcessActionOutcome, ProcessActionRecord},
     app::{App, InspectionTab},
+    cli::{LogPriority, LogScope},
     filters::FilterAction,
     i18n::{UiLanguage, text},
     model::{
@@ -25,10 +27,89 @@ use crate::{
     onboarding::{GUIDANCE_PAGE_COUNT, GuidanceOverlay, TIPS},
     provider::platform_name,
     snapshot::{ProcessSnapshotEntry, SnapshotDiff},
+    theme::{GlyphMode, Glyphs, Theme},
 };
+
+/// Border set for the ASCII glyph fallback: plain `-`, `|`, `+` instead of
+/// Unicode line symbols, so every block edge stays pure ASCII.
+const ASCII_BORDERS: symbols::border::Set = symbols::border::Set {
+    top_left: "+",
+    top_right: "+",
+    bottom_left: "+",
+    bottom_right: "+",
+    vertical_left: "|",
+    vertical_right: "|",
+    horizontal_top: "-",
+    horizontal_bottom: "-",
+};
+
+/// Sparkline bars for the ASCII glyph fallback: a `.`/`:`/`=`/`#` ramp
+/// instead of the Unicode eighth-block levels.
+const ASCII_BARS: symbols::bar::Set = symbols::bar::Set {
+    full: "#",
+    seven_eighths: "#",
+    three_quarters: "=",
+    five_eighths: "=",
+    half: ":",
+    three_eighths: ":",
+    one_quarter: ".",
+    one_eighth: ".",
+    empty: " ",
+};
+
+/// Swap a block's border set for the ASCII one when the glyph fallback is
+/// active; Unicode mode keeps ratatui's default line symbols untouched.
+fn glyph_block(block: Block<'_>, mode: GlyphMode) -> Block<'_> {
+    match mode {
+        GlyphMode::Ascii => block.border_set(ASCII_BORDERS),
+        GlyphMode::Unicode => block,
+    }
+}
+
+/// The sparkline bar set for the active glyph repertoire.
+fn sparkline_bars(mode: GlyphMode) -> symbols::bar::Set {
+    match mode {
+        GlyphMode::Ascii => ASCII_BARS,
+        GlyphMode::Unicode => symbols::bar::NINE_LEVELS,
+    }
+}
+
+/// Translate decorative Unicode chrome (box-drawing separators, arrows,
+/// markers) in titles and hint bars to ASCII when the glyph fallback is
+/// active. Unicode mode returns the text unchanged.
+fn chrome(mode: GlyphMode, text: String) -> String {
+    if mode != GlyphMode::Ascii {
+        return text;
+    }
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '│' | '┃' => out.push('|'),
+            '─' | '━' => out.push('-'),
+            '┌' | '┐' | '└' | '┘' | '├' | '┤' | '┬' | '┴' | '┼' => out.push('+'),
+            '→' => out.push_str("->"),
+            '←' => out.push_str("<-"),
+            '↑' => out.push('^'),
+            '↓' => out.push('v'),
+            '↪' => out.push('>'),
+            '·' | '•' => out.push('.'),
+            '▾' => out.push('v'),
+            '▸' => out.push('>'),
+            '●' => out.push('*'),
+            '○' => out.push('o'),
+            '×' => out.push('x'),
+            '▲' => out.push('!'),
+            '✓' => out.push('+'),
+            '★' => out.push('*'),
+            _ => out.push(c),
+        }
+    }
+    out
+}
 
 fn row_label_and_context(app: &App, row: &TreeRow) -> (String, String) {
     let p = &app.processes[&row.pid];
+    let glyphs = &app.glyphs;
     let child_count = app
         .children
         .get(&Some(row.pid))
@@ -41,12 +122,12 @@ fn row_label_and_context(app: &App, row: &TreeRow) -> (String, String) {
         .unwrap_or(false)
     {
         if app.expanded.contains(&row.pid) {
-            "▾"
+            glyphs.expand_open
         } else {
-            "▸"
+            glyphs.expand_closed
         }
     } else {
-        "·"
+        glyphs.expand_leaf
     };
     let mut prefix = String::new();
     for is_last in row
@@ -55,10 +136,14 @@ fn row_label_and_context(app: &App, row: &TreeRow) -> (String, String) {
         .skip(1)
         .take(row.depth.saturating_sub(1))
     {
-        prefix.push_str(if *is_last { "  " } else { "│ " });
+        prefix.push_str(if *is_last { "  " } else { glyphs.tree_vertical });
     }
     if row.depth > 0 {
-        prefix.push_str(if row.is_last { "└─" } else { "├─" });
+        prefix.push_str(if row.is_last {
+            glyphs.tree_last
+        } else {
+            glyphs.tree_branch
+        });
     }
     let context = process_path(p);
     let name = if child_count > 0 && !app.expanded.contains(&row.pid) {
@@ -66,8 +151,15 @@ fn row_label_and_context(app: &App, row: &TreeRow) -> (String, String) {
     } else {
         p.name.clone()
     };
+    // The star sits between the expand marker and the name; its width is part
+    // of the label, so the path-column math below stays correct.
+    let star = if app.is_starred(row.pid) {
+        format!("{} ", glyphs.star)
+    } else {
+        String::new()
+    };
     (
-        format!("{}{} {}  [{}]", prefix, marker, name, row.pid),
+        format!("{}{} {}{}  [{}]", prefix, marker, star, name, row.pid),
         context,
     )
 }
@@ -214,23 +306,29 @@ fn parent_label(parent: Option<Pid>) -> String {
         .unwrap_or_else(|| "-".into())
 }
 
-fn event_line(event: &ProcessEvent) -> Line<'static> {
+fn event_line(
+    language: UiLanguage,
+    event: &ProcessEvent,
+    theme: &Theme,
+    glyphs: &Glyphs,
+) -> Line<'static> {
     let age = event.observed_at.elapsed().as_secs();
-    let (color, text) = match &event.change {
+    let (color, content) = match &event.change {
         ProcessChange::Started {
             pid, name, parent, ..
         } => (
-            Color::LightGreen,
+            theme.started_fg,
             format!(
-                "{:>4}s  + {} [{}]  parent {}",
+                "{:>4}s  + {} [{}]  {} {}",
                 age,
                 name,
                 pid,
+                text(language, "parent", "父"),
                 parent_label(*parent)
             ),
         ),
         ProcessChange::Exited { pid, name, .. } => (
-            Color::LightRed,
+            theme.severity_crit,
             format!("{:>4}s  - {} [{}]", age, name, pid),
         ),
         ProcessChange::Reparented {
@@ -240,26 +338,43 @@ fn event_line(event: &ProcessEvent) -> Line<'static> {
             new_parent,
             ..
         } => (
-            Color::LightYellow,
+            theme.reparented_fg,
             format!(
-                "{:>4}s  ↪ {} [{}]  {} → {}",
+                "{:>4}s  {} {} [{}]  {} {} {}",
                 age,
+                glyphs.reparent,
                 name,
                 pid,
                 parent_label(*old_parent),
+                glyphs.arrow_right,
                 parent_label(*new_parent)
             ),
         ),
     };
-    Line::from(Span::styled(text, Style::default().fg(color)))
+    Line::from(Span::styled(content, Style::default().fg(color)))
 }
 
-fn action_line(record: &ProcessActionRecord) -> Line<'static> {
+fn action_outcome_label(language: UiLanguage, outcome: &ProcessActionOutcome) -> &'static str {
+    match (language, outcome) {
+        (UiLanguage::English, _) => outcome.label(),
+        (UiLanguage::Chinese, ProcessActionOutcome::Sent) => "已发送",
+        (UiLanguage::Chinese, ProcessActionOutcome::Refused(_)) => "已拒绝",
+        (UiLanguage::Chinese, ProcessActionOutcome::Failed(_)) => "失败",
+    }
+}
+
+fn action_line(
+    language: UiLanguage,
+    record: &ProcessActionRecord,
+    theme: &Theme,
+    glyphs: &Glyphs,
+    mode: GlyphMode,
+) -> Line<'static> {
     let age = record.observed_at.elapsed().as_secs();
     let (color, marker) = match &record.outcome {
-        ProcessActionOutcome::Sent => (Color::LightGreen, "✓"),
+        ProcessActionOutcome::Sent => (theme.severity_info, glyphs.ok),
         ProcessActionOutcome::Refused(_) => (Color::LightYellow, "!"),
-        ProcessActionOutcome::Failed(_) => (Color::LightRed, "×"),
+        ProcessActionOutcome::Failed(_) => (theme.severity_crit, "×"),
     };
     let detail = record
         .outcome
@@ -267,14 +382,17 @@ fn action_line(record: &ProcessActionRecord) -> Line<'static> {
         .map(|detail| format!("  {detail}"))
         .unwrap_or_default();
     Line::from(Span::styled(
-        format!(
-            "{:>4}s  {marker} {} {} [{}]  {}{}",
-            age,
-            record.action.label(),
-            record.target.name,
-            record.target.pid,
-            record.outcome.label(),
-            detail
+        chrome(
+            mode,
+            format!(
+                "{:>4}s  {marker} {} {} [{}]  {}{}",
+                age,
+                record.action.label(),
+                record.target.name,
+                record.target.pid,
+                action_outcome_label(language, &record.outcome),
+                detail
+            ),
         ),
         Style::default().fg(color),
     ))
@@ -282,6 +400,7 @@ fn action_line(record: &ProcessActionRecord) -> Line<'static> {
 
 fn draw_event_overlay(frame: &mut Frame, app: &App, area: Rect) {
     let language = app.language();
+    let theme = &app.theme;
     let width = area.width.saturating_sub(2).clamp(1, 100);
     let height = area.height.saturating_sub(2).clamp(1, 18);
     let popup = Rect::new(
@@ -296,7 +415,7 @@ fn draw_event_overlay(frame: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(Span::styled(
             text(language, " ACTIONS", " 操作记录"),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         )));
         let action_limit = line_limit.saturating_sub(1).min(5);
@@ -305,18 +424,24 @@ fn draw_event_overlay(frame: &mut Frame, app: &App, area: Rect) {
                 .iter()
                 .rev()
                 .take(action_limit)
-                .map(action_line),
+                .map(|record| action_line(language, record, theme, &app.glyphs, app.glyph_mode)),
         );
     }
     if !app.events.is_empty() && lines.len() < line_limit {
         lines.push(Line::from(Span::styled(
             text(language, " PROCESS CHANGES", " 进程变化"),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         )));
         let remaining = line_limit.saturating_sub(lines.len());
-        lines.extend(app.events.iter().rev().take(remaining).map(event_line));
+        lines.extend(
+            app.events
+                .iter()
+                .rev()
+                .take(remaining)
+                .map(|event| event_line(language, event, theme, &app.glyphs)),
+        );
     }
     if lines.is_empty() {
         lines.push(Line::from(text(
@@ -340,7 +465,12 @@ fn draw_event_overlay(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(title))
+            .block(glyph_block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(chrome(app.glyph_mode, title)),
+                app.glyph_mode,
+            ))
             .wrap(Wrap { trim: false }),
         popup,
     );
@@ -380,19 +510,24 @@ fn draw_process_action_overlay(frame: &mut Frame, app: &App, area: Rect) {
     );
     let target = &dialog.target;
     let language = app.language();
+    let theme = &app.theme;
     let mut lines = vec![
         Line::from(vec![
             Span::styled(
                 format!("{} [{}]", target.name, target.pid),
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(format!("  started {}", target.start_time)),
+            Span::raw(format!(
+                "  {} {}",
+                text(language, "started", "启动于"),
+                target.start_time
+            )),
         ]),
         Line::from(Span::styled(
             marquee(&target.command, 0, width.saturating_sub(4).max(1) as usize),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.dim),
         )),
         Line::from(""),
     ];
@@ -430,7 +565,7 @@ fn draw_process_action_overlay(frame: &mut Frame, app: &App, area: Rect) {
                         "该操作会改变正在运行的进程，并可能影响其完整服务树。",
                     )
                 },
-                Style::default().fg(Color::LightRed),
+                Style::default().fg(theme.severity_crit),
             )),
             Line::from(text(
                 language,
@@ -445,10 +580,14 @@ fn draw_process_action_overlay(frame: &mut Frame, app: &App, area: Rect) {
                         .fg(Color::LightYellow)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(text(
-                    language,
-                    "  ·  Esc returns without changing the process",
-                    "  ·  Esc 返回且不改变进程",
+                Span::raw(chrome(
+                    app.glyph_mode,
+                    text(
+                        language,
+                        "  ·  Esc returns without changing the process",
+                        "  ·  Esc 返回且不改变进程",
+                    )
+                    .to_string(),
                 )),
             ]),
         ]);
@@ -469,7 +608,11 @@ fn draw_process_action_overlay(frame: &mut Frame, app: &App, area: Rect) {
             .into()
         };
         for (index, action) in dialog.actions().iter().copied().enumerate() {
-            let marker = if index == dialog.selected { "▸" } else { " " };
+            let marker = if index == dialog.selected {
+                app.glyphs.expand_closed
+            } else {
+                " "
+            };
             let style = if index == dialog.selected {
                 Style::default()
                     .fg(Color::Black)
@@ -496,14 +639,19 @@ fn draw_process_action_overlay(frame: &mut Frame, app: &App, area: Rect) {
                     "No signal is sent here: review the next screen, then press y to confirm.",
                     "此处不会发送信号：请在下一页复核，然后按 y 确认。",
                 ),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.dim),
             )),
         ]);
     }
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(title))
+            .block(glyph_block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(chrome(app.glyph_mode, title)),
+                app.glyph_mode,
+            ))
             .wrap(Wrap { trim: false }),
         popup,
     );
@@ -518,6 +666,7 @@ fn filter_action_label(language: UiLanguage, action: FilterAction) -> &'static s
 
 fn draw_filter_manager_overlay(frame: &mut Frame, app: &App, area: Rect) {
     let language = app.language();
+    let theme = &app.theme;
     let width = area.width.saturating_sub(2).clamp(1, 132);
     let height = area.height.saturating_sub(2).clamp(1, 22);
     let popup = Rect::new(
@@ -559,41 +708,54 @@ fn draw_filter_manager_overlay(frame: &mut Frame, app: &App, area: Rect) {
                     format!(" {}  ", filter_action_label(language, editor.action)),
                     Style::default()
                         .fg(if editor.action == FilterAction::Include {
-                            Color::LightGreen
+                            theme.severity_info
                         } else {
-                            Color::LightRed
+                            theme.severity_crit
                         })
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(format!("{}▏", editor.input)),
+                Span::raw(format!("{}{}", editor.input, app.glyphs.cursor)),
             ]),
             Line::from(""),
-            Line::from(text(
-                language,
-                " Text: path:/System/Library  ·  combined: path:/opt name:python",
-                " 文本：path:/System/Library  ·  组合：path:/opt name:python",
+            Line::from(chrome(
+                app.glyph_mode,
+                text(
+                    language,
+                    " Text: path:/System/Library  ·  combined: path:/opt name:python",
+                    " 文本：path:/System/Library  ·  组合：path:/opt name:python",
+                )
+                .to_string(),
             )),
             Line::from(text(
                 language,
                 r" Regex: path~^/Applications/(ChatGPT|Otty)\.app/  (case-sensitive; (?i) supported)",
                 r" 正则：path~^/Applications/(ChatGPT|Otty)\.app/（区分大小写；支持 (?i)）",
             )),
-            Line::from(text(
-                language,
-                " Spaces: path:\"/Applications/Google Chrome.app\"  ·  fields: any/name/cmd/path/user/state",
-                " 空格：path:\"/Applications/Google Chrome.app\"  ·  字段：any/name/cmd/path/user/state",
+            Line::from(chrome(
+                app.glyph_mode,
+                text(
+                    language,
+                    " Spaces: path:\"/Applications/Google Chrome.app\"  ·  fields: any/name/cmd/path/user/state",
+                    " 空格：path:\"/Applications/Google Chrome.app\"  ·  字段：any/name/cmd/path/user/state",
+                )
+                .to_string(),
             )),
         ];
         if let Some(error) = &editor.error {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 format!(" {}: {error}", text(language, "error", "错误")),
-                Style::default().fg(Color::LightRed),
+                Style::default().fg(theme.severity_crit),
             )));
         }
         frame.render_widget(
             Paragraph::new(lines)
-                .block(Block::default().borders(Borders::ALL).title(title))
+                .block(glyph_block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(chrome(app.glyph_mode, title)),
+                    app.glyph_mode,
+                ))
                 .wrap(Wrap { trim: false }),
             popup,
         );
@@ -610,22 +772,26 @@ fn draw_filter_manager_overlay(frame: &mut Frame, app: &App, area: Rect) {
                 " No filters. Press a to add an ALLOW rule or x to add a DENY rule.",
                 " 暂无过滤规则。按 a 新增包含规则，或按 x 新增排除规则。",
             ))
-            .style(Style::default().fg(Color::DarkGray)),
+            .style(Style::default().fg(theme.dim)),
         ]
     } else {
         app.process_filters
             .iter()
             .enumerate()
             .map(|(index, rule)| {
-                let enabled = if rule.enabled { "●" } else { "○" };
+                let enabled = if rule.enabled {
+                    app.glyphs.filter_on
+                } else {
+                    app.glyphs.filter_off
+                };
                 let style = if rule.enabled {
                     Style::default().fg(if rule.action == FilterAction::Include {
-                        Color::LightGreen
+                        theme.severity_info
                     } else {
-                        Color::LightRed
+                        theme.severity_crit
                     })
                 } else {
-                    Style::default().fg(Color::DarkGray)
+                    Style::default().fg(theme.dim)
                 };
                 ListItem::new(format!(
                     " {:>2}. {enabled} {:<5}  {}",
@@ -648,13 +814,13 @@ fn draw_filter_manager_overlay(frame: &mut Frame, app: &App, area: Rect) {
         app.processes.len().saturating_sub(1)
     );
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .highlight_style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        );
+        .block(glyph_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(chrome(app.glyph_mode, title)),
+            app.glyph_mode,
+        ))
+        .highlight_style(theme.selection());
     let mut state = ListState::default();
     if !app.process_filters.is_empty() {
         state.select(Some(app.filter_selected));
@@ -662,9 +828,9 @@ fn draw_filter_manager_overlay(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_stateful_widget(list, chunks[0], &mut state);
 
     let error_style = if app.filter_error.is_some() {
-        Style::default().fg(Color::LightRed)
+        Style::default().fg(theme.severity_crit)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(theme.dim)
     };
     let error = app
         .filter_error
@@ -680,10 +846,14 @@ fn draw_filter_manager_overlay(frame: &mut Frame, app: &App, area: Rect) {
         });
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(text(
-                language,
-                " a allow  x deny  Enter/e edit  Space enable  d delete  ↑↓ move  F/Esc close",
-                " a 包含  x 排除  Enter/e 编辑  Space 启停  d 删除  ↑↓ 移动  F/Esc 关闭",
+            Line::from(chrome(
+                app.glyph_mode,
+                text(
+                    language,
+                    " a allow  x deny  Enter/e edit  Space enable  d delete  ↑↓ move  F/Esc close",
+                    " a 包含  x 排除  Enter/e 编辑  Space 启停  d 删除  ↑↓ 移动  F/Esc 关闭",
+                )
+                .to_string(),
             )),
             Line::from(Span::styled(error, error_style)),
             Line::from(text(
@@ -693,6 +863,120 @@ fn draw_filter_manager_overlay(frame: &mut Frame, app: &App, area: Rect) {
             )),
         ]),
         chunks[1],
+    );
+}
+
+fn draw_palette_overlay(frame: &mut Frame, app: &App, area: Rect) {
+    let language = app.language();
+    let theme = &app.theme;
+    let width = area.width.saturating_sub(2).clamp(1, 72);
+    let height = area.height.saturating_sub(2).clamp(1, 16);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    let block = glyph_block(
+        Block::default().borders(Borders::ALL).title(text(
+            language,
+            " command palette ",
+            " 命令面板 ",
+        )),
+        app.glyph_mode,
+    );
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(":", Style::default().fg(Color::LightCyan)),
+            Span::raw(format!("{}{}", app.palette_query, app.glyphs.cursor)),
+        ])),
+        chunks[0],
+    );
+
+    let matches = app.palette_matches();
+    let inner_width = chunks[1].width as usize;
+    let visible_rows = chunks[1].height as usize;
+    let selected = app.palette_selected.min(matches.len().saturating_sub(1));
+    let start = if selected < visible_rows {
+        0
+    } else {
+        selected - visible_rows + 1
+    };
+    let lines: Vec<Line> = if matches.is_empty() {
+        vec![Line::from(Span::styled(
+            text(language, " no matching commands ", " 无匹配命令 "),
+            Style::default().fg(theme.dim),
+        ))]
+    } else {
+        // Descriptions need room to be useful; below ~50 columns the row is
+        // just the command name and its key hint.
+        let show_description = inner_width >= 50;
+        matches
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible_rows)
+            .map(|(index, command)| {
+                let name = text(language, command.en_name, command.zh_name);
+                let mut row = format!(" {name}");
+                row.push_str(&" ".repeat(22_usize.saturating_sub(name.width())));
+                let hint = command.key_hint;
+                if show_description {
+                    // The right-aligned hint always keeps one column of gap;
+                    // the description is clipped by display width to fit.
+                    let description =
+                        text(language, command.en_description, command.zh_description);
+                    let budget = inner_width.saturating_sub(row.width() + hint.width() + 2);
+                    let mut used = 0;
+                    for character in description.chars() {
+                        let width = character.width().unwrap_or(0);
+                        if used + width > budget {
+                            break;
+                        }
+                        used += width;
+                        row.push(character);
+                    }
+                }
+                let gap = inner_width.saturating_sub(row.width() + hint.width() + 1);
+                row.push_str(&" ".repeat(gap));
+                row.push_str(hint);
+                let style = if index == selected {
+                    theme.selection()
+                } else {
+                    Style::default().fg(theme.tree_fg)
+                };
+                Line::from(Span::styled(row, style))
+            })
+            .collect()
+    };
+    frame.render_widget(Paragraph::new(lines), chunks[1]);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            chrome(
+                app.glyph_mode,
+                format!(
+                    " {} ",
+                    text(
+                        language,
+                        "↑↓ select · Enter run · Esc close",
+                        "↑↓ 选择 · Enter 执行 · Esc 关闭",
+                    )
+                ),
+            ),
+            Style::default().fg(theme.dim),
+        ))),
+        chunks[2],
     );
 }
 
@@ -945,13 +1229,9 @@ fn inspection_lines(
     lines
 }
 
-fn inspection_tabs_line(
-    inspection: &ProcessInspection,
-    active: InspectionTab,
-    language: UiLanguage,
-    available_width: u16,
-) -> Line<'static> {
-    let full_labels = [
+/// The full tab labels with live counts, independent of width.
+fn inspection_full_labels(inspection: &ProcessInspection, language: UiLanguage) -> [String; 4] {
+    [
         text(language, "Overview", "概览").to_string(),
         format!(
             "{} {}",
@@ -968,8 +1248,53 @@ fn inspection_tabs_line(
             text(language, "Files", "文件"),
             inspection.files.len()
         ),
+    ]
+}
+
+/// Display width of a rendered tab bar: each label padded by one cell on
+/// both sides, joined by three-cell separators. CJK labels are double-width,
+/// so this must be measured, not assumed.
+fn inspection_tab_bar_width(labels: &[String]) -> usize {
+    labels.iter().map(|label| label.width() + 2).sum::<usize>() + labels.len().saturating_sub(1) * 3
+}
+
+/// The visible tab labels for the current width, or `None` when the terminal
+/// is so narrow that only the active tab is shown (no clickable tab bar).
+/// Full labels are preferred from 58 columns up, compact below that, but a
+/// set is only used when its measured width actually fits; oversized
+/// count-bearing labels degrade gracefully instead of clipping.
+fn inspection_tab_labels(
+    inspection: &ProcessInspection,
+    language: UiLanguage,
+    available_width: u16,
+) -> Option<Vec<String>> {
+    let full_labels = inspection_full_labels(inspection, language);
+    let compact_labels = [
+        text(language, "Info", "概览").to_string(),
+        text(language, "Thr", "线程").to_string(),
+        text(language, "Net", "端口").to_string(),
+        text(language, "File", "文件").to_string(),
     ];
-    if available_width < 32 {
+    let available_width = usize::from(available_width);
+    if available_width >= 58 && inspection_tab_bar_width(&full_labels) <= available_width {
+        return Some(full_labels.into());
+    }
+    if inspection_tab_bar_width(&compact_labels) <= available_width {
+        return Some(compact_labels.into());
+    }
+    None
+}
+
+fn inspection_tabs_line(
+    inspection: &ProcessInspection,
+    active: InspectionTab,
+    language: UiLanguage,
+    available_width: u16,
+    theme: &Theme,
+    mode: GlyphMode,
+) -> Line<'static> {
+    let Some(labels) = inspection_tab_labels(inspection, language, available_width) else {
+        let active_label = inspection_full_labels(inspection, language);
         return Line::from(vec![
             Span::styled(
                 format!(" {}/4 ", active.index() + 1),
@@ -979,29 +1304,24 @@ fn inspection_tabs_line(
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                full_labels[active.index()].clone(),
+                active_label[active.index()].clone(),
                 Style::default()
                     .fg(Color::LightCyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" · Tab →", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                chrome(mode, " · Tab →".to_string()),
+                Style::default().fg(theme.dim),
+            ),
         ]);
-    }
-    let compact_labels = [
-        text(language, "Info", "概览").to_string(),
-        text(language, "Thr", "线程").to_string(),
-        text(language, "Net", "端口").to_string(),
-        text(language, "File", "文件").to_string(),
-    ];
-    let labels = if available_width < 58 {
-        compact_labels
-    } else {
-        full_labels
     };
     let mut spans = Vec::new();
     for (index, label) in labels.into_iter().enumerate() {
         if index > 0 {
-            spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(
+                chrome(mode, " │ ".to_string()),
+                Style::default().fg(theme.dim),
+            ));
         }
         let style = if index == active.index() {
             Style::default()
@@ -1009,27 +1329,36 @@ fn inspection_tabs_line(
                 .bg(Color::LightCyan)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Gray)
+            Style::default().fg(theme.muted)
         };
         spans.push(Span::styled(format!(" {label} "), style));
     }
     Line::from(spans)
 }
 
-fn draw_inspection_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
+fn draw_inspection_overlay(frame: &mut Frame, app: &mut App, area: Rect, tree_area: Rect) {
     let Some(inspection) = &app.inspection else {
         return;
     };
     let width = area.width.saturating_sub(2).clamp(1, 140);
-    let height = area.height.saturating_sub(2).max(1);
+    // On tall terminals the popup hugs the process-tree block so its bottom
+    // border never dips into the selected-process pane below; on cramped
+    // ones keep the legacy full-height layout so content still fits.
+    let (popup_y, popup_height) = if area.height >= 20 {
+        (tree_area.y, tree_area.height.max(1))
+    } else {
+        let height = area.height.saturating_sub(2).max(1);
+        (area.y + area.height.saturating_sub(height) / 2, height)
+    };
     let popup = Rect::new(
         area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2,
+        popup_y,
         width,
-        height,
+        popup_height,
     );
     let language = app.language();
     let active_tab = app.inspection_tab;
+    let theme = app.theme;
     let mut lines = inspection_lines(inspection, active_tab, language);
     let inspection_status = if app.inspection_is_scanning() {
         let elapsed = app.inspection_elapsed();
@@ -1040,17 +1369,17 @@ fn draw_inspection_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
                 match language {
                     UiLanguage::English => format!(
                         " {} collecting process context in the background ({:.1}s)",
-                        activity_spinner(elapsed),
+                        activity_spinner(elapsed, &app.glyphs),
                         elapsed.as_secs_f64()
                     ),
                     UiLanguage::Chinese => format!(
                         " {} 正在后台采集进程上下文（{:.1}s）",
-                        activity_spinner(elapsed),
+                        activity_spinner(elapsed, &app.glyphs),
                         elapsed.as_secs_f64()
                     ),
                 },
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
             )),
         );
@@ -1069,10 +1398,13 @@ fn draw_inspection_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         ),
     };
     frame.render_widget(Clear, popup);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::LightCyan))
-        .title(title);
+    let block = glyph_block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.border_focused))
+            .title(title),
+        app.glyph_mode,
+    );
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     let sections = Layout::default()
@@ -1089,9 +1421,33 @@ fn draw_inspection_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
             active_tab,
             language,
             sections[0].width,
+            &theme,
+            app.glyph_mode,
         )),
         sections[0],
     );
+    // Record each tab label's clickable region (label plus its padding,
+    // excluding the separators) for mouse tab switching, clipped to the
+    // tab-bar rect actually on screen.
+    app.inspection_tab_regions.clear();
+    if let Some(labels) = inspection_tab_labels(inspection, language, sections[0].width) {
+        let bar_end = sections[0].x.saturating_add(sections[0].width);
+        let mut x = sections[0].x;
+        for (index, label) in labels.iter().enumerate() {
+            if index > 0 {
+                x = x.saturating_add(3);
+            }
+            let width = label.width() as u16 + 2;
+            let clipped = width.min(bar_end.saturating_sub(x));
+            if clipped > 0 {
+                if let Some(tab) = InspectionTab::from_index(index) {
+                    app.inspection_tab_regions
+                        .push((Rect::new(x, sections[0].y, clipped, 1), tab));
+                }
+            }
+            x = x.saturating_add(width);
+        }
+    }
     let content_height = sections[1].height as usize;
     let content_width = sections[1].width.max(1) as usize;
     let visual_lines = lines
@@ -1109,12 +1465,16 @@ fn draw_inspection_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         sections[1],
     );
     frame.render_widget(
-        Paragraph::new(text(
-            language,
-            " Tab card · Shift+Tab back · ↑↓ scroll · Enter/r refresh · M memory · D dossier · Esc close",
-            " Tab 切换卡片 · Shift+Tab 返回 · ↑↓ 滚动 · Enter/r 刷新 · M 内存 · D 档案 · Esc 关闭",
+        Paragraph::new(chrome(
+            app.glyph_mode,
+            text(
+                language,
+                " Tab/←→ card · ↑↓ scroll · Enter/r refresh · M memory · D dossier · Esc close",
+                " Tab/←→ 切换卡片 · ↑↓ 滚动 · Enter/r 刷新 · M 内存 · D 档案 · Esc 关闭",
+            )
+            .to_string(),
         ))
-        .style(Style::default().fg(Color::DarkGray)),
+        .style(Style::default().fg(theme.dim)),
         sections[2],
     );
 }
@@ -1139,12 +1499,12 @@ fn draw_dossier_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
             match language {
                 UiLanguage::English => format!(
                     " {} collecting process dossier in parallel ({:.1}s)",
-                    activity_spinner(elapsed),
+                    activity_spinner(elapsed, &app.glyphs),
                     elapsed.as_secs_f64()
                 ),
                 UiLanguage::Chinese => format!(
                     " {} 正在并行采集进程档案（{:.1}s）",
-                    activity_spinner(elapsed),
+                    activity_spinner(elapsed, &app.glyphs),
                     elapsed.as_secs_f64()
                 ),
             },
@@ -1196,7 +1556,7 @@ fn draw_dossier_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         } else if trimmed.contains("complete") {
             Style::default().fg(Color::DarkGray)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(app.theme.tree_fg)
         };
         lines.push(Line::from(Span::styled(line.to_owned(), style)));
     }
@@ -1222,30 +1582,47 @@ fn draw_dossier_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         ""
     };
     let logs = if panel.include_logs {
-        format!(
-            "logs on {} <= {} {}",
-            panel.scope.label(),
-            panel.priority.label(),
-            compact_duration(panel.since_seconds)
-        )
+        match language {
+            UiLanguage::English => format!(
+                "logs on {} <= {} {}",
+                log_scope_label(language, panel.scope),
+                log_priority_label(language, panel.priority),
+                compact_duration(panel.since_seconds)
+            ),
+            UiLanguage::Chinese => format!(
+                "日志开 {} <= {} {}",
+                log_scope_label(language, panel.scope),
+                log_priority_label(language, panel.priority),
+                compact_duration(panel.since_seconds)
+            ),
+        }
     } else {
-        "logs off".into()
+        text(language, "logs off", "日志关").into()
     };
-    let hash = if panel.hash { "hash on" } else { "hash off" };
+    let hash = if panel.hash {
+        text(language, "hash on", "哈希开")
+    } else {
+        text(language, "hash off", "哈希关")
+    };
     let title = match language {
         UiLanguage::English => format!(
-            " dossier {} [{}]{}  {}  {}  r refresh  s/p/w logs  h hash  L logs  i/M/m/v/l evidence  D/Esc close ",
+            " dossier {} [{}]{}  {}  {}  r refresh  s/p/w logs  h hash  g logs  i/M/m/v/l evidence  D/Esc close ",
             panel.name, panel.pid, scanning, logs, hash
         ),
         UiLanguage::Chinese => format!(
-            " 进程档案 {} [{}]{}  {}  {}  r 刷新  s/p/w 日志  h 哈希  L 日志开关  i/M/m/v/l 证据  D/Esc 关闭 ",
+            " 进程档案 {} [{}]{}  {}  {}  r 刷新  s/p/w 日志  h 哈希  g 日志开关  i/M/m/v/l 证据  D/Esc 关闭 ",
             panel.name, panel.pid, scanning, logs, hash
         ),
     };
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(title))
+            .block(glyph_block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(chrome(app.glyph_mode, title)),
+                app.glyph_mode,
+            ))
             .scroll((app.dossier_context_scroll, 0))
             .wrap(Wrap { trim: false }),
         popup,
@@ -1272,12 +1649,12 @@ fn draw_memory_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
             match language {
                 UiLanguage::English => format!(
                     " {} attributing process memory in the background ({:.1}s)",
-                    activity_spinner(elapsed),
+                    activity_spinner(elapsed, &app.glyphs),
                     elapsed.as_secs_f64()
                 ),
                 UiLanguage::Chinese => format!(
                     " {} 正在后台归因进程内存（{:.1}s）",
-                    activity_spinner(elapsed),
+                    activity_spinner(elapsed, &app.glyphs),
                     elapsed.as_secs_f64()
                 ),
             },
@@ -1321,7 +1698,7 @@ fn draw_memory_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         } else if trimmed.starts_with("CATEGORY") || trimmed.starts_with("VIRTUAL") {
             Style::default().fg(Color::DarkGray)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(app.theme.tree_fg)
         };
         lines.push(Line::from(Span::styled(line.to_owned(), style)));
     }
@@ -1363,7 +1740,12 @@ fn draw_memory_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(title))
+            .block(glyph_block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(chrome(app.glyph_mode, title)),
+                app.glyph_mode,
+            ))
             .scroll((app.memory_context_scroll, 0))
             .wrap(Wrap { trim: false }),
         popup,
@@ -1390,12 +1772,12 @@ fn draw_service_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
             match language {
                 UiLanguage::English => format!(
                     " {} resolving systemd/launchd ownership in the background ({:.1}s)",
-                    activity_spinner(elapsed),
+                    activity_spinner(elapsed, &app.glyphs),
                     elapsed.as_secs_f64()
                 ),
                 UiLanguage::Chinese => format!(
                     " {} 正在后台解析 systemd/launchd 归属（{:.1}s）",
-                    activity_spinner(elapsed),
+                    activity_spinner(elapsed, &app.glyphs),
                     elapsed.as_secs_f64()
                 ),
             },
@@ -1428,7 +1810,7 @@ fn draw_service_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         } else if line.starts_with("evidence ") {
             Style::default().fg(Color::DarkGray)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(app.theme.tree_fg)
         };
         lines.push(Line::from(Span::styled(line.to_owned(), style)));
     }
@@ -1470,7 +1852,12 @@ fn draw_service_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(title))
+            .block(glyph_block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(chrome(app.glyph_mode, title)),
+                app.glyph_mode,
+            ))
             .scroll((app.service_context_scroll, 0))
             .wrap(Wrap { trim: false }),
         popup,
@@ -1497,12 +1884,12 @@ fn draw_executable_context_overlay(frame: &mut Frame, app: &mut App, area: Rect)
             match language {
                 UiLanguage::English => format!(
                     " {} verifying executable image and provenance in the background ({:.1}s)",
-                    activity_spinner(elapsed),
+                    activity_spinner(elapsed, &app.glyphs),
                     elapsed.as_secs_f64()
                 ),
                 UiLanguage::Chinese => format!(
                     " {} 正在后台验证运行映像及来源（{:.1}s）",
-                    activity_spinner(elapsed),
+                    activity_spinner(elapsed, &app.glyphs),
                     elapsed.as_secs_f64()
                 ),
             },
@@ -1545,7 +1932,7 @@ fn draw_executable_context_overlay(frame: &mut Frame, app: &mut App, area: Rect)
         } else if line.starts_with("coverage ") {
             Style::default().fg(Color::DarkGray)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(app.theme.tree_fg)
         };
         lines.push(Line::from(Span::styled(line.to_owned(), style)));
     }
@@ -1574,7 +1961,11 @@ fn draw_executable_context_overlay(frame: &mut Frame, app: &mut App, area: Rect)
     } else {
         ""
     };
-    let hash = if panel.hash { "hash on" } else { "hash off" };
+    let hash = if panel.hash {
+        text(language, "hash on", "哈希开")
+    } else {
+        text(language, "hash off", "哈希关")
+    };
     let title = match language {
         UiLanguage::English => format!(
             " verify image {} [{}]{}  {}  Enter/r refresh  h hash  M memory  D dossier  m manager  l logs  v/Esc close ",
@@ -1588,7 +1979,12 @@ fn draw_executable_context_overlay(frame: &mut Frame, app: &mut App, area: Rect)
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(title))
+            .block(glyph_block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(chrome(app.glyph_mode, title)),
+                app.glyph_mode,
+            ))
             .scroll((app.executable_context_scroll, 0))
             .wrap(Wrap { trim: false }),
         popup,
@@ -1625,12 +2021,12 @@ fn draw_logs_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
             match language {
                 UiLanguage::English => format!(
                     " {} reading bounded native logs in the background ({:.1}s)",
-                    activity_spinner(elapsed),
+                    activity_spinner(elapsed, &app.glyphs),
                     elapsed.as_secs_f64()
                 ),
                 UiLanguage::Chinese => format!(
                     " {} 正在后台读取有界原生日志（{:.1}s）",
-                    activity_spinner(elapsed),
+                    activity_spinner(elapsed, &app.glyphs),
                     elapsed.as_secs_f64()
                 ),
             },
@@ -1667,7 +2063,7 @@ fn draw_logs_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         } else if line.contains(" warning ") {
             Style::default().fg(Color::Yellow)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(app.theme.tree_fg)
         };
         lines.push(Line::from(Span::styled(line.to_owned(), style)));
     }
@@ -1702,8 +2098,8 @@ fn draw_logs_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
             panel.name,
             panel.pid,
             scanning,
-            panel.scope.label(),
-            panel.priority.label(),
+            log_scope_label(language, panel.scope),
+            log_priority_label(language, panel.priority),
             compact_duration(panel.since_seconds),
         ),
         UiLanguage::Chinese => format!(
@@ -1711,15 +2107,20 @@ fn draw_logs_context_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
             panel.name,
             panel.pid,
             scanning,
-            panel.scope.label(),
-            panel.priority.label(),
+            log_scope_label(language, panel.scope),
+            log_priority_label(language, panel.priority),
             compact_duration(panel.since_seconds),
         ),
     };
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(title))
+            .block(glyph_block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(chrome(app.glyph_mode, title)),
+                app.glyph_mode,
+            ))
             .scroll((app.logs_context_scroll, 0))
             .wrap(Wrap { trim: false }),
         popup,
@@ -1790,7 +2191,10 @@ fn draw_trend_overlay(frame: &mut Frame, app: &App, area: Rect) {
             app.trend_view.label()
         ),
     };
-    let block = Block::default().borders(Borders::ALL).title(title);
+    let block = glyph_block(
+        Block::default().borders(Borders::ALL).title(title),
+        app.glyph_mode,
+    );
     let inner = block.inner(popup);
     frame.render_widget(Clear, popup);
     frame.render_widget(block, popup);
@@ -1804,9 +2208,10 @@ fn draw_trend_overlay(frame: &mut Frame, app: &App, area: Rect) {
     };
     if inner.height < 10 || inner.width < 10 {
         frame.render_widget(
-            Paragraph::new(format!(
-                "{} samples; enlarge terminal for charts",
-                samples.len()
+            Paragraph::new(text(
+                language,
+                "enlarge terminal for charts",
+                "放大终端以显示图表",
             )),
             inner,
         );
@@ -1838,16 +2243,32 @@ fn draw_trend_overlay(frame: &mut Frame, app: &App, area: Rect) {
     .split(inner);
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(format!(
-                " {} samples / {}s window | subtree {} proc | newest at right",
-                samples.len(),
-                window,
-                subtree_processes
-            )),
+            Line::from(match language {
+                UiLanguage::English => format!(
+                    " {} samples / {}s window | subtree {} proc | newest at right",
+                    samples.len(),
+                    window,
+                    subtree_processes
+                ),
+                UiLanguage::Chinese => format!(
+                    " {} 个样本 / {}s 窗口 | 子树 {} 进程 | 最新在右",
+                    samples.len(),
+                    window,
+                    subtree_processes
+                ),
+            }),
             Line::from(if app.trend_view == TrendView::Io {
-                " shared I/O scale: read/write and self/tree charts are directly comparable"
+                text(
+                    language,
+                    " shared I/O scale: read/write and self/tree charts are directly comparable",
+                    " 读写共用刻度：读/写与自身/子树图表可直接对比",
+                )
             } else {
-                " shared scale per metric: self and tree charts are directly comparable"
+                text(
+                    language,
+                    " shared scale per metric: self and tree charts are directly comparable",
+                    " 每项指标共用刻度：自身与子树图表可直接对比",
+                )
             }),
         ]),
         chunks[0],
@@ -1874,25 +2295,53 @@ fn draw_trend_overlay(frame: &mut Frame, app: &App, area: Rect) {
             .unwrap_or(1)
             .max(1);
         let series = [
-            ("READ self", own_read.as_slice(), Color::Cyan),
-            ("READ tree", tree_read.as_slice(), Color::LightCyan),
-            ("WRITE self", own_write.as_slice(), Color::Yellow),
-            ("WRITE tree", tree_write.as_slice(), Color::LightRed),
+            (
+                text(language, "READ self", "读 自身"),
+                own_read.as_slice(),
+                Color::Cyan,
+            ),
+            (
+                text(language, "READ tree", "读 子树"),
+                tree_read.as_slice(),
+                Color::LightCyan,
+            ),
+            (
+                text(language, "WRITE self", "写 自身"),
+                own_write.as_slice(),
+                Color::Yellow,
+            ),
+            (
+                text(language, "WRITE tree", "写 子树"),
+                tree_write.as_slice(),
+                Color::LightRed,
+            ),
         ];
         for (index, (label, values, color)) in series.iter().enumerate() {
             let (label, values, color) = (*label, *values, *color);
             let (now, average, maximum) = memory_stats(values);
+            let title = match language {
+                UiLanguage::English => format!(
+                    " {label:<10} now {}  avg {}  max {} ",
+                    format_bytes_rate(now),
+                    format_bytes_rate(average),
+                    format_bytes_rate(maximum)
+                ),
+                UiLanguage::Chinese => format!(
+                    " {label}  当前 {}  均值 {}  峰值 {} ",
+                    format_bytes_rate(now),
+                    format_bytes_rate(average),
+                    format_bytes_rate(maximum)
+                ),
+            };
             frame.render_widget(
                 Sparkline::default()
-                    .block(Block::default().borders(Borders::TOP).title(format!(
-                        " {label:<10} now {}  avg {}  max {} ",
-                        format_bytes_rate(now),
-                        format_bytes_rate(average),
-                        format_bytes_rate(maximum)
-                    )))
+                    .block(glyph_block(
+                        Block::default().borders(Borders::TOP).title(title),
+                        app.glyph_mode,
+                    ))
                     .data(values)
                     .max(io_scale)
-                    .bar_set(symbols::bar::NINE_LEVELS)
+                    .bar_set(sparkline_bars(app.glyph_mode))
                     .style(Style::default().fg(color)),
                 chunks[index + 1],
             );
@@ -1926,53 +2375,95 @@ fn draw_trend_overlay(frame: &mut Frame, app: &App, area: Rect) {
     let (tree_cpu_now, tree_cpu_avg, tree_cpu_max) = f32_stats(&subtree_cpu);
     let (own_mem_now, own_mem_avg, own_mem_max) = memory_stats(&own_memory);
     let (tree_mem_now, tree_mem_avg, tree_mem_max) = memory_stats(&subtree_memory);
+    let cpu_self_title = match language {
+        UiLanguage::English => format!(
+            " CPU self   now {own_cpu_now:.1}%  avg {own_cpu_avg:.1}%  max {own_cpu_max:.1}% "
+        ),
+        UiLanguage::Chinese => format!(
+            " CPU 自身  当前 {own_cpu_now:.1}%  均值 {own_cpu_avg:.1}%  峰值 {own_cpu_max:.1}% "
+        ),
+    };
     frame.render_widget(
         Sparkline::default()
-            .block(Block::default().borders(Borders::TOP).title(format!(
-                " CPU self   now {own_cpu_now:.1}%  avg {own_cpu_avg:.1}%  max {own_cpu_max:.1}% "
-            )))
+            .block(glyph_block(
+                Block::default().borders(Borders::TOP).title(cpu_self_title),
+                app.glyph_mode,
+            ))
             .data(&own_cpu_data)
             .max(cpu_scale)
-            .bar_set(symbols::bar::NINE_LEVELS)
+            .bar_set(sparkline_bars(app.glyph_mode))
             .style(Style::default().fg(Color::Yellow)),
         chunks[1],
     );
+    let cpu_tree_title = match language {
+        UiLanguage::English => format!(
+            " CPU tree   now {tree_cpu_now:.1}%  avg {tree_cpu_avg:.1}%  max {tree_cpu_max:.1}% "
+        ),
+        UiLanguage::Chinese => format!(
+            " CPU 子树  当前 {tree_cpu_now:.1}%  均值 {tree_cpu_avg:.1}%  峰值 {tree_cpu_max:.1}% "
+        ),
+    };
     frame.render_widget(
         Sparkline::default()
-            .block(Block::default().borders(Borders::TOP).title(format!(
-                " CPU tree   now {tree_cpu_now:.1}%  avg {tree_cpu_avg:.1}%  max {tree_cpu_max:.1}% "
-            )))
+            .block(glyph_block(
+                Block::default().borders(Borders::TOP).title(cpu_tree_title),
+                app.glyph_mode,
+            ))
             .data(&subtree_cpu_data)
             .max(cpu_scale)
-            .bar_set(symbols::bar::NINE_LEVELS)
+            .bar_set(sparkline_bars(app.glyph_mode))
             .style(Style::default().fg(Color::LightRed)),
         chunks[2],
     );
+    let mem_self_title = match language {
+        UiLanguage::English => format!(
+            " MEM self   now {} MB  avg {} MB  max {} MB ",
+            own_mem_now / 1024 / 1024,
+            own_mem_avg / 1024 / 1024,
+            own_mem_max / 1024 / 1024
+        ),
+        UiLanguage::Chinese => format!(
+            " 内存 自身  当前 {} MB  均值 {} MB  峰值 {} MB ",
+            own_mem_now / 1024 / 1024,
+            own_mem_avg / 1024 / 1024,
+            own_mem_max / 1024 / 1024
+        ),
+    };
     frame.render_widget(
         Sparkline::default()
-            .block(Block::default().borders(Borders::TOP).title(format!(
-                " MEM self   now {} MB  avg {} MB  max {} MB ",
-                own_mem_now / 1024 / 1024,
-                own_mem_avg / 1024 / 1024,
-                own_mem_max / 1024 / 1024
-            )))
+            .block(glyph_block(
+                Block::default().borders(Borders::TOP).title(mem_self_title),
+                app.glyph_mode,
+            ))
             .data(&own_memory_data)
             .max(memory_scale)
-            .bar_set(symbols::bar::NINE_LEVELS)
+            .bar_set(sparkline_bars(app.glyph_mode))
             .style(Style::default().fg(Color::Cyan)),
         chunks[3],
     );
+    let mem_tree_title = match language {
+        UiLanguage::English => format!(
+            " MEM tree   now {} MB  avg {} MB  max {} MB ",
+            tree_mem_now / 1024 / 1024,
+            tree_mem_avg / 1024 / 1024,
+            tree_mem_max / 1024 / 1024
+        ),
+        UiLanguage::Chinese => format!(
+            " 内存 子树  当前 {} MB  均值 {} MB  峰值 {} MB ",
+            tree_mem_now / 1024 / 1024,
+            tree_mem_avg / 1024 / 1024,
+            tree_mem_max / 1024 / 1024
+        ),
+    };
     frame.render_widget(
         Sparkline::default()
-            .block(Block::default().borders(Borders::TOP).title(format!(
-                " MEM tree   now {} MB  avg {} MB  max {} MB ",
-                tree_mem_now / 1024 / 1024,
-                tree_mem_avg / 1024 / 1024,
-                tree_mem_max / 1024 / 1024
-            )))
+            .block(glyph_block(
+                Block::default().borders(Borders::TOP).title(mem_tree_title),
+                app.glyph_mode,
+            ))
             .data(&subtree_memory_data)
             .max(memory_scale)
-            .bar_set(symbols::bar::NINE_LEVELS)
+            .bar_set(sparkline_bars(app.glyph_mode))
             .style(Style::default().fg(Color::LightMagenta)),
         chunks[4],
     );
@@ -2014,6 +2505,145 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+// Compact human units for the status bar and the tree MEM column, where
+// horizontal space is scarce: "512M", "12.1G". Every branch stays within
+// five display cells for any input, including u64::MAX ("16E"), so the
+// column width math in the tree stays exact.
+fn format_compact_bytes(bytes: u64) -> String {
+    const EIB: u64 = 1024 * 1024 * 1024 * 1024 * 1024 * 1024;
+    const TIB: u64 = 1024 * 1024 * 1024 * 1024;
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
+    if bytes >= EIB {
+        format!("{:.0}E", bytes as f64 / EIB as f64)
+    } else if bytes >= 100 * TIB {
+        format!("{:.0}T", bytes as f64 / TIB as f64)
+    } else if bytes >= 100 * GIB {
+        let tib = bytes as f64 / TIB as f64;
+        // "{:.1}" can round 99.96 up to "100.0T" (six cells); fall back to
+        // the zero-decimal form at the boundary to hold the five-cell cap.
+        if tib >= 99.95 {
+            format!("{:.0}T", tib)
+        } else {
+            format!("{:.1}T", tib)
+        }
+    } else if bytes >= GIB {
+        let gib = bytes as f64 / GIB as f64;
+        if gib >= 99.95 {
+            format!("{:.1}T", bytes as f64 / TIB as f64)
+        } else {
+            format!("{:.1}G", gib)
+        }
+    } else if bytes >= MIB {
+        format!("{:.0}M", bytes as f64 / MIB as f64)
+    } else if bytes >= 1024 {
+        format!("{:.0}K", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes}B")
+    }
+}
+
+fn load_trend_arrow(history: &VecDeque<f64>, glyphs: &Glyphs) -> &'static str {
+    if history.len() < 2 {
+        return glyphs.trend_flat;
+    }
+    let first = history.front().copied().unwrap_or(0.0);
+    let last = history.back().copied().unwrap_or(0.0);
+    let delta = last - first;
+    if delta > 0.05 {
+        glyphs.trend_up
+    } else if delta < -0.05 {
+        glyphs.trend_down
+    } else {
+        glyphs.trend_flat
+    }
+}
+
+fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let language = app.language();
+    let theme = &app.theme;
+    let metrics = &app.host_metrics;
+    let label_style = Style::default().fg(theme.accent);
+    let findings = app.attention_findings();
+    let worst = findings.iter().map(|finding| finding.severity).max();
+    let (alert_text, alert_style) = match worst {
+        Some(severity) => (
+            format!(
+                "{} {} {} ",
+                app.glyphs.alert,
+                findings.len(),
+                text(language, "alerts", "条告警")
+            ),
+            theme.severity_style(severity).add_modifier(Modifier::BOLD),
+        ),
+        None => (
+            format!("{} ", text(language, "✓ ok", "✓ 正常")).replace('✓', app.glyphs.ok),
+            Style::default().fg(theme.dim),
+        ),
+    };
+    // The alert count is the most decision-relevant field: reserve its space
+    // first, then admit host metrics in priority order while they fit. The
+    // hostname identifies the machine, so it is clipped rather than dropped.
+    let mut budget = (area.width as usize).saturating_sub(alert_text.width());
+    let hostname = if metrics.hostname.is_empty() {
+        text(language, "unknown", "未知主机")
+    } else {
+        metrics.hostname.as_str()
+    };
+    let host_label = format!(" {hostname}  ");
+    let host_width = host_label.width().min(budget);
+    let mut spans = vec![Span::styled(
+        marquee(&host_label, 0, host_width),
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
+    let mut used = host_width;
+    budget = budget.saturating_sub(used);
+    let mut segments: Vec<Vec<Span>> = vec![
+        vec![
+            Span::styled("CPU ", label_style),
+            Span::raw(format!("{:.0}%  ", metrics.cpu_percent)),
+        ],
+        vec![
+            Span::styled(text(language, "MEM ", "内存 "), label_style),
+            Span::raw(format!(
+                "{}/{}  ",
+                format_compact_bytes(metrics.memory_used),
+                format_compact_bytes(metrics.memory_total)
+            )),
+        ],
+        vec![
+            Span::styled(text(language, "load ", "负载 "), label_style),
+            Span::raw(format!(
+                "{:.2}{}  ",
+                metrics.load_one,
+                load_trend_arrow(&app.load_history, &app.glyphs)
+            )),
+        ],
+    ];
+    if metrics.swap_total > 0 {
+        let swap_percent = metrics.swap_used as f64 * 100.0 / metrics.swap_total as f64;
+        segments.push(vec![
+            Span::styled(text(language, "SWAP ", "交换 "), label_style),
+            Span::raw(format!("{swap_percent:.0}%  ")),
+        ]);
+    }
+    for segment in segments {
+        let width: usize = segment.iter().map(|span| span.content.width()).sum();
+        if width <= budget {
+            spans.extend(segment);
+            used += width;
+            budget -= width;
+        }
+    }
+    let padding = (area.width as usize).saturating_sub(used + alert_text.width());
+    spans.push(Span::raw(" ".repeat(padding)));
+    spans.push(Span::styled(alert_text, alert_style));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
 fn sort_label(language: UiLanguage, mode: SortMode) -> &'static str {
     match (language, mode) {
         (UiLanguage::English, _) => mode.label(),
@@ -2051,68 +2681,140 @@ fn network_scope_label(language: UiLanguage, scope: NetworkScope) -> &'static st
     }
 }
 
+fn log_scope_label(language: UiLanguage, scope: LogScope) -> &'static str {
+    match (language, scope) {
+        (UiLanguage::English, _) => scope.label(),
+        (UiLanguage::Chinese, LogScope::Auto) => "自动",
+        (UiLanguage::Chinese, LogScope::Process) => "进程",
+        (UiLanguage::Chinese, LogScope::Service) => "服务",
+    }
+}
+
+fn log_priority_label(language: UiLanguage, priority: LogPriority) -> &'static str {
+    match (language, priority) {
+        (UiLanguage::English, _) => priority.label(),
+        (UiLanguage::Chinese, LogPriority::Error) => "错误",
+        (UiLanguage::Chinese, LogPriority::Warning) => "警告",
+        (UiLanguage::Chinese, LogPriority::Info) => "信息",
+        (UiLanguage::Chinese, LogPriority::Debug) => "调试",
+    }
+}
+
 fn format_signed_rate(delta: i128) -> String {
     let sign = if delta >= 0 { "+" } else { "-" };
     let value = delta.unsigned_abs().min(u128::from(u64::MAX)) as u64;
     format!("{sign}{}", format_bytes_rate(value))
 }
 
-fn snapshot_entry_line(prefix: &str, entry: &ProcessSnapshotEntry, color: Color) -> Line<'static> {
+fn snapshot_entry_line(
+    language: UiLanguage,
+    prefix: &str,
+    entry: &ProcessSnapshotEntry,
+    color: Color,
+) -> Line<'static> {
     let parent = parent_label(entry.parent);
     let command = if entry.command.is_empty() {
-        "[command unavailable]".to_string()
+        text(language, "[command unavailable]", "[命令不可用]").to_string()
     } else {
         entry.command.clone()
     };
     Line::from(Span::styled(
-        format!(
-            " {prefix} {} [{}] parent {} | tree {} proc {} MB | {}",
-            entry.name,
-            entry.pid,
-            parent,
-            entry.subtree.process_count,
-            entry.subtree.memory / 1024 / 1024,
-            command
-        ),
+        match language {
+            UiLanguage::English => format!(
+                " {prefix} {} [{}] parent {} | tree {} proc {} MB | {}",
+                entry.name,
+                entry.pid,
+                parent,
+                entry.subtree.process_count,
+                entry.subtree.memory / 1024 / 1024,
+                command
+            ),
+            UiLanguage::Chinese => format!(
+                " {prefix} {} [{}] 父 {} | 子树 {} 进程 {} MB | {}",
+                entry.name,
+                entry.pid,
+                parent,
+                entry.subtree.process_count,
+                entry.subtree.memory / 1024 / 1024,
+                command
+            ),
+        },
         Style::default().fg(color),
     ))
 }
 
-fn snapshot_diff_lines(diff: &SnapshotDiff) -> Vec<Line<'static>> {
+fn snapshot_diff_lines(
+    language: UiLanguage,
+    diff: &SnapshotDiff,
+    theme: &Theme,
+    glyphs: &Glyphs,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     lines.push(Line::from(Span::styled(
-        format!(
-            "PROCESS CHANGES  +{} started  -{} exited  ↪{} reparented",
-            diff.started.len(),
-            diff.exited.len(),
-            diff.reparented.len()
-        ),
+        match language {
+            UiLanguage::English => format!(
+                "PROCESS CHANGES  +{} started  -{} exited  {}{} reparented",
+                diff.started.len(),
+                diff.exited.len(),
+                glyphs.reparent,
+                diff.reparented.len()
+            ),
+            UiLanguage::Chinese => format!(
+                "进程变化  +{} 新增  -{} 退出  {}{} 换父",
+                diff.started.len(),
+                diff.exited.len(),
+                glyphs.reparent,
+                diff.reparented.len()
+            ),
+        },
         Style::default()
             .fg(Color::LightCyan)
             .add_modifier(Modifier::BOLD),
     )));
     if diff.started.is_empty() && diff.exited.is_empty() && diff.reparented.is_empty() {
         lines.push(Line::from(Span::styled(
-            " no process identity or relationship changes",
-            Style::default().fg(Color::DarkGray),
+            text(
+                language,
+                " no process identity or relationship changes",
+                " 进程身份与关系均无变化",
+            ),
+            Style::default().fg(theme.dim),
         )));
     } else {
         for entry in &diff.started {
-            lines.push(snapshot_entry_line("+", entry, Color::LightGreen));
+            lines.push(snapshot_entry_line(language, "+", entry, theme.started_fg));
         }
         for entry in &diff.exited {
-            lines.push(snapshot_entry_line("-", entry, Color::LightRed));
+            lines.push(snapshot_entry_line(
+                language,
+                "-",
+                entry,
+                theme.severity_crit,
+            ));
         }
         for entry in &diff.reparented {
             lines.push(Line::from(Span::styled(
-                format!(
-                    " ↪ {} [{}] parent {} → {}",
-                    entry.name,
-                    entry.pid,
-                    parent_label(entry.old_parent),
-                    parent_label(entry.new_parent)
-                ),
-                Style::default().fg(Color::LightYellow),
+                match language {
+                    UiLanguage::English => format!(
+                        " {} {} [{}] parent {} {} {}",
+                        glyphs.reparent,
+                        entry.name,
+                        entry.pid,
+                        parent_label(entry.old_parent),
+                        glyphs.arrow_right,
+                        parent_label(entry.new_parent)
+                    ),
+                    UiLanguage::Chinese => format!(
+                        " {} {} [{}] 父 {} {} {}",
+                        glyphs.reparent,
+                        entry.name,
+                        entry.pid,
+                        parent_label(entry.old_parent),
+                        glyphs.arrow_right,
+                        parent_label(entry.new_parent)
+                    ),
+                },
+                Style::default().fg(theme.reparented_fg),
             )));
         }
     }
@@ -2126,10 +2828,19 @@ fn snapshot_diff_lines(diff: &SnapshotDiff) -> Vec<Line<'static>> {
     let memory_growth_count = memory_growth.len();
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        if memory_growth_count > 50 {
-            format!("TOP TREE MEMORY GROWTH ({memory_growth_count}, showing 50)")
-        } else {
-            format!("TOP TREE MEMORY GROWTH ({memory_growth_count})")
+        match (language, memory_growth_count > 50) {
+            (UiLanguage::English, true) => {
+                format!("TOP TREE MEMORY GROWTH ({memory_growth_count}, showing 50)")
+            }
+            (UiLanguage::English, false) => {
+                format!("TOP TREE MEMORY GROWTH ({memory_growth_count})")
+            }
+            (UiLanguage::Chinese, true) => {
+                format!("子树内存增长 TOP（{memory_growth_count}，显示前 50）")
+            }
+            (UiLanguage::Chinese, false) => {
+                format!("子树内存增长 TOP（{memory_growth_count}）")
+            }
         },
         Style::default()
             .fg(Color::LightMagenta)
@@ -2137,21 +2848,36 @@ fn snapshot_diff_lines(diff: &SnapshotDiff) -> Vec<Line<'static>> {
     )));
     if memory_growth.is_empty() {
         lines.push(Line::from(Span::styled(
-            " no surviving process subtree increased memory",
-            Style::default().fg(Color::DarkGray),
+            text(
+                language,
+                " no surviving process subtree increased memory",
+                " 没有存活进程子树的内存增长",
+            ),
+            Style::default().fg(theme.dim),
         )));
     } else {
         for delta in memory_growth.into_iter().take(50) {
             lines.push(Line::from(Span::styled(
-                format!(
-                    " {}  {} [{}] | now {} MB | own {} | children {:+}",
-                    format_signed_bytes(delta.subtree_memory),
-                    delta.name,
-                    delta.pid,
-                    delta.current_subtree.memory / 1024 / 1024,
-                    format_signed_bytes(delta.own_memory),
-                    delta.subtree_processes
-                ),
+                match language {
+                    UiLanguage::English => format!(
+                        " {}  {} [{}] | now {} MB | own {} | children {:+}",
+                        format_signed_bytes(delta.subtree_memory),
+                        delta.name,
+                        delta.pid,
+                        delta.current_subtree.memory / 1024 / 1024,
+                        format_signed_bytes(delta.own_memory),
+                        delta.subtree_processes
+                    ),
+                    UiLanguage::Chinese => format!(
+                        " {}  {} [{}] | 当前 {} MB | 自身 {} | 子进程 {:+}",
+                        format_signed_bytes(delta.subtree_memory),
+                        delta.name,
+                        delta.pid,
+                        delta.current_subtree.memory / 1024 / 1024,
+                        format_signed_bytes(delta.own_memory),
+                        delta.subtree_processes
+                    ),
+                },
                 Style::default().fg(Color::LightMagenta),
             )));
         }
@@ -2166,10 +2892,19 @@ fn snapshot_diff_lines(diff: &SnapshotDiff) -> Vec<Line<'static>> {
     let cpu_growth_count = cpu_growth.len();
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        if cpu_growth_count > 50 {
-            format!("TOP TREE CPU INCREASE ({cpu_growth_count}, showing 50)")
-        } else {
-            format!("TOP TREE CPU INCREASE ({cpu_growth_count})")
+        match (language, cpu_growth_count > 50) {
+            (UiLanguage::English, true) => {
+                format!("TOP TREE CPU INCREASE ({cpu_growth_count}, showing 50)")
+            }
+            (UiLanguage::English, false) => {
+                format!("TOP TREE CPU INCREASE ({cpu_growth_count})")
+            }
+            (UiLanguage::Chinese, true) => {
+                format!("子树 CPU 增长 TOP（{cpu_growth_count}，显示前 50）")
+            }
+            (UiLanguage::Chinese, false) => {
+                format!("子树 CPU 增长 TOP（{cpu_growth_count}）")
+            }
         },
         Style::default()
             .fg(Color::LightRed)
@@ -2177,20 +2912,34 @@ fn snapshot_diff_lines(diff: &SnapshotDiff) -> Vec<Line<'static>> {
     )));
     if cpu_growth.is_empty() {
         lines.push(Line::from(Span::styled(
-            " no surviving process subtree increased CPU by more than 0.1%",
-            Style::default().fg(Color::DarkGray),
+            text(
+                language,
+                " no surviving process subtree increased CPU by more than 0.1%",
+                " 没有存活进程子树的 CPU 增幅超过 0.1%",
+            ),
+            Style::default().fg(theme.dim),
         )));
     } else {
         for delta in cpu_growth.into_iter().take(50) {
             lines.push(Line::from(Span::styled(
-                format!(
-                    " {:+.1}%  {} [{}] | now {:.1}% | own {:+.1}%",
-                    delta.subtree_cpu,
-                    delta.name,
-                    delta.pid,
-                    delta.current_subtree.cpu,
-                    delta.own_cpu
-                ),
+                match language {
+                    UiLanguage::English => format!(
+                        " {:+.1}%  {} [{}] | now {:.1}% | own {:+.1}%",
+                        delta.subtree_cpu,
+                        delta.name,
+                        delta.pid,
+                        delta.current_subtree.cpu,
+                        delta.own_cpu
+                    ),
+                    UiLanguage::Chinese => format!(
+                        " {:+.1}%  {} [{}] | 当前 {:.1}% | 自身 {:+.1}%",
+                        delta.subtree_cpu,
+                        delta.name,
+                        delta.pid,
+                        delta.current_subtree.cpu,
+                        delta.own_cpu
+                    ),
+                },
                 Style::default().fg(Color::LightRed),
             )));
         }
@@ -2198,13 +2947,29 @@ fn snapshot_diff_lines(diff: &SnapshotDiff) -> Vec<Line<'static>> {
 
     for (title, empty, is_read) in [
         (
-            "TOP TREE READ RATE INCREASE",
-            " no surviving process subtree increased disk reads",
+            text(
+                language,
+                "TOP TREE READ RATE INCREASE",
+                "子树读速率增长 TOP",
+            ),
+            text(
+                language,
+                " no surviving process subtree increased disk reads",
+                " 没有存活进程子树的磁盘读增加",
+            ),
             true,
         ),
         (
-            "TOP TREE WRITE RATE INCREASE",
-            " no surviving process subtree increased disk writes",
+            text(
+                language,
+                "TOP TREE WRITE RATE INCREASE",
+                "子树写速率增长 TOP",
+            ),
+            text(
+                language,
+                " no surviving process subtree increased disk writes",
+                " 没有存活进程子树的磁盘写增加",
+            ),
             false,
         ),
     ] {
@@ -2229,10 +2994,11 @@ fn snapshot_diff_lines(diff: &SnapshotDiff) -> Vec<Line<'static>> {
         let count = growth.len();
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            if count > 50 {
-                format!("{title} ({count}, showing 50)")
-            } else {
-                format!("{title} ({count})")
+            match (language, count > 50) {
+                (UiLanguage::English, true) => format!("{title} ({count}, showing 50)"),
+                (UiLanguage::English, false) => format!("{title} ({count})"),
+                (UiLanguage::Chinese, true) => format!("{title}（{count}，显示前 50）"),
+                (UiLanguage::Chinese, false) => format!("{title}（{count}）"),
             },
             Style::default()
                 .fg(if is_read {
@@ -2245,7 +3011,7 @@ fn snapshot_diff_lines(diff: &SnapshotDiff) -> Vec<Line<'static>> {
         if growth.is_empty() {
             lines.push(Line::from(Span::styled(
                 empty,
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.dim),
             )));
         } else {
             for delta in growth.into_iter().take(50) {
@@ -2263,14 +3029,24 @@ fn snapshot_diff_lines(diff: &SnapshotDiff) -> Vec<Line<'static>> {
                     )
                 };
                 lines.push(Line::from(Span::styled(
-                    format!(
-                        " {}  {} [{}] | now {} | own {}",
-                        format_signed_rate(tree_delta),
-                        delta.name,
-                        delta.pid,
-                        format_bytes_rate(current),
-                        format_signed_rate(own_delta)
-                    ),
+                    match language {
+                        UiLanguage::English => format!(
+                            " {}  {} [{}] | now {} | own {}",
+                            format_signed_rate(tree_delta),
+                            delta.name,
+                            delta.pid,
+                            format_bytes_rate(current),
+                            format_signed_rate(own_delta)
+                        ),
+                        UiLanguage::Chinese => format!(
+                            " {}  {} [{}] | 当前 {} | 自身 {}",
+                            format_signed_rate(tree_delta),
+                            delta.name,
+                            delta.pid,
+                            format_bytes_rate(current),
+                            format_signed_rate(own_delta)
+                        ),
+                    },
                     Style::default().fg(if is_read {
                         Color::LightCyan
                     } else {
@@ -2297,7 +3073,7 @@ fn draw_snapshot_diff_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
     );
     let language = app.language();
     let diff = baseline.diff(&app.processes, &app.resources);
-    let lines = snapshot_diff_lines(&diff);
+    let lines = snapshot_diff_lines(language, &diff, &app.theme, &app.glyphs);
     let content_height = height.saturating_sub(4) as usize;
     let max_scroll = lines
         .len()
@@ -2309,17 +3085,25 @@ fn draw_snapshot_diff_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
     let system = diff
         .system_delta
         .as_ref()
-        .map(|delta| {
-            format!(
+        .map(|delta| match language {
+            UiLanguage::English => format!(
                 "system ΔCPU {:+.1}% ΔMEM {} ΔR {} ΔW {} proc {:+}",
                 delta.subtree_cpu,
                 format_signed_bytes(delta.subtree_memory),
                 format_signed_rate(delta.subtree_read_rate),
                 format_signed_rate(delta.subtree_write_rate),
                 delta.subtree_processes
-            )
+            ),
+            UiLanguage::Chinese => format!(
+                "系统 ΔCPU {:+.1}% ΔMEM {} Δ读 {} Δ写 {} 进程 {:+}",
+                delta.subtree_cpu,
+                format_signed_bytes(delta.subtree_memory),
+                format_signed_rate(delta.subtree_read_rate),
+                format_signed_rate(delta.subtree_write_rate),
+                delta.subtree_processes
+            ),
         })
-        .unwrap_or_else(|| "system totals unavailable".into());
+        .unwrap_or_else(|| text(language, "system totals unavailable", "系统总量不可用").into());
     let title = match language {
         UiLanguage::English => format!(
             " baseline diff {}s  {}→{} proc  {}  ↑↓ scroll  b reset  x clear  d/Esc close ",
@@ -2339,13 +3123,18 @@ fn draw_snapshot_diff_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(title))
+            .block(glyph_block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(chrome(app.glyph_mode, title)),
+                app.glyph_mode,
+            ))
             .scroll((app.snapshot_diff_scroll, 0)),
         popup,
     );
 }
 
-fn network_endpoint_line(endpoint: &NetworkEndpoint) -> String {
+fn network_endpoint_line(endpoint: &NetworkEndpoint, glyphs: &Glyphs) -> String {
     let owner = endpoint
         .pid
         .map(|pid| format!("{} [{pid}]", endpoint.process))
@@ -2358,7 +3147,10 @@ fn network_endpoint_line(endpoint: &NetworkEndpoint) -> String {
     let route = if endpoint.remote_endpoint.is_empty() {
         endpoint.local_endpoint.clone()
     } else {
-        format!("{} → {}", endpoint.local_endpoint, endpoint.remote_endpoint)
+        format!(
+            "{} {} {}",
+            endpoint.local_endpoint, glyphs.arrow_right, endpoint.remote_endpoint
+        )
     };
     format!(
         " {:<4} {:<11} {:<45} | {} | fd {}{}",
@@ -2366,14 +3158,15 @@ fn network_endpoint_line(endpoint: &NetworkEndpoint) -> String {
     )
 }
 
-fn activity_spinner(elapsed: Duration) -> &'static str {
-    const FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
-    let index = (elapsed.as_millis() / 125) as usize % FRAMES.len();
-    FRAMES[index]
+fn activity_spinner(elapsed: Duration, glyphs: &Glyphs) -> &'static str {
+    let frames = glyphs.spinner;
+    let index = (elapsed.as_millis() / 125) as usize % frames.len();
+    frames[index]
 }
 
 fn draw_network_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
     let language = app.language();
+    let theme = app.theme;
     let width = area.width.saturating_sub(2).clamp(1, 150);
     let height = area.height.saturating_sub(2).max(1);
     let popup = Rect::new(
@@ -2385,7 +3178,7 @@ fn draw_network_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(Clear, popup);
     let Some(scan) = &app.network_scan else {
         let elapsed = app.network_scan_elapsed();
-        let spinner = activity_spinner(elapsed);
+        let spinner = activity_spinner(elapsed, &app.glyphs);
         frame.render_widget(
             Paragraph::new(vec![
                 Line::from(""),
@@ -2401,7 +3194,7 @@ fn draw_network_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
                         ),
                     },
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(theme.accent)
                         .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(""),
@@ -2411,14 +3204,15 @@ fn draw_network_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
                         " The process tree remains live. Press n/Esc to close; the scan may finish in the background.",
                         " 进程树仍保持实时。按 n/Esc 关闭；扫描可继续在后台完成。",
                     ),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme.dim),
                 )),
             ])
-            .block(
+            .block(glyph_block(
                 Block::default()
                     .borders(Borders::ALL)
                     .title(text(language, " network scan ", " 网络扫描 ")),
-            ),
+                app.glyph_mode,
+            )),
             popup,
         );
         return;
@@ -2431,19 +3225,23 @@ fn draw_network_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         .filter_map(|index| scan.endpoints.get(*index))
         .map(|endpoint| {
             let style = if endpoint.pid.is_some() {
-                Style::default().fg(Color::White)
+                Style::default().fg(theme.tree_fg)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(theme.dim)
             };
-            ListItem::new(network_endpoint_line(endpoint)).style(style)
+            ListItem::new(network_endpoint_line(endpoint, &app.glyphs)).style(style)
         })
         .collect::<Vec<_>>();
-    let mode = if app.network_searching {
+    let mode = if let Some(input) = &app.network_port_input {
+        format!(" {}: {}_", text(language, "port", "端口"), input)
+    } else if app.network_searching {
         format!(
             " {}: {}_",
             text(language, "find", "查找"),
             app.network_filter
         )
+    } else if let Some(port) = app.network_port_filter {
+        format!(" {}={port}", text(language, "port", "端口"))
     } else if app.network_filter.is_empty() {
         String::new()
     } else {
@@ -2457,7 +3255,7 @@ fn draw_network_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         let elapsed = app.network_scan_elapsed();
         format!(
             "  {} {} {:.1}s",
-            activity_spinner(elapsed),
+            activity_spinner(elapsed, &app.glyphs),
             text(language, "rescanning", "重新扫描"),
             elapsed.as_secs_f64()
         )
@@ -2474,13 +3272,13 @@ fn draw_network_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
         scanning,
     );
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .highlight_style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        );
+        .block(glyph_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(chrome(app.glyph_mode, title)),
+            app.glyph_mode,
+        ))
+        .highlight_style(theme.selection());
     let mut state = ListState::default();
     if !visible.is_empty() {
         state.select(Some(app.network_selected));
@@ -2501,17 +3299,30 @@ fn draw_network_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
     };
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(text(
-                language,
-                " ↑↓/jk move | v listeners/all | / find | Enter jump | r rescan | x clear | n/Esc close ",
-                " ↑↓/jk 移动 | v 监听/全部 | / 查找 | Enter 跳转 | r 重扫 | x 清除 | n/Esc 关闭 ",
-            )),
+            Line::from(if app.network_port_input.is_some() {
+                text(
+                    language,
+                    " port: digits | Enter locate | Esc cancel ",
+                    " 端口：输入数字 | Enter 定位 | Esc 取消 ",
+                )
+                .into()
+            } else {
+                chrome(
+                    app.glyph_mode,
+                    text(
+                        language,
+                        " ↑↓/jk move | v listeners/all | / find | p port | Enter jump | r rescan | x clear | n/Esc close ",
+                        " ↑↓/jk 移动 | v 监听/全部 | / 查找 | p 端口 | Enter 跳转 | r 重扫 | x 清除 | n/Esc 关闭 ",
+                    )
+                    .to_string(),
+                )
+            }),
             Line::from(Span::styled(
                 format!(" {warning}"),
                 Style::default().fg(if scan.warning.is_some() || app.network_is_scanning() {
-                    Color::Yellow
+                    theme.severity_warn
                 } else {
-                    Color::DarkGray
+                    theme.dim
                 }),
             )),
         ]),
@@ -2528,16 +3339,9 @@ fn hotspot_color(metric: HotspotMetric) -> Color {
     }
 }
 
-fn attention_color(severity: AttentionSeverity) -> Color {
-    match severity {
-        AttentionSeverity::Critical => Color::LightRed,
-        AttentionSeverity::Warning => Color::Yellow,
-        AttentionSeverity::Watch => Color::LightBlue,
-    }
-}
-
 fn draw_attention_overlay(frame: &mut Frame, app: &App, area: Rect) {
     let language = app.language();
+    let theme = &app.theme;
     let width = area.width.saturating_sub(2).clamp(1, 150);
     let height = area.height.saturating_sub(2).max(1);
     let popup = Rect::new(
@@ -2546,11 +3350,14 @@ fn draw_attention_overlay(frame: &mut Frame, app: &App, area: Rect) {
         width,
         height,
     );
-    let block = Block::default().borders(Borders::ALL).title(text(
-        language,
-        " attention cockpit ",
-        " 关注事项 ",
-    ));
+    let block = glyph_block(
+        Block::default().borders(Borders::ALL).title(text(
+            language,
+            " attention cockpit ",
+            " 关注事项 ",
+        )),
+        app.glyph_mode,
+    );
     let inner = block.inner(popup);
     let sections = Layout::vertical([
         Constraint::Length(2),
@@ -2582,7 +3389,7 @@ fn draw_attention_overlay(frame: &mut Frame, app: &App, area: Rect) {
                 " no current findings — no unhealthy state, churn, sustained load, or rapid growth",
                 " 当前没有发现异常状态、抖动、持续负载或快速增长",
             ))
-            .style(Style::default().fg(Color::DarkGray))]
+            .style(Style::default().fg(theme.dim))]
         } else {
             findings
                 .iter()
@@ -2600,17 +3407,12 @@ fn draw_attention_overlay(frame: &mut Frame, app: &App, area: Rect) {
                             finding.pid,
                             first_reason
                         ))
-                        .style(Style::default().fg(attention_color(finding.severity))),
+                        .style(theme.severity_style(finding.severity)),
                     )
                 })
                 .collect()
         };
-    let list = List::new(items).highlight_style(
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    );
+    let list = List::new(items).highlight_style(theme.selection());
     let mut state = ListState::default();
     if let Some(index) = selected_index {
         state.select(Some(index.saturating_sub(offset)));
@@ -2627,18 +3429,18 @@ fn draw_attention_overlay(frame: &mut Frame, app: &App, area: Rect) {
                         process.name,
                         finding.score
                     ),
-                    Style::default()
-                        .fg(attention_color(finding.severity))
+                    theme
+                        .severity_style(finding.severity)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(format!("PID {}  {}", finding.pid, process_path(process))),
             ])];
             for reason in &finding.reasons {
-                lines.push(Line::from(format!(" • {reason}")));
+                lines.push(Line::from(chrome(app.glyph_mode, format!(" • {reason}"))));
             }
             lines.push(Line::from(Span::styled(
                 format!(" command: {}", process_command_line(process)),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.dim),
             )));
             Some(lines)
         })
@@ -2655,7 +3457,7 @@ fn draw_attention_overlay(frame: &mut Frame, app: &App, area: Rect) {
                         " Findings are evidence-based hints, not a claim that a process is faulty.",
                         " 这些发现是基于证据的线索，不代表进程已被认定有故障。",
                     ),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme.dim),
                 )),
             ]
         });
@@ -2666,15 +3468,15 @@ fn draw_attention_overlay(frame: &mut Frame, app: &App, area: Rect) {
             Line::from(vec![
                 Span::styled(
                     format!(" CRIT {critical} "),
-                    Style::default().fg(Color::LightRed),
+                    theme.severity_style(AttentionSeverity::Critical),
                 ),
                 Span::styled(
                     format!(" WARN {warning} "),
-                    Style::default().fg(Color::Yellow),
+                    theme.severity_style(AttentionSeverity::Warning),
                 ),
                 Span::styled(
                     format!(" WATCH {watch} "),
-                    Style::default().fg(Color::LightBlue),
+                    theme.severity_style(AttentionSeverity::Watch),
                 ),
                 Span::raw(text(
                     language,
@@ -2682,10 +3484,14 @@ fn draw_attention_overlay(frame: &mut Frame, app: &App, area: Rect) {
                     " — 来自状态、生命周期和资源历史的可解释信号",
                 )),
             ]),
-            Line::from(text(
-                language,
-                " ↑↓/jk move | Enter jump | t trend | i inspect | p actions | r sample | Space pause | a/Esc close",
-                " ↑↓/jk 移动 | Enter 跳转 | t 趋势 | i 深检 | p 操作 | r 采样 | Space 暂停 | a/Esc 关闭",
+            Line::from(chrome(
+                app.glyph_mode,
+                text(
+                    language,
+                    " ↑↓/jk move | Enter jump | t trend | i inspect | p actions | r sample | Space pause | a/Esc close",
+                    " ↑↓/jk 移动 | Enter 跳转 | t 趋势 | i 深检 | p 操作 | r 采样 | Space 暂停 | a/Esc 关闭",
+                )
+                .to_string(),
             )),
         ]),
         sections[0],
@@ -2693,11 +3499,14 @@ fn draw_attention_overlay(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_stateful_widget(list, sections[1], &mut state);
     frame.render_widget(
         Paragraph::new(detail)
-            .block(Block::default().borders(Borders::TOP).title(text(
-                language,
-                " evidence ",
-                " 证据 ",
-            )))
+            .block(glyph_block(
+                Block::default().borders(Borders::TOP).title(text(
+                    language,
+                    " evidence ",
+                    " 证据 ",
+                )),
+                app.glyph_mode,
+            ))
             .wrap(Wrap { trim: false }),
         sections[2],
     );
@@ -2757,6 +3566,7 @@ fn hotspot_is_active(app: &App, pid: Pid, metric: HotspotMetric) -> bool {
 
 fn draw_hotspot_panel(frame: &mut Frame, app: &App, area: Rect, metric: HotspotMetric) {
     let language = app.language();
+    let theme = &app.theme;
     let ranked = app.hotspot_ranked(metric);
     let active = app.hotspot_metric == metric;
     let selected_rank = if active {
@@ -2802,7 +3612,7 @@ fn draw_hotspot_panel(frame: &mut Frame, app: &App, area: Rect, metric: HotspotM
                 " no activity in the current sample",
                 " 当前样本没有活动",
             ))
-            .style(Style::default().fg(Color::DarkGray)),
+            .style(Style::default().fg(theme.dim)),
         );
     }
     let title = if active {
@@ -2815,12 +3625,17 @@ fn draw_hotspot_panel(frame: &mut Frame, app: &App, area: Rect, metric: HotspotM
         format!(" {} ", hotspot_metric_label(language, metric))
     };
     let list = List::new(items)
-        .block(
+        .block(glyph_block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(title)
-                .border_style(Style::default().fg(if active { color } else { Color::DarkGray })),
-        )
+                .border_style(Style::default().fg(if active {
+                    color
+                } else {
+                    theme.border_unfocused
+                })),
+            app.glyph_mode,
+        ))
         .highlight_style(
             Style::default()
                 .fg(Color::Black)
@@ -2839,6 +3654,7 @@ fn draw_hotspot_panel(frame: &mut Frame, app: &App, area: Rect, metric: HotspotM
 
 fn draw_hotspot_overlay(frame: &mut Frame, app: &App, area: Rect) {
     let language = app.language();
+    let theme = &app.theme;
     let width = area.width.saturating_sub(2).clamp(1, 150);
     let height = area.height.saturating_sub(2).max(1);
     let popup = Rect::new(
@@ -2847,11 +3663,14 @@ fn draw_hotspot_overlay(frame: &mut Frame, app: &App, area: Rect) {
         width,
         height,
     );
-    let block = Block::default().borders(Borders::ALL).title(text(
-        language,
-        " hotspot cockpit ",
-        " 热点工作台 ",
-    ));
+    let block = glyph_block(
+        Block::default().borders(Borders::ALL).title(text(
+            language,
+            " hotspot cockpit ",
+            " 热点工作台 ",
+        )),
+        app.glyph_mode,
+    );
     let inner = block.inner(popup);
     let rows = Layout::vertical([
         Constraint::Length(2),
@@ -2872,7 +3691,7 @@ fn draw_hotspot_overlay(frame: &mut Frame, app: &App, area: Rect) {
                 Span::styled(
                     hotspot_scope_label(language, app.hotspot_scope),
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(theme.accent)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(text(language, "  | selected panel: ", "  | 当前面板：")),
@@ -2883,10 +3702,14 @@ fn draw_hotspot_overlay(frame: &mut Frame, app: &App, area: Rect) {
                         .add_modifier(Modifier::BOLD),
                 ),
             ]),
-            Line::from(text(
-                language,
-                " ↑↓ rank | ←→ metric | v self/tree | Enter jump | r sample | Esc close",
-                " ↑↓ 排名 | ←→ 指标 | v 自身/子树 | Enter 跳转 | r 采样 | Esc 关闭",
+            Line::from(chrome(
+                app.glyph_mode,
+                text(
+                    language,
+                    " ↑↓ rank | ←→ metric | v self/tree | Enter jump | r sample | Esc close",
+                    " ↑↓ 排名 | ←→ 指标 | v 自身/子树 | Enter 跳转 | r 采样 | Esc 关闭",
+                )
+                .to_string(),
             )),
         ]),
         rows[0],
@@ -2914,9 +3737,9 @@ fn draw_notice(frame: &mut Frame, app: &App, area: Rect) {
         1,
     );
     let style = if notice.is_error {
-        Style::default().fg(Color::White).bg(Color::Red)
+        app.theme.notice_error
     } else {
-        Style::default().fg(Color::Black).bg(Color::Green)
+        app.theme.notice_success
     }
     .add_modifier(Modifier::BOLD);
     frame.render_widget(Clear, notice_area);
@@ -2926,47 +3749,87 @@ fn draw_notice(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn guidance_key(key: &'static str, description: &'static str) -> Line<'static> {
+fn guidance_key(
+    theme: &Theme,
+    mode: GlyphMode,
+    key: &'static str,
+    description: &'static str,
+) -> Line<'static> {
     Line::from(vec![
         Span::styled(
-            format!("  {key:<12}"),
+            format!("  {:<12}", chrome(mode, key.to_string())),
             Style::default()
                 .fg(Color::LightCyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(description, Style::default().fg(Color::White)),
+        Span::styled(description, Style::default().fg(theme.tree_fg)),
     ])
 }
 
-fn guidance_section(title: &'static str) -> Line<'static> {
+fn guidance_section(mode: GlyphMode, title: &'static str) -> Line<'static> {
     Line::from(Span::styled(
-        format!(" {title}"),
+        format!(" {}", chrome(mode, title.to_string())),
         Style::default()
             .fg(Color::LightMagenta)
             .add_modifier(Modifier::BOLD),
     ))
 }
 
-fn guidance_page_en(page: usize) -> Vec<Line<'static>> {
+fn guidance_page_en(page: usize, theme: &Theme, mode: GlyphMode) -> Vec<Line<'static>> {
     match page % GUIDANCE_PAGE_COUNT {
         0 => vec![
             Line::from(""),
-            guidance_section("UNDERSTAND THE PROCESS TREE"),
+            guidance_section(mode, "UNDERSTAND THE PROCESS TREE"),
             Line::from(Span::styled(
                 " See who started it, what it owns, and the cost of the complete service.",
                 Style::default().fg(Color::Gray),
             )),
             Line::from(""),
-            guidance_key("↑ / ↓", "move through stable process rows"),
-            guidance_key("← / →", "reveal parent; expand or collapse children"),
-            guidance_key("0-9", "type a PID, then press Enter to locate it directly"),
             guidance_key(
+                theme,
+                mode,
+                "↑ / ↓ / j / k",
+                "move through stable process rows",
+            ),
+            guidance_key(
+                theme,
+                mode,
+                "← / →",
+                "reveal parent; expand or collapse children",
+            ),
+            guidance_key(
+                theme,
+                mode,
+                "0-9",
+                "type a PID, then press Enter to locate it directly",
+            ),
+            guidance_key(
+                theme,
+                mode,
                 "/",
                 "type a query, then Enter to apply it and select results",
             ),
-            guidance_key("F", "manage persistent allow/deny filters before search"),
-            guidance_key("f", "focus the selected parent chain and service subtree"),
             guidance_key(
+                theme,
+                mode,
+                ":",
+                "command palette: fuzzy-find and run any feature",
+            ),
+            guidance_key(
+                theme,
+                mode,
+                "F",
+                "manage persistent allow/deny filters before search",
+            ),
+            guidance_key(
+                theme,
+                mode,
+                "f",
+                "focus the selected parent chain and service subtree",
+            ),
+            guidance_key(
+                theme,
+                mode,
                 "Enter",
                 "inspect threads, sockets, files, and runtime context",
             ),
@@ -2978,32 +3841,78 @@ fn guidance_page_en(page: usize) -> Vec<Line<'static>> {
         ],
         1 => vec![
             Line::from(""),
-            guidance_section("MOVE FROM SYMPTOM TO EVIDENCE"),
+            guidance_section(mode, "MOVE FROM SYMPTOM TO EVIDENCE"),
             Line::from(Span::styled(
                 " Workspaces keep process ownership attached to every signal.",
                 Style::default().fg(Color::Gray),
             )),
             Line::from(""),
             guidance_key(
+                theme,
+                mode,
                 "a",
                 "attention: unhealthy state, churn, pressure, and growth",
             ),
-            guidance_key("h", "CPU, memory, read, and write hotspot workbench"),
-            guidance_key("t", "recent own and complete-subtree resource trend"),
-            guidance_key("n", "listeners, connections, peers, owners, and namespaces"),
             guidance_key(
+                theme,
+                mode,
+                "h",
+                "CPU, memory, read, and write hotspot workbench",
+            ),
+            guidance_key(
+                theme,
+                mode,
+                "t",
+                "recent own and complete-subtree resource trend",
+            ),
+            guidance_key(
+                theme,
+                mode,
+                "n",
+                "listeners, connections, peers, owners, and namespaces",
+            ),
+            guidance_key(
+                theme,
+                mode,
                 "v",
                 "verify executable image, package, hash, and code signature",
             ),
             guidance_key(
+                theme,
+                mode,
                 "m",
                 "systemd or launchd ownership, state, config, and next commands",
             ),
-            guidance_key("l", "bounded native logs for this process or service"),
-            guidance_key("M", "attribute RSS, PSS, swap, regions, and mapped files"),
-            guidance_key("D", "one process dossier with prioritized evidence"),
-            guidance_key("b / d / x", "capture baseline, compare, and clear"),
-            guidance_key("Space / r", "freeze the scene; sample manually"),
+            guidance_key(
+                theme,
+                mode,
+                "l",
+                "bounded native logs for this process or service",
+            ),
+            guidance_key(
+                theme,
+                mode,
+                "M",
+                "attribute RSS, PSS, swap, regions, and mapped files",
+            ),
+            guidance_key(
+                theme,
+                mode,
+                "D",
+                "one process dossier with prioritized evidence",
+            ),
+            guidance_key(
+                theme,
+                mode,
+                "b / d / x",
+                "capture baseline, compare, and clear",
+            ),
+            guidance_key(
+                theme,
+                mode,
+                "Space / r",
+                "freeze the scene; sample manually",
+            ),
             Line::from(""),
             Line::from(Span::styled(
                 " Tip: D collects manager, image, logs, and process evidence in parallel.",
@@ -3012,52 +3921,76 @@ fn guidance_page_en(page: usize) -> Vec<Line<'static>> {
         ],
         _ => vec![
             Line::from(""),
-            guidance_section("OPERATE CAREFULLY · SHARE USEFULLY"),
+            guidance_section(mode, "OPERATE CAREFULLY · SHARE USEFULLY"),
             Line::from(Span::styled(
                 " Actions are confirmed and identity-checked; reports preserve your context.",
                 Style::default().fg(Color::Gray),
             )),
             Line::from(""),
-            guidance_key("k", "end the selected process through a two-step dialog"),
-            guidance_key("p", "TERM, KILL, STOP, or CONT with explicit confirmation"),
-            guidance_key("e", "recent process changes and action audit"),
-            guidance_key("o", "export a private, versioned diagnostic report"),
-            guidance_key("s", "cycle stable and service-tree hotspot sorting"),
-            guidance_key("?", "open this field guide at any time"),
-            guidance_key("q / Ctrl-C", "leave psmore"),
+            guidance_key(
+                theme,
+                mode,
+                "p",
+                "TERM, KILL, STOP, or CONT with explicit confirmation",
+            ),
+            guidance_key(theme, mode, "e", "recent process changes and action audit"),
+            guidance_key(
+                theme,
+                mode,
+                "o",
+                "export a private, versioned diagnostic report",
+            ),
+            guidance_key(
+                theme,
+                mode,
+                "s",
+                "cycle stable and service-tree hotspot sorting",
+            ),
+            guidance_key(theme, mode, "L", "switch between English and Chinese"),
+            guidance_key(theme, mode, "?", "open this field guide at any time"),
+            guidance_key(
+                theme,
+                mode,
+                "q / Ctrl-C",
+                "q closes a pane, quits on the tree; Ctrl-C always quits",
+            ),
             Line::from(""),
             Line::from(Span::styled(
-                " CLI companions: doctor, explain, inspect, memory, exe, service, logs, tree, net, trace, diff",
+                " CLI companions: doctor, explain (the D dossier), inspect, memory, exe, service, logs, tree, net, trace, diff",
                 Style::default().fg(Color::Yellow),
             )),
             Line::from(""),
-            guidance_section("ABOUT PSMORE"),
-            Line::from(format!(
-                " v{} · wzfukui · fukui@wuzhi-ai.com",
-                env!("CARGO_PKG_VERSION")
+            guidance_section(mode, "ABOUT PSMORE"),
+            Line::from(chrome(
+                mode,
+                format!(
+                    " v{} · wzfukui · fukui@wuzhi-ai.com",
+                    env!("CARGO_PKG_VERSION")
+                ),
             )),
             Line::from(" https://github.com/wzfukui/psmore"),
         ],
     }
 }
 
-fn guidance_page_zh(page: usize) -> Vec<Line<'static>> {
+fn guidance_page_zh(page: usize, theme: &Theme, mode: GlyphMode) -> Vec<Line<'static>> {
     match page % GUIDANCE_PAGE_COUNT {
         0 => vec![
             Line::from(""),
-            guidance_section("理解进程树"),
+            guidance_section(mode, "理解进程树"),
             Line::from(Span::styled(
                 " 看清谁启动了进程、它拥有什么，以及完整服务的资源成本。",
                 Style::default().fg(Color::Gray),
             )),
             Line::from(""),
-            guidance_key("↑ / ↓", "在稳定排序的进程行之间移动"),
-            guidance_key("← / →", "显示父进程；展开或折叠子进程"),
-            guidance_key("0-9", "直接输入 PID，再按 Enter 精确定位"),
-            guidance_key("/", "输入查询，按 Enter 后应用并选择结果"),
-            guidance_key("F", "管理先于搜索执行的持久包含/排除规则"),
-            guidance_key("f", "聚焦选中进程的父链和服务子树"),
-            guidance_key("Enter", "检查线程、套接字、文件和运行上下文"),
+            guidance_key(theme, mode, "↑ / ↓ / j / k", "在稳定排序的进程行之间移动"),
+            guidance_key(theme, mode, "← / →", "显示父进程；展开或折叠子进程"),
+            guidance_key(theme, mode, "0-9", "直接输入 PID，再按 Enter 精确定位"),
+            guidance_key(theme, mode, "/", "输入查询，按 Enter 后应用并选择结果"),
+            guidance_key(theme, mode, ":", "命令面板：模糊查找并执行任意功能"),
+            guidance_key(theme, mode, "F", "管理先于搜索执行的持久包含/排除规则"),
+            guidance_key(theme, mode, "f", "聚焦选中进程的父链和服务子树"),
+            guidance_key(theme, mode, "Enter", "检查线程、套接字、文件和运行上下文"),
             Line::from(""),
             Line::from(Span::styled(
                 " 查询示例：user:deploy tree.mem>2g !state:zombie",
@@ -3066,23 +3999,23 @@ fn guidance_page_zh(page: usize) -> Vec<Line<'static>> {
         ],
         1 => vec![
             Line::from(""),
-            guidance_section("从症状走向证据"),
+            guidance_section(mode, "从症状走向证据"),
             Line::from(Span::styled(
                 " 每个诊断工作区都会保留进程归属关系。",
                 Style::default().fg(Color::Gray),
             )),
             Line::from(""),
-            guidance_key("a", "关注异常状态、抖动、压力和增长"),
-            guidance_key("h", "CPU、内存、读写热点工作台"),
-            guidance_key("t", "进程自身及完整子树的近期趋势"),
-            guidance_key("n", "监听、连接、对端、所有者和命名空间"),
-            guidance_key("v", "验证运行映像、软件包、哈希和代码签名"),
-            guidance_key("m", "systemd/launchd 归属、状态、配置和命令"),
-            guidance_key("l", "读取当前进程或服务的有界原生日志"),
-            guidance_key("M", "归因 RSS、PSS、Swap、区域和映射"),
-            guidance_key("D", "建立带优先级线索的单进程事故档案"),
-            guidance_key("b / d / x", "捕获基线、比较并清除"),
-            guidance_key("Space / r", "冻结现场；手工采样"),
+            guidance_key(theme, mode, "a", "关注异常状态、抖动、压力和增长"),
+            guidance_key(theme, mode, "h", "CPU、内存、读写热点工作台"),
+            guidance_key(theme, mode, "t", "进程自身及完整子树的近期趋势"),
+            guidance_key(theme, mode, "n", "监听、连接、对端、所有者和命名空间"),
+            guidance_key(theme, mode, "v", "验证运行映像、软件包、哈希和代码签名"),
+            guidance_key(theme, mode, "m", "systemd/launchd 归属、状态、配置和命令"),
+            guidance_key(theme, mode, "l", "读取当前进程或服务的有界原生日志"),
+            guidance_key(theme, mode, "M", "归因 RSS、PSS、Swap、区域和映射"),
+            guidance_key(theme, mode, "D", "建立带优先级线索的单进程事故档案"),
+            guidance_key(theme, mode, "b / d / x", "捕获基线、比较并清除"),
+            guidance_key(theme, mode, "Space / r", "冻结现场；手工采样"),
             Line::from(""),
             Line::from(Span::styled(
                 " 提示：D 会并行采集管理器、映像、日志和进程证据。",
@@ -3091,40 +4024,52 @@ fn guidance_page_zh(page: usize) -> Vec<Line<'static>> {
         ],
         _ => vec![
             Line::from(""),
-            guidance_section("谨慎操作 · 有效分享"),
+            guidance_section(mode, "谨慎操作 · 有效分享"),
             Line::from(Span::styled(
                 " 操作需要确认和身份校验；报告会保留当前调查上下文。",
                 Style::default().fg(Color::Gray),
             )),
             Line::from(""),
-            guidance_key("k", "通过两阶段弹窗结束选中进程"),
-            guidance_key("p", "经明确确认发送 TERM/KILL/STOP/CONT"),
-            guidance_key("e", "查看近期进程变化和操作审计"),
-            guidance_key("o", "导出私有、版本化诊断报告"),
-            guidance_key("s", "切换稳定排序和服务树热点排序"),
-            guidance_key("L / F2", "切换中文或英文界面"),
-            guidance_key("?", "随时打开本现场手册"),
-            guidance_key("q / Ctrl-C", "退出 psmore"),
+            guidance_key(theme, mode, "p", "经明确确认发送 TERM/KILL/STOP/CONT"),
+            guidance_key(theme, mode, "e", "查看近期进程变化和操作审计"),
+            guidance_key(theme, mode, "o", "导出私有、版本化诊断报告"),
+            guidance_key(theme, mode, "s", "切换稳定排序和服务树热点排序"),
+            guidance_key(theme, mode, "L", "切换中文或英文界面"),
+            guidance_key(theme, mode, "?", "随时打开本现场手册"),
+            guidance_key(
+                theme,
+                mode,
+                "q / Ctrl-C",
+                "q 关闭面板，在进程树退出；Ctrl-C 始终退出",
+            ),
             Line::from(""),
             Line::from(Span::styled(
-                " CLI 工具：doctor、explain、inspect、memory、exe、service、logs、tree、net、trace、diff",
+                " CLI 工具：doctor、explain（即 D 档案）、inspect、memory、exe、service、logs、tree、net、trace、diff",
                 Style::default().fg(Color::Yellow),
             )),
             Line::from(""),
-            guidance_section("关于 PSMORE"),
-            Line::from(format!(
-                " v{} · wzfukui · fukui@wuzhi-ai.com",
-                env!("CARGO_PKG_VERSION")
+            guidance_section(mode, "关于 PSMORE"),
+            Line::from(chrome(
+                mode,
+                format!(
+                    " v{} · wzfukui · fukui@wuzhi-ai.com",
+                    env!("CARGO_PKG_VERSION")
+                ),
             )),
             Line::from(" https://github.com/wzfukui/psmore"),
         ],
     }
 }
 
-fn guidance_page(page: usize, language: UiLanguage) -> Vec<Line<'static>> {
+fn guidance_page(
+    page: usize,
+    language: UiLanguage,
+    theme: &Theme,
+    mode: GlyphMode,
+) -> Vec<Line<'static>> {
     match language {
-        UiLanguage::Chinese => guidance_page_zh(page),
-        UiLanguage::English => guidance_page_en(page),
+        UiLanguage::Chinese => guidance_page_zh(page, theme, mode),
+        UiLanguage::English => guidance_page_en(page, theme, mode),
     }
 }
 
@@ -3160,13 +4105,18 @@ fn draw_guidance_overlay(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         Color::LightCyan
     };
+    let glyph_mode = app.glyph_mode;
     let title = match overlay {
-        GuidanceOverlay::Welcome => text(
-            language,
-            " WELCOME TO PSMORE · SEE THE SYSTEM THROUGH ITS PROCESSES ",
-            " 欢迎使用 PSMORE · 通过进程看清系统 ",
+        GuidanceOverlay::Welcome => chrome(
+            glyph_mode,
+            text(
+                language,
+                " WELCOME TO PSMORE · SEE THE SYSTEM THROUGH ITS PROCESSES ",
+                " 欢迎使用 PSMORE · 通过进程看清系统 ",
+            )
+            .to_string(),
         ),
-        GuidanceOverlay::Help => text(language, " PSMORE FIELD GUIDE ", " PSMORE 现场手册 "),
+        GuidanceOverlay::Help => text(language, " PSMORE FIELD GUIDE ", " PSMORE 现场手册 ").into(),
         GuidanceOverlay::Tip(index) => {
             let title = format!(
                 " PSMORE {} {}/{} ",
@@ -3175,15 +4125,18 @@ fn draw_guidance_overlay(frame: &mut Frame, app: &App, area: Rect) {
                 TIPS.len()
             );
             frame.render_widget(Clear, popup);
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border_color))
-                .title(Span::styled(
-                    title,
-                    Style::default()
-                        .fg(Color::LightMagenta)
-                        .add_modifier(Modifier::BOLD),
-                ));
+            let block = glyph_block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(border_color))
+                    .title(Span::styled(
+                        title,
+                        Style::default()
+                            .fg(Color::LightMagenta)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                glyph_mode,
+            );
             let Some(tip) = app.guidance.tip() else {
                 frame.render_widget(block, popup);
                 return;
@@ -3191,32 +4144,35 @@ fn draw_guidance_overlay(frame: &mut Frame, app: &App, area: Rect) {
             let lines = vec![
                 Line::from(""),
                 Line::from(Span::styled(
-                    format!(" {}", tip.title),
+                    chrome(glyph_mode, format!(" {}", tip.title)),
                     Style::default()
                         .fg(Color::LightCyan)
                         .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(""),
-                Line::from(format!(" {}", tip.body)),
+                Line::from(chrome(glyph_mode, format!(" {}", tip.body))),
                 Line::from(""),
                 Line::from(Span::styled(
-                    format!(" {}", tip.keys),
+                    chrome(glyph_mode, format!(" {}", tip.keys)),
                     Style::default().fg(Color::Yellow),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    format!(
-                        " {} · ? {} · T {} {} · D {} · L {}",
-                        text(language, "Any other key continues", "按其他键继续"),
-                        text(language, "guide", "手册"),
-                        text(language, "future tips", "启动提示"),
-                        if app.guidance.tips_enabled() {
-                            text(language, "ON", "开")
-                        } else {
-                            text(language, "OFF", "关")
-                        },
-                        text(language, "disable", "停用"),
-                        text(language, "language", "语言")
+                    chrome(
+                        glyph_mode,
+                        format!(
+                            " {} · ? {} · T {} {} · D {} · L {}",
+                            text(language, "Any other key continues", "按其他键继续"),
+                            text(language, "guide", "手册"),
+                            text(language, "future tips", "启动提示"),
+                            if app.guidance.tips_enabled() {
+                                text(language, "ON", "开")
+                            } else {
+                                text(language, "OFF", "关")
+                            },
+                            text(language, "disable", "停用"),
+                            text(language, "language", "语言")
+                        ),
                     ),
                     Style::default().fg(Color::DarkGray),
                 )),
@@ -3230,35 +4186,38 @@ fn draw_guidance_overlay(frame: &mut Frame, app: &App, area: Rect) {
             return;
         }
     };
-    let mut lines = guidance_page(app.guidance.page, language);
+    let mut lines = guidance_page(app.guidance.page, language, &app.theme, glyph_mode);
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        format!(
-            " ←/→ {} {}/{} · Enter/Esc {} · T {} {} · D {} · L/F2 {}{}",
-            text(language, "page", "页"),
-            app.guidance.page + 1,
-            GUIDANCE_PAGE_COUNT,
-            text(language, "close", "关闭"),
-            text(language, "tips", "提示"),
-            if app.guidance.tips_enabled() {
-                text(language, "ON", "开")
-            } else {
-                text(language, "OFF", "关")
-            },
-            text(language, "never show startup cards", "不再显示启动卡片"),
-            text(language, "language", "语言"),
-            if matches!(overlay, GuidanceOverlay::Help) {
-                text(language, " · ? close", " · ? 关闭")
-            } else {
-                ""
-            },
+        chrome(
+            glyph_mode,
+            format!(
+                " ←/→ {} {}/{} · Enter/Esc {} · T {} {} · D {} · L {}{}",
+                text(language, "page", "页"),
+                app.guidance.page + 1,
+                GUIDANCE_PAGE_COUNT,
+                text(language, "close", "关闭"),
+                text(language, "tips", "提示"),
+                if app.guidance.tips_enabled() {
+                    text(language, "ON", "开")
+                } else {
+                    text(language, "OFF", "关")
+                },
+                text(language, "never show startup cards", "不再显示启动卡片"),
+                text(language, "language", "语言"),
+                if matches!(overlay, GuidanceOverlay::Help) {
+                    text(language, " · ? close", " · ? 关闭")
+                } else {
+                    ""
+                },
+            ),
         ),
         Style::default().fg(Color::DarkGray),
     )));
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines)
-            .block(
+            .block(glyph_block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(border_color))
@@ -3268,7 +4227,8 @@ fn draw_guidance_overlay(frame: &mut Frame, app: &App, area: Rect) {
                             .fg(Color::LightCyan)
                             .add_modifier(Modifier::BOLD),
                     )),
-            )
+                glyph_mode,
+            ))
             .wrap(Wrap { trim: false }),
         popup,
     );
@@ -3284,12 +4244,14 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(1),
             Constraint::Min(3),
             Constraint::Length(detail_height),
-            Constraint::Length(2),
+            Constraint::Length(1),
         ])
         .split(area);
-    app.page_size = chunks[0].height.saturating_sub(2).max(1) as usize;
+    draw_status_bar(frame, app, chunks[0]);
+    app.page_size = chunks[1].height.saturating_sub(2).max(1) as usize;
     let mut title = if let Some(pid_input) = &app.pid_input {
         format!(
             " psmore  {} PID: {pid_input}",
@@ -3354,11 +4316,6 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     if app.paused {
         title.push_str(text(language, " PAUSED ", " 已暂停 "));
     }
-    title.push_str(&format!(
-        " {}={} ",
-        text(language, "sort", "排序"),
-        sort_label(language, app.sort_mode)
-    ));
     if app.active_filter_count() > 0 {
         title.push_str(&format!(
             " {}={}/{} ",
@@ -3384,8 +4341,18 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         .max()
         .unwrap_or(0)
         + 2;
-    let tree_width = chunks[0].width.saturating_sub(2) as usize;
-    let path_width = tree_width.saturating_sub(path_column);
+    // Right-aligned metric columns adapt to the terminal: below 100 columns
+    // MEM goes first, below 80 both are dropped and the layout matches the
+    // original two pseudo-column tree.
+    let show_cpu_column = area.width >= 80;
+    let show_mem_column = area.width >= 100;
+    let metrics_width = match (show_cpu_column, show_mem_column) {
+        (true, true) => 12,
+        (true, false) => 6,
+        _ => 0,
+    };
+    let tree_width = chunks[1].width.saturating_sub(2) as usize;
+    let path_width = tree_width.saturating_sub(path_column + metrics_width);
     app.advance_marquee(path_width);
     let items: Vec<ListItem> = app
         .visible
@@ -3393,20 +4360,31 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         .zip(row_parts.iter())
         .map(|(row, (label, context))| {
             let p = &app.processes[&row.pid];
-            let line = format!(
-                "{}{}{}",
-                label,
-                " ".repeat(path_column.saturating_sub(label.width())),
-                marquee(
-                    context,
-                    if Some(row.pid) == selected_pid {
-                        app.marquee_offset
-                    } else {
-                        0
-                    },
-                    path_width,
-                )
-            );
+            let theme = &app.theme;
+            let is_selected = Some(row.pid) == selected_pid;
+            let mut spans = vec![
+                Span::raw(label.clone()),
+                Span::raw(" ".repeat(path_column.saturating_sub(label.width()))),
+            ];
+            if show_cpu_column {
+                let cpu_style = if is_selected {
+                    Style::default()
+                } else {
+                    theme.hot_cpu_style(p.cpu).unwrap_or_default()
+                };
+                spans.push(Span::styled(
+                    format!("{:>5} ", format!("{:.1}", p.cpu.min(999.9))),
+                    cpu_style,
+                ));
+            }
+            if show_mem_column {
+                spans.push(Span::raw(format!("{:>5} ", format_compact_bytes(p.memory))));
+            }
+            spans.push(Span::raw(marquee(
+                context,
+                if is_selected { app.marquee_offset } else { 0 },
+                path_width,
+            )));
             let same_name_as_selected = !app.search.is_empty()
                 && Some(row.pid) != selected_pid
                 && selected_name
@@ -3416,40 +4394,47 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
             let recent_change = app.recent_change(row.pid);
             let sibling_background_allowed = selected_depth.map(|depth| depth > 2).unwrap_or(false);
             let style = if Some(row.pid) == selected_pid {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
+                theme.selection()
             } else if same_name_as_selected {
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD)
             } else if matches!(recent_change, Some(ProcessChange::Started { .. })) {
                 Style::default()
-                    .fg(Color::LightGreen)
+                    .fg(theme.started_fg)
                     .add_modifier(Modifier::BOLD)
             } else if matches!(recent_change, Some(ProcessChange::Reparented { .. })) {
                 Style::default()
-                    .fg(Color::LightYellow)
+                    .fg(theme.reparented_fg)
                     .add_modifier(Modifier::BOLD)
             } else if sibling_background_allowed
                 && selected_parent.is_some()
                 && p.parent == selected_parent
                 && Some(row.pid) != selected_pid
             {
-                // Crossterm has no portable alpha channel. Dim cyan gives
-                // sibling rows a clear, approximately 30% emphasis.
-                Style::default()
-                    .fg(Color::Cyan)
-                    .bg(Color::Rgb(0, 64, 72))
-                    .add_modifier(Modifier::DIM)
+                theme.sibling_style()
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(theme.tree_fg)
             };
-            ListItem::new(line).style(style)
+            ListItem::new(Line::from(spans)).style(style)
         })
         .collect();
-    let tree = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
+    let mut tree_block = glyph_block(
+        Block::default().borders(Borders::ALL).title(title),
+        app.glyph_mode,
+    );
+    if show_cpu_column {
+        tree_block = tree_block.title(Title {
+            content: Line::from(if show_mem_column {
+                " CPU%  MEM "
+            } else {
+                " CPU% "
+            }),
+            alignment: Some(Alignment::Right),
+            position: None,
+        });
+    }
+    let tree = List::new(items).block(tree_block);
     let mut tree_state = if app.visible.is_empty() {
         ListState::default()
     } else {
@@ -3458,10 +4443,13 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
             .with_selected(Some(app.selected))
     };
     tree_state.select(Some(app.selected));
-    frame.render_stateful_widget(tree, chunks[0], &mut tree_state);
+    // Record the tree block's screen region so mouse clicks can be mapped
+    // back to visible rows using the same scroll offset as the List.
+    app.tree_area = chunks[1];
+    frame.render_stateful_widget(tree, chunks[1], &mut tree_state);
     app.tree_offset = tree_state.offset();
 
-    let detail_width = chunks[1].width.saturating_sub(2).max(1) as usize;
+    let detail_width = chunks[2].width.saturating_sub(2).max(1) as usize;
     let detail = Text::from(
         selected_process_detail_lines(app, language, detail_width)
             .into_iter()
@@ -3470,13 +4458,16 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     );
     frame.render_widget(
         Paragraph::new(detail)
-            .block(Block::default().borders(Borders::ALL).title(text(
-                language,
-                " selected process ",
-                " 当前进程 ",
-            )))
+            .block(glyph_block(
+                Block::default().borders(Borders::ALL).title(text(
+                    language,
+                    " selected process ",
+                    " 当前进程 ",
+                )),
+                app.glyph_mode,
+            ))
             .wrap(Wrap { trim: false }),
-        chunks[1],
+        chunks[2],
     );
     let total_processes = app.processes.len().saturating_sub(1);
     let total_pages = app.visible.len().div_ceil(app.page_size);
@@ -3498,7 +4489,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
             )
         })
         .unwrap_or_else(|| text(language, "no base", "无基线").into());
-    let shortcut_line: String = if app.pid_input.is_some() {
+    let hint_line: String = if app.pid_input.is_some() {
         text(
             language,
             " PID: type digits | Enter locate | Backspace edit | Esc cancel ",
@@ -3506,14 +4497,26 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         )
         .into()
     } else if app.searching {
-        text(language, " search input (tree unchanged): words | name:/user:/state: | cpu>20 | mem>500m | tree.mem>2g | Enter apply | Esc cancel ", " 搜索输入（进程树不变）：文字 | name:/user:/state: | cpu>20 | mem>500m | tree.mem>2g | Enter 应用 | Esc 取消 ").into()
+        text(language, " search: words | name:/state: | cpu>20 mem>500m | ↑↓ history | Tab field | Enter apply | Esc cancel ", " 搜索（树不变）：文字 | name:/state: | cpu>20 mem>500m | ↑↓ 历史 | Tab 字段 | Enter 应用 | Esc 取消 ").into()
     } else if !app.search.is_empty() {
-        text(language, " search active | ↑↓ move | k end selected | / new search | Esc clear | Enter inspect | q quit ", " 搜索已生效 | ↑↓ 移动 | k 结束选中进程 | / 新搜索 | Esc 清除 | Enter 深检 | q 退出 ").into()
+        text(language, " search active | ↑↓/jk move | p actions | / new search | Esc clear | Enter inspect | q quit ", " 搜索已生效 | ↑↓/jk 移动 | p 操作 | / 新搜索 | Esc 清除 | Enter 深检 | q 退出 ").into()
     } else {
-        text(language, " ↑↓ move | ←/→ tree | digits PID | / find | F filters | k end | p actions | D dossier | M memory | a attention | h hot | m manager | v image | l logs | L language | ? help ", " ↑↓ 移动 | ←/→ 进程树 | 数字定位 PID | / 搜索 | F 过滤器 | k 结束 | p 操作 | D 档案 | M 内存 | a 关注 | h 热点 | m 管理器 | v 映像 | l 日志 | L 语言 | ? 帮助 ").into()
+        text(
+            language,
+            " Enter details · / search · : commands · a alerts · p actions · ? help · q quit ",
+            " Enter 详情 · / 搜索 · : 命令 · a 关注 · p 操作 · ? 帮助 · q 退出 ",
+        )
+        .into()
     };
-    let footer = Paragraph::new(vec![Line::from(format!(
-        " {} {} | {} {}/{} | {} | {} | {} {} | +{} -{} ↪{} | F2 {} | q {}  {}",
+    let hint_line = chrome(app.glyph_mode, hint_line);
+    // The footer is a single line. Wide terminals get the full stats plus the
+    // shortcut hints; as width shrinks the stats degrade to a compact form
+    // and finally yield the whole line to the hints (the hint text is the
+    // part that teaches keys, so it is clipped last). Text-entry modes
+    // (search, PID input) already replaced the hint with input help and skip
+    // stats entirely.
+    let full_stats = format!(
+        " {} {} | {} {}/{} | {} | {} | {} {} | +{} -{} {}{} | L {}",
         total_processes,
         text(language, "proc", "进程"),
         text(language, "page", "页"),
@@ -3525,18 +4528,37 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         sort_label(language, app.sort_mode),
         app.last_changes.started,
         app.last_changes.exited,
+        app.glyphs.reparent,
         app.last_changes.reparented,
         language.label(),
-        text(language, "quit", "退出"),
-        shortcut_line,
-    ))])
-    .style(Style::default().fg(if app.paused {
-        Color::Yellow
+    );
+    let compact_stats = format!(
+        " {} {} · {} · +{} -{} {}{}",
+        total_processes,
+        text(language, "proc", "进程"),
+        live_state,
+        app.last_changes.started,
+        app.last_changes.exited,
+        app.glyphs.reparent,
+        app.last_changes.reparented,
+    );
+    let footer_width = chunks[3].width as usize;
+    let show_stats = !app.searching && app.pid_input.is_none();
+    let combined = if show_stats && (full_stats.width() + 2 + hint_line.width()) <= footer_width {
+        format!("{full_stats} |{hint_line}")
+    } else if show_stats && (compact_stats.width() + 2 + hint_line.width()) <= footer_width {
+        format!("{compact_stats} |{hint_line}")
     } else {
-        Color::DarkGray
-    }))
-    .wrap(Wrap { trim: false });
-    frame.render_widget(footer, chunks[2]);
+        hint_line
+    };
+    let footer = Paragraph::new(Line::from(marquee(&combined, 0, footer_width))).style(
+        Style::default().fg(if app.paused {
+            app.theme.severity_warn
+        } else {
+            app.theme.dim
+        }),
+    );
+    frame.render_widget(footer, chunks[3]);
 
     if app.show_filter_manager {
         draw_filter_manager_overlay(frame, app, area);
@@ -3561,12 +4583,17 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     } else if app.service_context.is_some() {
         draw_service_context_overlay(frame, app, area);
     } else if app.inspection.is_some() {
-        draw_inspection_overlay(frame, app, area);
+        draw_inspection_overlay(frame, app, area, chunks[1]);
     } else if app.show_events {
         draw_event_overlay(frame, app, area);
     }
     if app.process_action.is_some() {
         draw_process_action_overlay(frame, app, area);
+    }
+    // The palette draws above every overlay and dialog (the action dialog
+    // lives outside the if-else chain) but below the notice and guidance.
+    if app.show_palette {
+        draw_palette_overlay(frame, app, area);
     }
     draw_notice(frame, app, area);
     draw_guidance_overlay(frame, app, area);
@@ -3577,10 +4604,12 @@ mod tests {
     use std::{
         process::{Child, Command},
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::*;
@@ -3592,7 +4621,12 @@ mod tests {
         cli::{LogPriority, LogScope},
         i18n::UiLanguage,
         model::{OpenFileInfo, ProcessInfo, ProcessInspection, SocketInfo, ThreadInfo},
+        network::NetworkScan,
         onboarding::{Guidance, TIPS},
+        provider::HostMetrics,
+        query::ProcessQuery,
+        snapshot::BaselineSnapshot,
+        theme::{GlyphMode, ThemeId},
     };
 
     fn ui_process(pid: u32, parent: Option<u32>, name: &str, executable: &str) -> ProcessInfo {
@@ -3687,12 +4721,12 @@ mod tests {
     }
 
     #[test]
-    fn f2_switches_the_complete_guidance_surface_between_languages() {
+    fn l_switches_the_complete_guidance_surface_between_languages() {
         let mut app = App::new_for_test(Guidance::welcome_for_test());
         let backend = TestBackend::new(100, 28);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        app.on_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE));
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let chinese = buffer_text(&terminal);
         let compact_chinese = chinese.replace(' ', "");
@@ -3700,7 +4734,7 @@ mod tests {
         assert!(compact_chinese.contains("理解进程树"));
         assert!(compact_chinese.contains("页1/3"));
 
-        app.on_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE));
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let english = buffer_text(&terminal);
         assert!(english.contains("WELCOME TO PSMORE"));
@@ -3802,6 +4836,51 @@ mod tests {
     }
 
     #[test]
+    fn inspection_arrow_keys_switch_tabs_and_stay_above_the_footer() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        app.inspection = Some(ProcessInspection {
+            pid: Pid::from_u32(42),
+            name: "worker".into(),
+            ..ProcessInspection::default()
+        });
+
+        // Left/right arrows mirror Tab/Shift-Tab, including the scroll reset.
+        app.inspection_scroll = 4;
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.inspection_tab, InspectionTab::Threads);
+        assert_eq!(app.inspection_scroll, 0);
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.inspection_tab, InspectionTab::Ports);
+        app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.inspection_tab, InspectionTab::Threads);
+
+        // The popup hugs the process-tree block: its bottom border (at x=1,
+        // since the popup is horizontally inset) sits on the row directly
+        // above the selected-process pane's top border (at x=0), never
+        // dipping into that pane, and the footer keeps its hints.
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let footer_row = buffer_row(&terminal, 29);
+        assert!(
+            footer_row.contains("p actions"),
+            "inspection popup covers the footer: {footer_row:?}"
+        );
+        let popup_bottom = (0..30u16)
+            .rfind(|row| buffer_row(&terminal, *row).chars().nth(1) == Some('└'))
+            .expect("inspection popup bottom border should be visible");
+        let detail_top = (0..30u16)
+            .rfind(|row| buffer_row(&terminal, *row).starts_with('┌'))
+            .expect("selected-process pane border should be visible");
+        assert_eq!(
+            popup_bottom + 1,
+            detail_top,
+            "inspection popup should end flush with the process tree's bottom border"
+        );
+    }
+
+    #[test]
     fn filter_manager_adds_toggles_edits_and_removes_rules() {
         let mut app = App::new_for_test(Guidance::welcome_for_test());
         app.guidance.overlay = None;
@@ -3841,7 +4920,7 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
         assert!(app.process_filters.is_empty());
 
-        app.on_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE));
         let backend = TestBackend::new(132, 26);
         let mut chinese_terminal = Terminal::new(backend).unwrap();
         chinese_terminal
@@ -3970,7 +5049,7 @@ mod tests {
         assert!(output.contains("resource.fd_limit_pressure"));
         assert!(output.contains("logs on auto <= info 15m"));
 
-        app.on_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
         assert!(!app.dossier_context.as_ref().unwrap().include_logs);
         assert!(app.dossier_context_is_scanning());
         app.on_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE));
@@ -4356,7 +5435,7 @@ mod tests {
     }
 
     #[test]
-    fn kill_key_requires_second_confirmation_before_sending_a_signal() {
+    fn action_dialog_requires_second_confirmation_before_sending_a_signal() {
         let child = Command::new("sleep")
             .arg("30")
             .spawn()
@@ -4380,10 +5459,10 @@ mod tests {
         assert_eq!(app.selected_pid(), Some(pid));
         assert!(!app.searching);
 
-        app.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
-        let dialog = app.process_action.as_ref().expect("k should open a dialog");
-        assert!(dialog.is_termination_only());
-        assert_eq!(dialog.actions(), &ProcessActionKind::TERMINATION);
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        let dialog = app.process_action.as_ref().expect("p should open a dialog");
+        assert!(!dialog.is_termination_only());
+        assert_eq!(dialog.actions(), &ProcessActionKind::ALL);
         assert_eq!(dialog.selected_action(), ProcessActionKind::Terminate);
         assert!(!dialog.confirming);
 
@@ -4391,19 +5470,22 @@ mod tests {
         assert!(app.process_action.as_ref().unwrap().confirming);
         assert!(child.0.try_wait().expect("check child").is_none());
 
-        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        // q steps out of the confirmation, then closes the dialog; the app
+        // keeps running because only the bare tree lets q quit.
+        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!app.process_action.as_ref().unwrap().confirming);
         app.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
         let dialog = app.process_action.as_ref().unwrap();
         assert_eq!(dialog.selected_action(), ProcessActionKind::Kill);
         assert!(dialog.confirming);
         assert!(child.0.try_wait().expect("check child again").is_none());
 
-        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
         assert!(app.process_action.is_none());
         assert!(app.action_history.is_empty());
 
-        app.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(child.0.try_wait().expect("check before y").is_none());
         app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
@@ -4426,11 +5508,1470 @@ mod tests {
         assert!(exited, "confirmed TERM did not stop the isolated target");
     }
 
+    /// Fixed seeded main screen, rendered with the default dark/unicode
+    /// configuration. The snapshot was captured before the theme system
+    /// existed; any change to default rendering fails this test.
+    fn seeded_main_screen_terminal() -> Terminal<TestBackend> {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        app.host_metrics = HostMetrics {
+            hostname: "testhost".into(),
+            load_one: 0.82,
+            cpu_percent: 42.0,
+            memory_used: 13_000_000_000,
+            memory_total: 17_179_869_184,
+            swap_used: 1_000_000_000,
+            swap_total: 4_000_000_000,
+        };
+        let mut hot = ui_process(2, Some(1), "worker", "/usr/bin/worker");
+        hot.cpu = 91.5;
+        hot.memory = 512 * 1024 * 1024;
+        let mut warm = ui_process(3, Some(1), "helper", "/usr/bin/helper");
+        warm.cpu = 62.0;
+        warm.memory = 64 * 1024 * 1024;
+        seed_processes(
+            &mut app,
+            vec![
+                ui_process(0, None, "kernel / system", ""),
+                ui_process(1, Some(0), "launchd", "/sbin/launchd"),
+                hot,
+                warm,
+                ui_process(4, Some(2), "child", "/usr/bin/child"),
+            ],
+        );
+        let backend = TestBackend::new(110, 28);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        terminal
+    }
+
+    #[test]
+    fn default_main_screen_matches_pre_theme_snapshot() {
+        let terminal = seeded_main_screen_terminal();
+        // Regenerate the fixture after intentional layout changes:
+        // PSMORE_REGEN_SNAPSHOT=1 cargo test default_main_screen_matches
+        if std::env::var_os("PSMORE_REGEN_SNAPSHOT").is_some() {
+            std::fs::write(
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/src/ui_main_screen_snapshot.txt"
+                ),
+                buffer_text(&terminal),
+            )
+            .expect("snapshot fixture should be writable");
+            return;
+        }
+        assert_eq!(
+            buffer_text(&terminal),
+            include_str!("ui_main_screen_snapshot.txt")
+        );
+        // Key styles are also pinned: the selected row stays white-on-blue
+        // bold, and the status-bar CPU label stays cyan.
+        let buffer = terminal.backend().buffer();
+        let selected = buffer.cell((1, 2)).expect("selected tree row cell");
+        assert_eq!(selected.fg, Color::White);
+        assert_eq!(selected.bg, Color::Blue);
+        assert!(selected.modifier.contains(Modifier::BOLD));
+        let cpu_label = buffer
+            .cell((12, 0))
+            .expect("status bar CPU label cell")
+            .clone();
+        assert_eq!(cpu_label.fg, Color::Cyan);
+        // The hot worker's CPU metric stays LightRed at the 85% threshold.
+        let hot_cpu = (0..buffer.area.width)
+            .filter_map(|x| buffer.cell((x, 4)))
+            .find(|cell| cell.symbol() == "9")
+            .expect("hot worker CPU cell")
+            .clone();
+        assert_eq!(hot_cpu.fg, Color::LightRed);
+    }
+
+    #[test]
+    fn cycling_the_theme_via_the_palette_repaints_and_persists() {
+        let directory = std::env::temp_dir().join(format!(
+            "psmore-theme-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        let state_path = directory.join("ui-state.json");
+        let mut app = App::new_for_test(Guidance::load_from_path(state_path.clone(), true));
+        app.guidance.overlay = None;
+        assert_eq!(app.theme_id, ThemeId::Dark);
+
+        app.on_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+        type_palette_query(&mut app, "cycle theme");
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.show_palette);
+        assert_eq!(app.theme_id, ThemeId::Light);
+        assert_eq!(
+            app.notice.as_ref().map(|notice| notice.message.as_str()),
+            Some("Theme: light")
+        );
+
+        app.cycle_theme();
+        assert_eq!(app.theme_id, ThemeId::HighContrast);
+        app.cycle_theme();
+        assert_eq!(app.theme_id, ThemeId::Dark);
+
+        // The resolved struct tracks the id, and the selection style differs
+        // between presets.
+        app.cycle_theme();
+        app.cycle_theme();
+        assert_eq!(app.theme.selection_fg, Color::Black);
+        assert_eq!(app.theme.selection_bg, Color::White);
+        assert_ne!(app.theme.selection(), Theme::dark().selection());
+
+        // Palette switching persisted the final choice to ui-state.json.
+        let reloaded = Guidance::load_from_path(state_path.clone(), true);
+        assert_eq!(reloaded.theme(), Some(ThemeId::HighContrast));
+
+        std::fs::remove_file(state_path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn ascii_glyphs_replace_unicode_tree_and_status_marks() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        app.host_metrics = HostMetrics {
+            hostname: "testhost".into(),
+            load_one: 0.0,
+            cpu_percent: 0.0,
+            memory_used: 1_000_000_000,
+            memory_total: 2_000_000_000,
+            swap_used: 0,
+            swap_total: 0,
+        };
+        let mut zombie = ui_process(2, Some(1), "zombie-worker", "/bin/zombie-worker");
+        zombie.status = "Zombie".into();
+        seed_processes(
+            &mut app,
+            vec![
+                ui_process(0, None, "kernel / system", ""),
+                ui_process(1, Some(0), "launchd", "/sbin/launchd"),
+                zombie,
+                ui_process(3, Some(2), "child", "/usr/bin/child"),
+                ui_process(4, Some(1), "helper", "/usr/bin/helper"),
+            ],
+        );
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let unicode = buffer_text(&terminal);
+        assert!(unicode.contains("├─"));
+        assert!(unicode.contains("└─"));
+        assert!(unicode.contains("▲ 1 alerts"));
+
+        app.toggle_glyphs();
+        assert_eq!(app.glyph_mode, GlyphMode::Ascii);
+        let mut ascii_terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        ascii_terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let ascii = buffer_text(&ascii_terminal);
+        assert!(ascii.contains("|-"));
+        assert!(ascii.contains("`-"));
+        // Block borders switch to the ASCII set too: no Unicode line symbols
+        // survive anywhere on the main screen.
+        assert!(!ascii.contains('├'));
+        assert!(!ascii.contains('▾'));
+        assert!(!ascii.contains('─'));
+        assert!(!ascii.contains('│'));
+        assert!(ascii.contains("! 1 alerts"));
+        // The test guidance has no state path, so the notice reports the
+        // save failure; the onboarding tests cover the persisted round-trip.
+        let notice = app.notice.as_ref().expect("glyph toggle notice");
+        assert!(notice.message.to_lowercase().contains("glyph"));
+    }
+
+    #[test]
+    fn ascii_mode_keeps_main_screen_and_trend_overlay_pure_ascii() {
+        // Decorative chrome must never leak Unicode in ASCII glyph mode.
+        // CJK text content is exempt by design and not rendered here.
+        const FORBIDDEN: &[char] = &[
+            '│', '┃', '├', '┤', '└', '┌', '┐', '┘', '─', '━', '▾', '▸', '●', '○', '↪', '▲', '✓',
+            '↑', '↓', '→', '←', '·', '•', '×', '★', '⠋',
+        ];
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        app.host_metrics = HostMetrics {
+            hostname: "testhost".into(),
+            load_one: 0.82,
+            cpu_percent: 42.0,
+            memory_used: 1_000_000_000,
+            memory_total: 2_000_000_000,
+            swap_used: 0,
+            swap_total: 0,
+        };
+        let mut zombie = ui_process(2, Some(1), "zombie-worker", "/bin/zombie-worker");
+        zombie.status = "Zombie".into();
+        seed_processes(
+            &mut app,
+            vec![
+                ui_process(0, None, "kernel / system", ""),
+                ui_process(1, Some(0), "launchd", "/sbin/launchd"),
+                zombie,
+            ],
+        );
+        for _ in 0..3 {
+            app.history
+                .record(&app.processes, &app.resources, Instant::now());
+        }
+        app.toggle_glyphs();
+
+        // Main screen.
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let main = buffer_text(&terminal);
+        for c in FORBIDDEN {
+            assert!(!main.contains(*c), "main screen leaked {c:?}: {main:?}");
+        }
+
+        // Trend overlay with live sparklines on top.
+        app.trend_pid = Some(Pid::from_u32(2));
+        app.trend_view = TrendView::Io;
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let trend = buffer_text(&terminal);
+        for c in FORBIDDEN {
+            assert!(!trend.contains(*c), "trend overlay leaked {c:?}: {trend:?}");
+        }
+        assert!(trend.contains("trends zombie-worker [2]"));
+    }
+
+    #[test]
+    fn overlay_body_text_uses_the_theme_foreground() {
+        fn dossier_app() -> App {
+            let mut app = App::new_for_test(Guidance::welcome_for_test());
+            app.guidance.overlay = None;
+            let current_pid = sysinfo::get_current_pid().unwrap();
+            app.dossier_context = Some(DossierContextPanel {
+                pid: current_pid,
+                name: "worker".into(),
+                content: [
+                    "PSMORE PROCESS DOSSIER",
+                    "process worker [42]  user deploy  status Run  identity verified",
+                    "EVIDENCE OVERVIEW",
+                    "  inspection         complete      20ms",
+                ]
+                .join("\n"),
+                report: None,
+                warning: None,
+                include_logs: false,
+                hash: false,
+                scope: LogScope::Auto,
+                priority: LogPriority::Info,
+                since_seconds: 900,
+                limit: 100,
+            });
+            app
+        }
+        // Foreground of the first character of the row containing `needle`.
+        fn body_fg(terminal: &Terminal<TestBackend>, needle: &str) -> Color {
+            let buffer = terminal.backend().buffer();
+            for y in 0..buffer.area.height {
+                let row: String = (0..buffer.area.width)
+                    .filter_map(|x| buffer.cell((x, y)))
+                    .map(|cell| cell.symbol())
+                    .collect();
+                if let Some(byte_index) = row.find(needle) {
+                    let x = row[..byte_index].chars().count() as u16;
+                    return buffer
+                        .cell((x, y))
+                        .map(|cell| cell.fg)
+                        .unwrap_or(Color::Reset);
+                }
+            }
+            panic!("row {needle:?} not rendered");
+        }
+
+        // Dark must stay pixel-identical to the pre-theme code: White body.
+        let mut app = dossier_app();
+        let mut terminal = Terminal::new(TestBackend::new(110, 18)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(body_fg(&terminal, "process worker [42]"), Color::White);
+
+        // Light theme routes the same body text through the theme token.
+        let mut app = dossier_app();
+        app.theme_id = ThemeId::Light;
+        app.theme = Theme::light();
+        let mut terminal = Terminal::new(TestBackend::new(110, 18)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(
+            body_fg(&terminal, "process worker [42]"),
+            Theme::light().tree_fg
+        );
+    }
+
+    #[test]
+    fn inspection_tab_labels_fit_their_measured_width() {
+        let inspection = ProcessInspection::default();
+        // English compact bar measures 31 cells: fits at 32.
+        assert!(inspection_tab_labels(&inspection, UiLanguage::English, 32).is_some());
+        // The four Chinese compact labels are double-width and measure 33
+        // cells: 32 degrades to the single active tab instead of clipping,
+        // and 33 fits exactly.
+        assert!(inspection_tab_labels(&inspection, UiLanguage::Chinese, 32).is_none());
+        let labels = inspection_tab_labels(&inspection, UiLanguage::Chinese, 33)
+            .expect("Chinese compact labels fit at 33");
+        assert_eq!(inspection_tab_bar_width(&labels), 33);
+        // Full labels are preferred from 58 columns up when they fit.
+        let full = inspection_tab_labels(&inspection, UiLanguage::English, 58)
+            .expect("full labels fit at 58");
+        assert!(full[0].contains("Overview"));
+        // Counts that outgrow the full bar fall back to compact labels.
+        let busy = ProcessInspection {
+            thread_count: 999_999_999_999,
+            ..ProcessInspection::default()
+        };
+        let labels = inspection_tab_labels(&busy, UiLanguage::English, 58)
+            .expect("compact fallback fits at 58");
+        assert_eq!(labels[0], "Info");
+    }
+
+    #[test]
+    fn inspection_tab_click_regions_stay_inside_the_tab_bar() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        app.guidance.set_language_for_test(UiLanguage::Chinese);
+        app.inspection = Some(ProcessInspection {
+            pid: Pid::from_u32(42),
+            name: "worker".into(),
+            ..ProcessInspection::default()
+        });
+        // area 36 -> popup 34 -> tab bar 32 cells: the Chinese compact bar
+        // (33 cells) does not fit, so only the active tab shows and no
+        // clickable regions are recorded.
+        let mut terminal = Terminal::new(TestBackend::new(36, 14)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(app.inspection_tab_regions.is_empty());
+        let output = buffer_text(&terminal);
+        assert!(output.contains("1/4"));
+
+        // area 37 -> popup 35 -> tab bar 33 cells: the Chinese compact bar
+        // fits exactly and every recorded region stays inside the bar.
+        let mut terminal = Terminal::new(TestBackend::new(37, 14)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.inspection_tab_regions.len(), 4);
+        let bar_end = app
+            .inspection_tab_regions
+            .iter()
+            .map(|(region, _)| region.x + region.width)
+            .max()
+            .unwrap();
+        // The 33-cell bar starts at inner x = 2 and ends at x = 35.
+        assert!(bar_end <= 35, "regions escaped the tab bar: {bar_end}");
+    }
+
+    #[test]
+    fn network_port_filter_label_is_bilingual() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        app.show_network = true;
+        app.network_scan = Some(network_fixture());
+        app.network_port_filter = Some(8080);
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(buffer_text(&terminal).contains("port=8080"));
+
+        app.guidance.set_language_for_test(UiLanguage::Chinese);
+        // A fresh backend: TestBackend keeps stale symbols in the
+        // continuation cells of wide CJK glyphs after a redraw.
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        // TestBackend pads the continuation cell of every wide CJK glyph
+        // with a blank, so compare Chinese substrings without whitespace.
+        let compact: String = buffer_text(&terminal)
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(compact.contains("端口=8080"));
+    }
+
     #[test]
     fn zero_sized_terminal_does_not_panic() {
         let mut app = App::new_for_test(Guidance::welcome_for_test());
         let backend = TestBackend::new(0, 0);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    }
+
+    fn buffer_row(terminal: &Terminal<TestBackend>, row: u16) -> String {
+        let buffer = terminal.backend().buffer();
+        let mut output = String::new();
+        for x in 0..buffer.area.width {
+            if let Some(cell) = buffer.cell((x, row)) {
+                output.push_str(cell.symbol());
+            }
+        }
+        output
+    }
+
+    fn seed_processes(app: &mut App, processes: Vec<ProcessInfo>) {
+        app.processes = processes.into_iter().map(|p| (p.pid, p)).collect();
+        app.children.clear();
+        for process in app.processes.values() {
+            app.children
+                .entry(process.parent)
+                .or_default()
+                .push(process.pid);
+        }
+        app.resources = aggregate_resources(&app.processes, &app.children);
+        app.expanded = app
+            .children
+            .iter()
+            .filter(|(pid, kids)| pid.is_some() && !kids.is_empty())
+            .filter_map(|(pid, _)| *pid)
+            .collect();
+        // cycle_sort_mode rebuilds the visible rows from the seeded map.
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        app.selected = 0;
+    }
+
+    #[test]
+    fn status_bar_renders_host_metrics_alerts_and_survives_narrow_terminals() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        app.host_metrics = HostMetrics {
+            hostname: "testhost".into(),
+            load_one: 0.82,
+            cpu_percent: 42.0,
+            memory_used: 13_000_000_000,
+            memory_total: 17_179_869_184,
+            swap_used: 1_000_000_000,
+            swap_total: 4_000_000_000,
+        };
+        let mut zombie = ui_process(7654, Some(1), "zombie-worker", "/bin/zombie-worker");
+        zombie.status = "Zombie".into();
+        seed_processes(
+            &mut app,
+            vec![
+                ui_process(0, None, "kernel / system", ""),
+                ui_process(1, Some(0), "launchd", "/sbin/launchd"),
+                zombie,
+            ],
+        );
+
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let status = buffer_row(&terminal, 0);
+        assert!(status.contains("testhost"));
+        assert!(status.contains("load 0.82"));
+        assert!(status.contains("CPU 42%"));
+        assert!(status.contains("12.1G/16.0G"));
+        assert!(status.contains("SWAP 25%"));
+        assert!(status.contains("▲ 1 alerts"));
+
+        let narrow = TestBackend::new(40, 12);
+        let mut narrow_terminal = Terminal::new(narrow).unwrap();
+        narrow_terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let narrow_status = buffer_row(&narrow_terminal, 0);
+        assert!(narrow_status.contains("testhost"));
+        // The alert count is the most decision-relevant field: it must
+        // survive even when host metrics are dropped for lack of width.
+        assert!(narrow_status.contains("alerts"));
+    }
+
+    #[test]
+    fn metric_columns_adapt_to_terminal_width() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        app.host_metrics = HostMetrics {
+            hostname: "testhost".into(),
+            load_one: 0.0,
+            cpu_percent: 0.0,
+            memory_used: 2_000_000_000,
+            memory_total: 17_179_869_184,
+            swap_used: 0,
+            swap_total: 0,
+        };
+        let mut hot = ui_process(2, Some(1), "worker", "/usr/bin/worker");
+        hot.cpu = 34.2;
+        hot.memory = 512 * 1024 * 1024;
+        seed_processes(
+            &mut app,
+            vec![
+                ui_process(0, None, "kernel / system", ""),
+                ui_process(1, Some(0), "launchd", "/sbin/launchd"),
+                hot,
+                ui_process(3, Some(1), "shell", "/bin/zsh"),
+            ],
+        );
+        // Keep the detail pane on the idle shell so the hot worker's metrics
+        // can only come from the tree columns.
+        app.selected = app
+            .visible
+            .iter()
+            .position(|row| row.pid == Pid::from_u32(3))
+            .expect("shell should be visible");
+
+        let wide = TestBackend::new(120, 20);
+        let mut wide_terminal = Terminal::new(wide).unwrap();
+        wide_terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let wide_text = buffer_text(&wide_terminal);
+        assert!(wide_text.contains("34.2"));
+        assert!(wide_text.contains("512M"));
+        let wide_border = buffer_row(&wide_terminal, 1);
+        assert!(wide_border.contains("CPU%"));
+        assert!(wide_border.contains("MEM"));
+
+        let medium = TestBackend::new(90, 20);
+        let mut medium_terminal = Terminal::new(medium).unwrap();
+        medium_terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let medium_text = buffer_text(&medium_terminal);
+        assert!(medium_text.contains("34.2"));
+        assert!(!medium_text.contains("512M"));
+        let medium_border = buffer_row(&medium_terminal, 1);
+        assert!(medium_border.contains("CPU%"));
+        assert!(!medium_border.contains("MEM"));
+
+        let narrow = TestBackend::new(70, 20);
+        let mut narrow_terminal = Terminal::new(narrow).unwrap();
+        narrow_terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let narrow_text = buffer_text(&narrow_terminal);
+        assert!(!narrow_text.contains("34.2"));
+        assert!(!narrow_text.contains("512M"));
+        assert!(!buffer_row(&narrow_terminal, 1).contains("CPU%"));
+    }
+
+    #[test]
+    fn footer_hint_line_stays_short_in_both_languages() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        let backend = TestBackend::new(160, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let english = buffer_text(&terminal);
+        let english_row = english
+            .lines()
+            .find(|line| line.contains("p actions"))
+            .expect("English footer should show the hint line");
+        // Wide terminals merge stats and hints onto one row; measure only
+        // the hint segment (from the first hint entry onward) so the length
+        // budget still guards the hint text.
+        let english_hint = english_row
+            .find("Enter details")
+            .map(|index| &english_row[index..])
+            .unwrap_or(english_row);
+        assert!(
+            english_hint.trim_end().chars().count() <= 80,
+            "English hint line too long: {english_hint:?}"
+        );
+
+        app.on_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE));
+        // The language-change confirmation notice overlays the footer.
+        app.notice = None;
+        // A fresh terminal avoids TestBackend's stale-cell artifacts when
+        // English cells are replaced by narrower Chinese labels.
+        let backend = TestBackend::new(160, 30);
+        let mut chinese_terminal = Terminal::new(backend).unwrap();
+        chinese_terminal
+            .draw(|frame| draw(frame, &mut app))
+            .unwrap();
+        let chinese = buffer_text(&chinese_terminal);
+        let chinese_row = chinese
+            .lines()
+            .find(|line| line.replace(' ', "").contains("p操作"))
+            .expect("Chinese footer should show the hint line");
+        // TestBackend pads wide CJK glyphs with blank continuation cells, so
+        // anchor on the ASCII "Enter" rather than the spaced-out 详情.
+        let chinese_hint = chinese_row
+            .find("Enter")
+            .map(|index| &chinese_row[index..])
+            .unwrap_or(chinese_row);
+        assert!(
+            chinese_hint.trim_end().chars().count() <= 80,
+            "Chinese hint line too long: {chinese_hint:?}"
+        );
+    }
+
+    fn type_palette_query(app: &mut App, query: &str) {
+        for character in query.chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+    }
+
+    #[test]
+    fn colon_opens_the_command_palette_and_esc_closes_it() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+
+        app.on_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+        assert!(app.show_palette);
+        assert!(app.palette_query.is_empty());
+        // An empty query lists the full catalog.
+        assert_eq!(app.palette_matches().len(), 30);
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rendered = buffer_text(&terminal);
+        assert!(rendered.contains("command palette"));
+        assert!(rendered.contains("Memory attribution"));
+        assert!(rendered.contains("Enter run"));
+
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.show_palette);
+    }
+
+    #[test]
+    fn palette_query_fuzzy_matches_both_languages() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        app.on_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+
+        type_palette_query(&mut app, "mem");
+        let names: Vec<&str> = app
+            .palette_matches()
+            .iter()
+            .map(|command| command.en_name)
+            .collect();
+        assert!(
+            names.contains(&"Memory attribution"),
+            "\"mem\" should match memory attribution: {names:?}"
+        );
+
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+        // Chinese keywords match even while the UI is in English.
+        type_palette_query(&mut app, "档案");
+        let names: Vec<&str> = app
+            .palette_matches()
+            .iter()
+            .map(|command| command.en_name)
+            .collect();
+        assert_eq!(names, vec!["Process dossier"]);
+
+        // Backspace edits the query and resets the selection.
+        app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(app.palette_query, "档");
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.show_palette);
+    }
+
+    #[test]
+    fn palette_enter_executes_exactly_like_the_key() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+
+        // events: same as pressing e on the bare tree.
+        app.on_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+        type_palette_query(&mut app, "events");
+        let quit = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!quit);
+        assert!(!app.show_palette);
+        assert!(app.show_events);
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.show_events);
+
+        // language: same as pressing L.
+        assert_eq!(app.language(), UiLanguage::English);
+        app.on_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+        type_palette_query(&mut app, "language");
+        let quit = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!quit);
+        assert_eq!(app.language(), UiLanguage::Chinese);
+        app.notice = None;
+        app.on_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE));
+        assert_eq!(app.language(), UiLanguage::English);
+    }
+
+    #[test]
+    fn palette_execution_closes_other_overlays_first() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        assert!(app.show_events);
+        // The palette opens over the events overlay without touching it.
+        app.on_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+        assert!(app.show_palette);
+        assert!(app.show_events);
+
+        type_palette_query(&mut app, "attention");
+        let quit = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!quit);
+        // Exclusivity: executing a workspace command closes the old overlay.
+        assert!(app.show_attention);
+        assert!(!app.show_events);
+    }
+
+    #[test]
+    fn palette_q_closes_without_quitting_and_colon_is_text_in_search() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+
+        app.on_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+        assert!(app.show_palette);
+        // Layered-q: q closes the palette layer, it does not quit psmore.
+        let quit = app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!quit);
+        assert!(!app.show_palette);
+
+        // With a query typed, q is ordinary input instead.
+        app.on_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+        type_palette_query(&mut app, "e");
+        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(app.show_palette);
+        assert_eq!(app.palette_query, "eq");
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        // While searching, `:` belongs to the search input.
+        app.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert!(app.searching);
+        app.on_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+        assert!(app.searching);
+        assert!(!app.show_palette);
+        assert_eq!(app.search_input, ":");
+    }
+
+    #[test]
+    fn k_moves_selection_up_and_p_opens_the_action_dialog() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        seed_processes(
+            &mut app,
+            vec![
+                ui_process(0, None, "kernel / system", ""),
+                ui_process(1, Some(0), "launchd", "/sbin/launchd"),
+                ui_process(2, Some(1), "worker", "/usr/bin/worker"),
+            ],
+        );
+        app.selected = 2;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.selected, 1);
+        assert!(app.process_action.is_none());
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.selected, 2);
+        assert!(app.process_action.is_none());
+
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        let dialog = app.process_action.as_ref().expect("p should open a dialog");
+        assert_eq!(dialog.actions(), &ProcessActionKind::ALL);
+        assert_eq!(dialog.target.pid, Pid::from_u32(2));
+        assert!(!app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)));
+        assert!(app.process_action.is_none());
+    }
+
+    fn apply_search(app: &mut App, query: &str) {
+        app.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        type_palette_query(app, query);
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    fn click(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn search_history_recalls_applied_queries_and_restores_the_draft() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        seed_processes(
+            &mut app,
+            vec![
+                ui_process(0, None, "kernel / system", ""),
+                ui_process(1, Some(0), "launchd", "/sbin/launchd"),
+                ui_process(2, Some(1), "worker", "/usr/bin/worker"),
+            ],
+        );
+
+        apply_search(&mut app, "name:worker");
+        assert_eq!(app.search, "name:worker");
+        apply_search(&mut app, "cpu>20");
+        assert_eq!(app.query_history, vec!["cpu>20", "name:worker"]);
+
+        // A cancelled query is not recorded.
+        app.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        type_palette_query(&mut app, "name:draft");
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.query_history, vec!["cpu>20", "name:worker"]);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        type_palette_query(&mut app, "mem");
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.search_input, "cpu>20");
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.search_input, "name:worker");
+        // Walking past the oldest entry stays on it.
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.search_input, "name:worker");
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.search_input, "cpu>20");
+        // Down past the newest entry returns to the in-progress draft.
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.search_input, "mem");
+        // The tree only changes once the query is applied.
+        assert!(app.search.is_empty() || app.search == "cpu>20");
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn query_history_dedups_and_caps_at_twenty() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        seed_processes(
+            &mut app,
+            vec![
+                ui_process(0, None, "kernel / system", ""),
+                ui_process(1, Some(0), "launchd", "/sbin/launchd"),
+            ],
+        );
+
+        apply_search(&mut app, "name:first");
+        apply_search(&mut app, "name:second");
+        apply_search(&mut app, "name:first");
+        assert_eq!(app.query_history, vec!["name:first", "name:second"]);
+
+        for index in 0..25 {
+            apply_search(&mut app, &format!("pid:{index}"));
+        }
+        assert_eq!(app.query_history.len(), 20);
+        assert_eq!(app.query_history[0], "pid:24");
+        assert_eq!(app.query_history[19], "pid:5");
+    }
+
+    #[test]
+    fn tab_completes_field_starters_and_cycles_candidates() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        seed_processes(
+            &mut app,
+            vec![
+                ui_process(0, None, "kernel / system", ""),
+                ui_process(1, Some(0), "launchd", "/sbin/launchd"),
+            ],
+        );
+
+        // Empty token: Tab cycles through every field starter.
+        app.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.search_input, "name:");
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.search_input, "cmd:");
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        // Mid-token partial: only candidates with that prefix, token replaced.
+        app.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        type_palette_query(&mut app, "us");
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.search_input, "user:");
+        // Typing ends the cycle; the completed starter takes a value and the
+        // finished query still parses.
+        type_palette_query(&mut app, "joe");
+        assert!(ProcessQuery::parse(&app.search_input).is_ok());
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        // Completion replaces only the current token, keeping earlier terms.
+        app.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        type_palette_query(&mut app, "name:launchd cp");
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.search_input, "name:launchd cpu>");
+        type_palette_query(&mut app, "20");
+        assert!(ProcessQuery::parse(&app.search_input).is_ok());
+
+        // A token that prefixes no starter is left alone.
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        type_palette_query(&mut app, "zzz");
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.search_input, "zzz");
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn star_toggles_marker_and_survives_tree_rebuilds() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        seed_processes(
+            &mut app,
+            vec![
+                ui_process(0, None, "kernel / system", ""),
+                ui_process(1, Some(0), "launchd", "/sbin/launchd"),
+                ui_process(2, Some(1), "worker", "/usr/bin/worker"),
+            ],
+        );
+        app.selected = 2;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('*'), KeyModifiers::NONE));
+        assert!(app.is_starred(Pid::from_u32(2)));
+        assert_eq!(app.marks.len(), 1);
+
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let worker_row = buffer_text(&terminal)
+            .lines()
+            .find(|line| line.contains("worker"))
+            .expect("worker row should render")
+            .to_string();
+        assert!(worker_row.contains("★"), "starred row: {worker_row:?}");
+
+        // A rebuild (here: cycling the sort mode) keeps the star.
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert!(app.is_starred(Pid::from_u32(2)));
+
+        // Toggling again removes the star.
+        app.on_key(KeyEvent::new(KeyCode::Char('*'), KeyModifiers::NONE));
+        assert!(!app.is_starred(Pid::from_u32(2)));
+        assert!(app.marks.is_empty());
+    }
+
+    #[test]
+    fn reused_pid_does_not_inherit_the_star() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        seed_processes(
+            &mut app,
+            vec![
+                ui_process(0, None, "kernel / system", ""),
+                ui_process(1, Some(0), "launchd", "/sbin/launchd"),
+                ui_process(2, Some(1), "worker", "/usr/bin/worker"),
+            ],
+        );
+        app.selected = 2;
+        app.on_key(KeyEvent::new(KeyCode::Char('*'), KeyModifiers::NONE));
+        assert!(app.is_starred(Pid::from_u32(2)));
+
+        // The PID comes back as a different instance (new start time): the
+        // star must not follow the reused PID.
+        app.processes
+            .get_mut(&Pid::from_u32(2))
+            .expect("worker is seeded")
+            .start_time = 999;
+        assert!(!app.is_starred(Pid::from_u32(2)));
+    }
+
+    #[test]
+    fn quote_jumps_between_starred_processes_with_wrap_and_notices() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        seed_processes(
+            &mut app,
+            vec![
+                ui_process(0, None, "kernel / system", ""),
+                ui_process(1, Some(0), "launchd", "/sbin/launchd"),
+                ui_process(2, Some(1), "alpha", "/usr/bin/alpha"),
+                ui_process(3, Some(1), "beta", "/usr/bin/beta"),
+                ui_process(4, Some(1), "gamma", "/usr/bin/gamma"),
+            ],
+        );
+
+        // No stars yet: ' shows a bilingual notice instead of jumping.
+        app.on_key(KeyEvent::new(KeyCode::Char('\''), KeyModifiers::NONE));
+        let notice = app.notice.as_ref().expect("notice for empty star list");
+        assert!(notice.message.contains("no starred processes"));
+        assert!(!notice.is_error);
+
+        // Star gamma (index 4) and alpha (index 2).
+        app.selected = 4;
+        app.on_key(KeyEvent::new(KeyCode::Char('*'), KeyModifiers::NONE));
+        app.selected = 2;
+        app.on_key(KeyEvent::new(KeyCode::Char('*'), KeyModifiers::NONE));
+
+        // From alpha: next starred is gamma; from gamma it wraps to alpha.
+        app.on_key(KeyEvent::new(KeyCode::Char('\''), KeyModifiers::NONE));
+        assert_eq!(app.selected, 4);
+        app.on_key(KeyEvent::new(KeyCode::Char('\''), KeyModifiers::NONE));
+        assert_eq!(app.selected, 2);
+    }
+
+    fn network_fixture() -> NetworkScan {
+        NetworkScan {
+            endpoints: vec![
+                NetworkEndpoint {
+                    pid: Some(Pid::from_u32(2)),
+                    process: "worker".into(),
+                    fd: "12".into(),
+                    protocol: "TCP".into(),
+                    local_endpoint: "127.0.0.1:8080".into(),
+                    remote_endpoint: String::new(),
+                    state: "LISTEN".into(),
+                    namespace: String::new(),
+                },
+                NetworkEndpoint {
+                    pid: Some(Pid::from_u32(3)),
+                    process: "sshd".into(),
+                    fd: "5".into(),
+                    protocol: "TCP".into(),
+                    local_endpoint: "0.0.0.0:22".into(),
+                    remote_endpoint: String::new(),
+                    state: "LISTEN".into(),
+                    namespace: String::new(),
+                },
+            ],
+            warning: None,
+        }
+    }
+
+    #[test]
+    fn network_port_input_filters_selects_and_x_restores() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        app.show_network = true;
+        app.network_scan = Some(network_fixture());
+
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert_eq!(app.network_port_input.as_deref(), Some(""));
+        type_palette_query(&mut app, "8080");
+        // Digits are the only accepted input.
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(app.network_port_input.as_deref(), Some("8080"));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.network_port_filter, Some(8080));
+        assert_eq!(app.network_port_input, None);
+        let visible = app.network_visible_indices();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(app.network_selected, 0);
+        assert_eq!(
+            app.network_scan.as_ref().unwrap().endpoints[visible[0]].local_endpoint,
+            "127.0.0.1:8080"
+        );
+
+        // x clears the port filter together with the text filter.
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(app.network_port_filter, None);
+        assert_eq!(app.network_visible_indices().len(), 2);
+
+        // A port with no endpoint keeps the list and shows a notice.
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        type_palette_query(&mut app, "9");
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.network_port_filter, None);
+        let notice = app.notice.as_ref().expect("no-match notice");
+        assert!(notice.message.contains("no endpoint on port 9"));
+        assert_eq!(app.network_visible_indices().len(), 2);
+
+        // Esc cancels the input and restores the unfiltered list.
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        type_palette_query(&mut app, "8080");
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.network_port_filter, Some(8080));
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        type_palette_query(&mut app, "22");
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.network_port_input, None);
+        assert_eq!(app.network_port_filter, None);
+        assert_eq!(app.network_visible_indices().len(), 2);
+    }
+
+    #[test]
+    fn palette_find_port_opens_network_with_port_input() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+
+        app.on_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+        type_palette_query(&mut app, "find port");
+        let quit = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!quit);
+        assert!(app.show_network);
+        assert_eq!(app.network_port_input.as_deref(), Some(""));
+        // Clean up the background scan started by opening the workspace.
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.show_network);
+    }
+
+    #[test]
+    fn mouse_click_selects_row_and_second_click_opens_inspection() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        seed_processes(
+            &mut app,
+            vec![
+                ui_process(0, None, "kernel / system", ""),
+                ui_process(1, Some(0), "launchd", "/sbin/launchd"),
+                ui_process(2, Some(1), "alpha", "/usr/bin/alpha"),
+                ui_process(3, Some(1), "beta", "/usr/bin/beta"),
+                ui_process(4, Some(1), "gamma", "/usr/bin/gamma"),
+            ],
+        );
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let area = app.tree_area;
+        // Click the third visible row (index 2 = alpha): border row + offset.
+        app.on_mouse(click(area.x + 3, area.y + 1 + 2));
+        assert_eq!(app.selected, 2);
+        assert_eq!(app.selected_pid(), Some(Pid::from_u32(2)));
+        assert!(app.inspection.is_none());
+
+        // Clicking the already-selected row acts like Enter.
+        app.on_mouse(click(area.x + 3, area.y + 1 + 2));
+        assert!(app.inspection.is_some());
+        app.inspection = None;
+        app.inspection_tab_regions.clear();
+
+        // Clicks on the border or below the last row are ignored.
+        app.on_mouse(click(area.x + 3, area.y));
+        assert_eq!(app.selected, 2);
+        app.on_mouse(click(area.x + 3, area.y + 1 + 5));
+        assert_eq!(app.selected, 2);
+    }
+
+    #[test]
+    fn mouse_wheel_moves_the_tree_selection() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        seed_processes(
+            &mut app,
+            vec![
+                ui_process(0, None, "kernel / system", ""),
+                ui_process(1, Some(0), "launchd", "/sbin/launchd"),
+                ui_process(2, Some(1), "alpha", "/usr/bin/alpha"),
+            ],
+        );
+        assert_eq!(app.selected, 0);
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.selected, 1);
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn mouse_click_on_inspection_tab_bar_switches_tabs() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        seed_processes(
+            &mut app,
+            vec![
+                ui_process(0, None, "kernel / system", ""),
+                ui_process(1, Some(0), "launchd", "/sbin/launchd"),
+                ui_process(2, Some(1), "worker", "/usr/bin/worker"),
+            ],
+        );
+        app.selected = 2;
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.inspection.is_some());
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        assert_eq!(app.inspection_tab, InspectionTab::Overview);
+        let (region, tab) = app
+            .inspection_tab_regions
+            .iter()
+            .find(|(_, tab)| *tab == InspectionTab::Ports)
+            .copied()
+            .expect("ports tab region should be recorded");
+        app.on_mouse(click(region.x + 1, region.y));
+        assert_eq!(app.inspection_tab, InspectionTab::Ports);
+        // Clicking the active tab again is a no-op but harmless.
+        app.on_mouse(click(region.x + 1, region.y));
+        assert_eq!(app.inspection_tab, InspectionTab::Ports);
+        let _ = tab;
+    }
+
+    #[test]
+    fn mouse_clicks_are_ignored_under_overlays() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        seed_processes(
+            &mut app,
+            vec![
+                ui_process(0, None, "kernel / system", ""),
+                ui_process(1, Some(0), "launchd", "/sbin/launchd"),
+                ui_process(2, Some(1), "alpha", "/usr/bin/alpha"),
+            ],
+        );
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let area = app.tree_area;
+
+        app.show_events = true;
+        app.on_mouse(click(area.x + 3, area.y + 1 + 2));
+        assert_eq!(app.selected, 0);
+        app.show_events = false;
+
+        // The wheel still works under overlays, scrolling like j/k.
+        app.show_network = true;
+        app.network_scan = Some(network_fixture());
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.network_selected, 1);
+        app.show_network = false;
+    }
+
+    #[test]
+    fn q_closes_overlays_and_only_quits_on_the_bare_tree() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        assert!(app.show_events);
+        assert!(!app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)));
+        assert!(!app.show_events);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(app.show_attention);
+        assert!(!app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)));
+        assert!(!app.show_attention);
+
+        assert!(app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn d_without_baseline_shows_a_notice() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        assert!(app.baseline.is_none());
+
+        app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert!(!app.show_snapshot_diff);
+        let notice = app.notice.as_ref().expect("d should explain itself");
+        assert!(notice.message.contains("baseline"));
+
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+        assert!(app.baseline.is_some());
+        app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert!(app.show_snapshot_diff);
+    }
+
+    #[test]
+    fn l_toggles_language_inside_overlays_but_f2_does_not() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        assert_eq!(app.language(), UiLanguage::English);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        assert!(app.show_events);
+        app.on_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE));
+        assert_eq!(app.language(), UiLanguage::Chinese);
+        assert!(app.show_events);
+
+        app.on_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        assert_eq!(app.language(), UiLanguage::Chinese);
+        assert!(app.show_events);
+    }
+
+    #[test]
+    fn l_toggles_language_with_shift_modifier_but_not_ctrl() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        assert_eq!(app.language(), UiLanguage::English);
+
+        // Real terminals report uppercase letters with the SHIFT modifier.
+        app.on_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT));
+        assert_eq!(app.language(), UiLanguage::Chinese);
+        app.on_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::CONTROL));
+        assert_eq!(app.language(), UiLanguage::Chinese);
+    }
+
+    #[test]
+    fn trend_overlay_renders_bilingual_labels() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        seed_processes(
+            &mut app,
+            vec![
+                ui_process(0, None, "kernel / system", ""),
+                ui_process(1, Some(0), "launchd", "/sbin/launchd"),
+                ui_process(42, Some(1), "worker", "/usr/bin/worker"),
+            ],
+        );
+        for _ in 0..3 {
+            app.history
+                .record(&app.processes, &app.resources, Instant::now());
+        }
+        app.trend_pid = Some(Pid::from_u32(42));
+        app.trend_view = TrendView::Io;
+
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let english = buffer_text(&terminal);
+        assert!(english.contains("trends worker [42]"));
+        assert!(english.contains("READ self"));
+        assert!(english.contains("WRITE tree"));
+        assert!(english.contains("samples /"));
+        assert!(!english.contains("读 自身"));
+
+        app.guidance.set_language_for_test(UiLanguage::Chinese);
+        // A fresh backend: TestBackend keeps stale symbols in the
+        // continuation cells of wide CJK glyphs after a redraw.
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let chinese = buffer_text(&terminal);
+        // TestBackend pads the continuation cell of every wide CJK glyph
+        // with a blank, so compare Chinese substrings without whitespace.
+        let compact: String = chinese.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains("趋势worker[42]"));
+        assert!(compact.contains("读自身"));
+        assert!(compact.contains("写子树"));
+        assert!(compact.contains("个样本"));
+        assert!(compact.contains("当前"));
+        assert!(!chinese.contains("READ self"));
+        assert!(!chinese.contains("avg"));
+    }
+
+    #[test]
+    fn snapshot_diff_overlay_renders_bilingual_labels() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        seed_processes(
+            &mut app,
+            vec![
+                ui_process(0, None, "kernel / system", ""),
+                ui_process(1, Some(0), "launchd", "/sbin/launchd"),
+                ui_process(42, Some(1), "worker", "/usr/bin/worker"),
+            ],
+        );
+        app.baseline = Some(BaselineSnapshot::capture(
+            &app.processes,
+            &app.resources,
+            Instant::now(),
+        ));
+        // One exit, one start, and memory growth on a survivor.
+        let mut grown = ui_process(1, Some(0), "launchd", "/sbin/launchd");
+        grown.memory = 64 * 1024 * 1024;
+        seed_processes(
+            &mut app,
+            vec![
+                ui_process(0, None, "kernel / system", ""),
+                grown,
+                ui_process(77, Some(1), "new-worker", "/usr/bin/new-worker"),
+            ],
+        );
+        app.show_snapshot_diff = true;
+
+        let backend = TestBackend::new(140, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let english = buffer_text(&terminal);
+        assert!(english.contains("baseline diff"));
+        assert!(english.contains("PROCESS CHANGES"));
+        assert!(english.contains("started"));
+        assert!(english.contains("parent"));
+        assert!(english.contains("TOP TREE MEMORY GROWTH"));
+        assert!(!english.contains("进程变化"));
+
+        app.guidance.set_language_for_test(UiLanguage::Chinese);
+        // A fresh backend: TestBackend keeps stale symbols in the
+        // continuation cells of wide CJK glyphs after a redraw.
+        let backend = TestBackend::new(140, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let chinese = buffer_text(&terminal);
+        // TestBackend pads the continuation cell of every wide CJK glyph
+        // with a blank, so compare Chinese substrings without whitespace.
+        let compact: String = chinese.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains("基线对比"));
+        assert!(compact.contains("进程变化"));
+        assert!(compact.contains("新增"));
+        assert!(compact.contains("退出"));
+        assert!(compact.contains("子树内存增长"));
+        assert!(!chinese.contains("PROCESS CHANGES"));
+        assert!(!chinese.contains("TOP TREE MEMORY GROWTH"));
+    }
+
+    #[test]
+    fn footer_merges_stats_and_hints_on_one_line() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+
+        // Wide terminal: full stats and hints share the single footer row.
+        let wide = TestBackend::new(160, 30);
+        let mut wide_terminal = Terminal::new(wide).unwrap();
+        wide_terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let wide_row = buffer_row(&wide_terminal, 29);
+        assert!(wide_row.contains("proc"), "stats lost: {wide_row:?}");
+        assert!(wide_row.contains("page"), "page stats lost: {wide_row:?}");
+        assert!(
+            wide_row.contains("Enter details"),
+            "hints lost: {wide_row:?}"
+        );
+
+        // Medium terminal: stats degrade to the compact form, hints stay.
+        let medium = TestBackend::new(120, 30);
+        let mut medium_terminal = Terminal::new(medium).unwrap();
+        medium_terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let medium_row = buffer_row(&medium_terminal, 29);
+        assert!(medium_row.contains("proc"), "stats lost: {medium_row:?}");
+        assert!(
+            medium_row.contains("Enter details"),
+            "hints lost: {medium_row:?}"
+        );
+
+        // Narrow terminal: the hints own the whole line and are clipped in
+        // place rather than pushed below the viewport.
+        for (width, height) in [(40u16, 12u16), (28, 10)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let hint_row = buffer_row(&terminal, height - 1);
+            assert!(
+                hint_row.contains("Enter details"),
+                "hint line lost at {width} columns: {hint_row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_bytes_stay_within_five_cells() {
+        const KIB: u64 = 1024;
+        const MIB: u64 = KIB * 1024;
+        const GIB: u64 = MIB * 1024;
+        const TIB: u64 = GIB * 1024;
+        const PIB: u64 = TIB * 1024;
+        const EIB: u64 = PIB * 1024;
+        let cases = [
+            0,
+            1,
+            1023,
+            KIB,
+            MIB,
+            512 * MIB,
+            GIB,
+            10 * GIB,
+            99 * GIB,
+            100 * GIB - 1,
+            100 * GIB,
+            TIB,
+            100 * TIB - 1,
+            100 * TIB,
+            PIB,
+            EIB,
+            u64::MAX,
+        ];
+        for bytes in cases {
+            let compact = format_compact_bytes(bytes);
+            assert!(
+                compact.chars().count() <= 5,
+                "{bytes} rendered as {compact:?} ({} cells)",
+                compact.chars().count()
+            );
+        }
+        assert_eq!(format_compact_bytes(512 * MIB), "512M");
+        assert_eq!(format_compact_bytes(13_000_000_000), "12.1G");
+        assert_eq!(format_compact_bytes(100 * GIB - 1), "0.1T");
+        assert_eq!(format_compact_bytes(u64::MAX), "16E");
     }
 }

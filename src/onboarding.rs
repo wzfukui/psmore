@@ -3,17 +3,30 @@ use std::{env, fs, io, path::PathBuf};
 #[cfg(unix)]
 use std::os::unix::fs::DirBuilderExt;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
     filters::ProcessFilterRule,
     i18n::{UiLanguage, detect_system_language},
     secure_output::write_secure_atomic,
+    theme::{GlyphMode, ThemeId},
 };
 
 const STATE_SCHEMA_VERSION: u32 = 1;
 const STATE_FILE_NAME: &str = "ui-state.json";
 pub(crate) const GUIDANCE_PAGE_COUNT: usize = 3;
+
+/// Lenient `Option<enum>` field: a value written by a newer psmore (or hand
+/// edited) that this build does not recognize deserializes to `None` instead
+/// of failing the whole `StoredState` and resetting unrelated settings.
+fn lenient_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: for<'a> Deserialize<'a>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GuidanceOverlay {
@@ -88,7 +101,7 @@ pub(crate) const TIPS: &[Tip] = &[
     Tip {
         title: "Build one process dossier",
         body: "Collect process, service-manager, executable-image, and bounded log evidence in parallel, then review prioritized signals without losing their source paths.",
-        keys: "D dossier  |  r refresh  |  L logs on/off  |  h hash",
+        keys: "D dossier  |  r refresh  |  g logs on/off  |  h hash",
     },
     Tip {
         title: "Export the context you already collected",
@@ -97,8 +110,8 @@ pub(crate) const TIPS: &[Tip] = &[
     },
     Tip {
         title: "Process actions are identity-safe",
-        body: "Use k for the focused TERM/KILL dialog or p for all actions. Every signal requires a separate confirmation and a PID start-time re-check.",
-        keys: "k end  |  p actions  |  y confirm  |  Esc cancel",
+        body: "Press p for the TERM/KILL/STOP/CONT action dialog. Every signal requires a separate confirmation and a PID start-time re-check.",
+        keys: "p actions  |  y confirm  |  Esc cancel",
     },
 ];
 
@@ -161,7 +174,7 @@ const TIPS_ZH: &[Tip] = &[
     Tip {
         title: "建立单进程事故档案",
         body: "并行采集进程、服务管理器、运行映像和有界日志证据，再按优先级复核。",
-        keys: "D 档案  |  r 刷新  |  L 日志开关  |  h 哈希",
+        keys: "D 档案  |  r 刷新  |  g 日志开关  |  h 哈希",
     },
     Tip {
         title: "导出已经取得的上下文",
@@ -170,8 +183,8 @@ const TIPS_ZH: &[Tip] = &[
     },
     Tip {
         title: "进程操作校验实例身份",
-        body: "k 打开 TERM/KILL 专用弹窗，p 打开全部操作。每次发送都需要独立确认并重新核对 PID 启动时间。",
-        keys: "k 结束  |  p 操作  |  y 确认  |  Esc 取消",
+        body: "按 p 打开 TERM/KILL/STOP/CONT 操作弹窗。每次发送都需要独立确认并重新核对 PID 启动时间。",
+        keys: "p 操作  |  y 确认  |  Esc 取消",
     },
 ];
 
@@ -183,8 +196,14 @@ struct StoredState {
     next_tip_index: usize,
     #[serde(default)]
     language: Option<UiLanguage>,
+    #[serde(default, deserialize_with = "lenient_option")]
+    theme: Option<ThemeId>,
+    #[serde(default, deserialize_with = "lenient_option")]
+    glyphs: Option<GlyphMode>,
     #[serde(default)]
     filters: Vec<ProcessFilterRule>,
+    #[serde(default)]
+    query_history: Vec<String>,
 }
 
 impl Default for StoredState {
@@ -195,7 +214,10 @@ impl Default for StoredState {
             tips_enabled: true,
             next_tip_index: 0,
             language: None,
+            theme: None,
+            glyphs: None,
             filters: Vec::new(),
+            query_history: Vec::new(),
         }
     }
 }
@@ -249,7 +271,7 @@ impl Guidance {
         }
     }
 
-    fn load_from_path(path: PathBuf, suppress_for_this_run: bool) -> Self {
+    pub(crate) fn load_from_path(path: PathBuf, suppress_for_this_run: bool) -> Self {
         let (state, warning) = match fs::read_to_string(&path) {
             Ok(contents) => match serde_json::from_str::<StoredState>(&contents) {
                 Ok(state) if state.schema_version == STATE_SCHEMA_VERSION => (state, None),
@@ -334,6 +356,11 @@ impl Guidance {
         self.language
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_language_for_test(&mut self, language: UiLanguage) {
+        self.language = language;
+    }
+
     pub(crate) fn toggle_language(&mut self) -> io::Result<UiLanguage> {
         self.language = self.language.next();
         self.state.language = Some(self.language);
@@ -345,8 +372,39 @@ impl Guidance {
         &self.state.filters
     }
 
+    /// Theme persisted by an explicit in-TUI choice; `None` means the CLI
+    /// flag, environment, or the default decides.
+    pub(crate) fn theme(&self) -> Option<ThemeId> {
+        self.state.theme
+    }
+
+    pub(crate) fn set_theme(&mut self, theme: ThemeId) -> io::Result<()> {
+        self.state.theme = Some(theme);
+        self.persist()
+    }
+
+    /// Glyph repertoire persisted by an explicit in-TUI choice.
+    pub(crate) fn glyphs(&self) -> Option<GlyphMode> {
+        self.state.glyphs
+    }
+
+    pub(crate) fn set_glyphs(&mut self, glyphs: GlyphMode) -> io::Result<()> {
+        self.state.glyphs = Some(glyphs);
+        self.persist()
+    }
+
     pub(crate) fn save_filters(&mut self, filters: &[ProcessFilterRule]) -> io::Result<()> {
         self.state.filters = filters.to_vec();
+        self.persist()
+    }
+
+    /// Applied `/` queries, most recent first, capped by the caller.
+    pub(crate) fn query_history(&self) -> &[String] {
+        &self.state.query_history
+    }
+
+    pub(crate) fn save_query_history(&mut self, history: &[String]) -> io::Result<()> {
+        self.state.query_history = history.to_vec();
         self.persist()
     }
 
@@ -507,6 +565,60 @@ mod tests {
     }
 
     #[test]
+    fn theme_and_glyph_choices_are_persisted() {
+        let directory = test_directory("theme-glyphs");
+        let path = directory.join(STATE_FILE_NAME);
+        let mut guidance = Guidance::load_from_path(path.clone(), true);
+        assert_eq!(guidance.theme(), None);
+        assert_eq!(guidance.glyphs(), None);
+        guidance.set_theme(ThemeId::HighContrast).unwrap();
+        guidance.set_glyphs(GlyphMode::Ascii).unwrap();
+
+        let reloaded = Guidance::load_from_path(path.clone(), true);
+        assert_eq!(reloaded.theme(), Some(ThemeId::HighContrast));
+        assert_eq!(reloaded.glyphs(), Some(GlyphMode::Ascii));
+
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn unknown_theme_and_glyph_values_fall_back_without_crashing() {
+        use crate::filters::FilterAction;
+
+        let directory = test_directory("unknown-theme");
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join(STATE_FILE_NAME);
+        // A state file written by a newer build: the theme and glyphs values
+        // are unknown here, but language, filters, and query history are
+        // valid and must survive the load.
+        fs::write(
+            &path,
+            br#"{"schema_version":1,"first_run_completed":true,"tips_enabled":false,"next_tip_index":0,"language":"chinese","theme":"neon","glyphs":"emoji","filters":[{"action":"exclude","expression":"name:node","enabled":true}],"query_history":["cpu>20"]}"#,
+        )
+        .unwrap();
+
+        let mut guidance = Guidance::load_from_path(path.clone(), true);
+        // The file parses, so there is no fallback-to-defaults warning.
+        assert!(guidance.take_warning().is_none());
+        assert_eq!(guidance.theme(), None);
+        assert_eq!(guidance.glyphs(), None);
+        assert_eq!(guidance.language(), UiLanguage::Chinese);
+        assert_eq!(
+            guidance.filters(),
+            &[ProcessFilterRule {
+                action: FilterAction::Exclude,
+                expression: "name:node".into(),
+                enabled: true,
+            }]
+        );
+        assert_eq!(guidance.query_history(), &["cpu>20".to_string()]);
+
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
     fn process_filters_are_persisted_with_private_ui_preferences() {
         use crate::filters::FilterAction;
 
@@ -522,6 +634,22 @@ mod tests {
 
         let reloaded = Guidance::load_from_path(path.clone(), true);
         assert_eq!(reloaded.filters(), filters);
+
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn query_history_round_trips_through_ui_state() {
+        let directory = test_directory("query-history");
+        let path = directory.join(STATE_FILE_NAME);
+        let history = vec!["name:node".to_string(), "cpu>20".to_string()];
+        let mut guidance = Guidance::load_from_path(path.clone(), true);
+        assert!(guidance.query_history().is_empty());
+        guidance.save_query_history(&history).unwrap();
+
+        let reloaded = Guidance::load_from_path(path.clone(), true);
+        assert_eq!(reloaded.query_history(), history);
 
         fs::remove_file(path).unwrap();
         fs::remove_dir(directory).unwrap();

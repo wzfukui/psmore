@@ -71,7 +71,7 @@ def main() -> int:
         fail(f"timed out waiting for {needle!r}; terminal tail:\n{tail}")
 
     try:
-        read_until(b"digits PID", 10.0)
+        read_until(b"p actions", 10.0)
         os.write(master, b"F")
         read_until(b"process filters", 5.0)
         os.write(master, b"x")
@@ -133,13 +133,31 @@ def main() -> int:
 
         os.write(master, b"m")
         time.sleep(0.2)
-        os.write(master, b"k")
+        os.write(master, b"p")
         read_until(f"[{pid}]".encode(), 5.0)
         read_until(b"No signal is sent here", 5.0)
         os.write(master, b"\r")
         read_until(b"Press y to send the signal", 5.0)
+        # Layered q: leave the confirmation, close the dialog, quit the tree.
+        # Keep draining the PTY while waiting: three q presses mean three
+        # more full-screen redraws, and a blocked write would otherwise stop
+        # psmore from ever reading the queued keys.
         os.write(master, b"q")
-        process.wait(timeout=5.0)
+        os.write(master, b"q")
+        os.write(master, b"q")
+        deadline = time.monotonic() + 5.0
+        while process.poll() is None and time.monotonic() < deadline:
+            readable, _, _ = select.select([master], [], [], 0.25)
+            if readable:
+                try:
+                    chunk = os.read(master, 65536)
+                except OSError:
+                    chunk = b""
+                if chunk:
+                    output.extend(chunk)
+        if process.poll() is None:
+            tail = bytes(output[-6000:]).decode("utf-8", errors="replace")
+            fail(f"psmore did not quit after layered q; terminal tail:\n{tail}")
         if process.returncode != 0:
             fail(f"psmore exited with status {process.returncode}")
     except Exception as error:
@@ -158,7 +176,7 @@ def main() -> int:
 
     print(
         "Verified TUI persistent filter -> safe bare-tree Escape -> PID locate -> delayed search apply -> tabbed inspection cards -> dossier -> memory -> dossier -> image -> "
-        f"manager -> logs -> manager -> two-step end dialog for PID {pid}"
+        f"manager -> logs -> manager -> two-step action dialog and layered q for PID {pid}"
     )
     return 0
 

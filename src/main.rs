@@ -38,6 +38,7 @@ mod query;
 mod report;
 mod secure_output;
 mod snapshot;
+mod theme;
 mod ui;
 
 use std::{
@@ -52,7 +53,7 @@ use std::{
 };
 
 use crossterm::{
-    event::{self, Event},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -111,20 +112,41 @@ fn handle_pending_input(app: &mut App) -> io::Result<bool> {
     }
     match event::read()? {
         Event::Key(key) => Ok(app.on_key(key)),
+        Event::Mouse(mouse) => {
+            app.on_mouse(mouse);
+            Ok(false)
+        }
         _ => Ok(false),
     }
 }
 
-fn run_tui(initial_query: String, suppress_guidance: bool) -> Result<(), Box<dyn Error>> {
+fn run_tui(cli: &Cli) -> Result<(), Box<dyn Error>> {
     enable_raw_mode()?;
+    // From here on, every init failure must unwind the terminal modes that
+    // already succeeded, or the caller's terminal is left corrupted.
     let mut stdout = io::stdout();
-    if let Err(error) = execute!(stdout, EnterAlternateScreen) {
+    if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
+        // EnterAlternateScreen may have succeeded before EnableMouseCapture
+        // failed, so undo both unconditionally.
+        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
         let _ = disable_raw_mode();
         return Err(error.into());
     }
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-    let mut app = App::new_for_tui(initial_query, suppress_guidance);
+    let mut terminal = match Terminal::new(backend) {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+            let _ = disable_raw_mode();
+            return Err(error.into());
+        }
+    };
+    let mut app = App::new_for_tui(
+        cli.query.clone(),
+        cli.tui_no_tips,
+        cli.tui_theme,
+        cli.tui_glyphs,
+    );
     let result: io::Result<()> = (|| {
         loop {
             app.poll_background_jobs();
@@ -140,7 +162,11 @@ fn run_tui(initial_query: String, suppress_guidance: bool) -> Result<(), Box<dyn
     // Attempt every cleanup step even when an earlier one fails, so a runtime
     // error is less likely to leave the caller's terminal in an unusable state.
     let raw_mode_result = disable_raw_mode();
-    let alternate_screen_result = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let alternate_screen_result = execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    );
     let cursor_result = terminal.show_cursor();
     result?;
     raw_mode_result?;
@@ -288,7 +314,7 @@ fn main() -> ExitCode {
             if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
                 return usage_error("interactive mode requires a terminal; use --table or --json");
             }
-            runtime_result(run_tui(cli.query, cli.tui_no_tips))
+            runtime_result(run_tui(&cli))
         }
         LaunchMode::Table | LaunchMode::Json => {
             if let Err(error) = validate_query(&cli.query) {

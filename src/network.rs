@@ -48,6 +48,20 @@ impl NetworkEndpoint {
             .to_lowercase()
             .contains(&query)
     }
+
+    /// True when either endpoint of this entry uses the given port.
+    pub(crate) fn has_port(&self, port: u16) -> bool {
+        endpoint_port(&self.local_endpoint) == Some(port)
+            || endpoint_port(&self.remote_endpoint) == Some(port)
+    }
+}
+
+/// The port of an `host:port` endpoint string; the host part may be an IPv6
+/// literal, a wildcard, or empty, so only the final `:` segment matters.
+pub(crate) fn endpoint_port(endpoint: &str) -> Option<u16> {
+    endpoint
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse().ok())
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

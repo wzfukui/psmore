@@ -22,16 +22,17 @@
 - Multi-pane diagnostics:
   - interactive thread, port, file, log, service, executable image, memory attribution, and incident dossier workflows
   - script-friendly output for non-interactive environments (`--table`, `--json`, `--jsonl`)
-- Built-in safety controls (`k` terminate, `p` process action center, two-step confirmation, identity re-check)
+- Built-in safety controls (`p` process action center, two-step confirmation, identity re-check)
 - Baseline capture and diff (`b`) for before/after diagnosis workflows
 - Security-aware export with redaction (`--redact`) for external sharing
+- Color themes (`--theme dark|light|high-contrast`, `PSMORE_THEME`, palette "Cycle theme") and an ASCII glyph fallback (`--glyphs ascii`, `PSMORE_GLYPHS`, auto-detected on `dumb`/`linux` or non-UTF-8 terminals)
 
 ## Language (localization) policy
 
 This repository is now defaulted to English.
 
 - Default runtime language in TUI is chosen from OS locale.
-- Manual switch is available (`L` in main screen, `F2` in any workspace) and persisted.
+- Manual switch is available (`L` anywhere in the TUI outside text input) and persisted.
 - `PSMORE_LANG` can be used to force first-run language if needed.
 - Command output from non-interactive mode remains English-first, stable for scripts and automation.
 
@@ -54,9 +55,9 @@ psmore --version
 
 ```bash
 # Linux
-sha256sum -c psmore-v0.1.2-x86_64-unknown-linux-gnu.tar.gz.sha256
-tar -xzf psmore-v0.1.2-x86_64-unknown-linux-gnu.tar.gz
-cd psmore-v0.1.2-x86_64-unknown-linux-gnu
+sha256sum -c psmore-v0.2.0-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf psmore-v0.2.0-x86_64-unknown-linux-gnu.tar.gz
+cd psmore-v0.2.0-x86_64-unknown-linux-gnu
 ./install.sh --dry-run
 ./install.sh
 ```
@@ -78,11 +79,19 @@ Interactive mode opens quickly:
 
 - `↑/↓` / `j/k`: move selection
 - `←/→`: expose parent / expand children
-- `/`: query mode
+- `/`: query mode (`↑/↓` recall applied queries, `Tab` completes field starters like `name:` or `cpu>`)
+- `*`: star/unstar the selected process; `'`: jump to the next starred process
+- `:`: command palette (fuzzy-find and run any feature)
 - `F` filter manager
 - `Enter`: deep inspection
+- `p`: process actions (TERM/KILL/STOP/CONT)
+- `n`: network workspace (`/` text filter, `p` exact-port lookup)
 - `s`: hotspot sort
-- `q`: quit
+- `q`: close the current pane, quit on the bare tree
+- Mouse: click a row to select it (click again for details), wheel scrolls, inspection tab labels are clickable
+
+A top status bar shows host load, CPU, memory, and alert counts; the tree adds
+per-process `CPU%`/`MEM` columns on wide terminals.
 
 If you already know a PID:
 
@@ -102,7 +111,7 @@ psmore --json --query 'state:zombie'
 - `psmore check QUERY` — CI-safe health gate (`--expect`, `--wait`, `--stable`)
 - `psmore inspect PID` — full process deep inspection
 - `psmore memory PID` — per-instance memory attribution
-- `psmore explain PID` — evidence dossier (inspection, service, image, logs)
+- `psmore explain PID` — evidence dossier (inspection, service, image, logs); the TUI `D` key opens the same dossier
 - `psmore exe PID` — executable-image verification
 - `psmore stale [QUERY]` — find processes holding replaced/deleted images (Linux)
 - `psmore service PID` — resolve to launchd/systemd context

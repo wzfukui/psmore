@@ -1,4 +1,5 @@
 use crate::model::{HotspotMetric, HotspotScope};
+use crate::theme::{GlyphMode, ThemeId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LaunchMode {
@@ -327,6 +328,8 @@ pub(crate) struct Cli {
     pub(crate) completion_shell: Option<CompletionShell>,
     pub(crate) query: String,
     pub(crate) tui_no_tips: bool,
+    pub(crate) tui_theme: Option<ThemeId>,
+    pub(crate) tui_glyphs: Option<GlyphMode>,
     pub(crate) sample_ms: u64,
     pub(crate) diff_paths: Option<(String, String)>,
     pub(crate) diff_fail_on: DiffFailOn,
@@ -413,6 +416,8 @@ impl Default for Cli {
             completion_shell: None,
             query: String::new(),
             tui_no_tips: false,
+            tui_theme: None,
+            tui_glyphs: None,
             sample_ms: 500,
             diff_paths: None,
             diff_fail_on: DiffFailOn::Never,
@@ -551,6 +556,18 @@ impl Cli {
                     }
                     cli.tui_no_tips = true;
                 }
+                "--theme" => {
+                    let value = args.next().ok_or_else(|| {
+                        "--theme requires dark, light, or high-contrast".to_string()
+                    })?;
+                    set_tui_theme(&mut cli, &value)?;
+                }
+                "--glyphs" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| "--glyphs requires unicode or ascii".to_string())?;
+                    set_tui_glyphs(&mut cli, &value)?;
+                }
                 "-q" | "--query" => {
                     let value = args
                         .next()
@@ -566,6 +583,12 @@ impl Cli {
                 _ if argument.starts_with("--query=") => {
                     let value = argument.trim_start_matches("--query=").to_string();
                     set_query(&mut cli, &mut query_set, value)?;
+                }
+                _ if argument.starts_with("--theme=") => {
+                    set_tui_theme(&mut cli, argument.trim_start_matches("--theme="))?;
+                }
+                _ if argument.starts_with("--glyphs=") => {
+                    set_tui_glyphs(&mut cli, argument.trim_start_matches("--glyphs="))?;
                 }
                 _ if argument.starts_with("--sample-ms=") => {
                     let value = argument.trim_start_matches("--sample-ms=");
@@ -593,15 +616,54 @@ impl Cli {
         {
             return Err("--no-tips only applies to the interactive TUI".into());
         }
+        if cli.tui_theme.is_some()
+            && !matches!(
+                cli.mode,
+                LaunchMode::Tui | LaunchMode::Help | LaunchMode::Version
+            )
+        {
+            return Err("--theme only applies to the interactive TUI".into());
+        }
+        if cli.tui_glyphs.is_some()
+            && !matches!(
+                cli.mode,
+                LaunchMode::Tui | LaunchMode::Help | LaunchMode::Version
+            )
+        {
+            return Err("--glyphs only applies to the interactive TUI".into());
+        }
         apply_secret_redaction(cli, redact_secrets)
     }
 }
 
+fn set_tui_theme(cli: &mut Cli, value: &str) -> Result<(), String> {
+    if cli.tui_theme.is_some() {
+        return Err("--theme may only be specified once".into());
+    }
+    cli.tui_theme = Some(ThemeId::parse(value).ok_or_else(|| {
+        format!("invalid --theme value: {value}; use dark, light, or high-contrast")
+    })?);
+    Ok(())
+}
+
+fn set_tui_glyphs(cli: &mut Cli, value: &str) -> Result<(), String> {
+    if cli.tui_glyphs.is_some() {
+        return Err("--glyphs may only be specified once".into());
+    }
+    cli.tui_glyphs = Some(
+        GlyphMode::parse(value)
+            .ok_or_else(|| format!("invalid --glyphs value: {value}; use unicode or ascii"))?,
+    );
+    Ok(())
+}
+
 fn extract_secret_redaction(arguments: &mut Vec<String>) -> Result<bool, String> {
-    const VALUE_OPTIONS: [&str; 23] = [
+    const VALUE_OPTIONS: [&str; 25] = [
         "-q",
         "--query",
         "--sample-ms",
+        "--theme",
+        "--glyphs",
         "--expect",
         "--protocol",
         "--limit",
@@ -3918,6 +3980,10 @@ COMMANDS:
 GLOBAL OPTIONS:
   -q, --query QUERY   Start the TUI filtered, or filter snapshot rows
       --no-tips       Skip first-run help or the startup tip for this TUI run
+      --theme NAME    TUI color theme: dark, light, or high-contrast
+                      (overrides PSMORE_THEME and the persisted preference)
+      --glyphs NAME   TUI glyph set: unicode or ascii
+                      (overrides PSMORE_GLYPHS and terminal auto-detection)
       --table         Print a human-readable process snapshot and exit
       --json          Print a versioned JSON process snapshot and exit
       --sample-ms MS  CPU and I/O sampling interval, 100-60000 [default: 500]
@@ -4028,7 +4094,8 @@ Inspection, service-manager context, and executable provenance are collected in
 parallel with bounded native logs. Every section keeps its original versioned
 report, coverage, and identity evidence; ranked signals link back to JSON
 evidence paths and are review priorities, not asserted root causes. Use
---no-logs when log collection is too sensitive or unnecessary.
+--no-logs when log collection is too sensitive or unnecessary. The interactive
+TUI shows the same dossier under the D key.
 EXAMPLES:
   psmore explain 1234
   psmore explain 1234 --since 30m --priority warning
@@ -4546,6 +4613,8 @@ mod tests {
                 completion_shell: None,
                 query: "user:deploy".into(),
                 tui_no_tips: false,
+                tui_theme: None,
+                tui_glyphs: None,
                 sample_ms: 1_200,
                 diff_paths: None,
                 diff_fail_on: DiffFailOn::Never,
@@ -5086,6 +5155,29 @@ mod tests {
         );
         assert!(Cli::parse(["--no-tips"]).unwrap().tui_no_tips);
         assert!(Cli::parse(["--no-onboarding"]).unwrap().tui_no_tips);
+        assert_eq!(
+            Cli::parse(["--theme", "light"]).unwrap().tui_theme,
+            Some(ThemeId::Light)
+        );
+        assert_eq!(
+            Cli::parse(["--theme=high-contrast"]).unwrap().tui_theme,
+            Some(ThemeId::HighContrast)
+        );
+        assert_eq!(
+            Cli::parse(["--glyphs", "ascii"]).unwrap().tui_glyphs,
+            Some(GlyphMode::Ascii)
+        );
+        assert_eq!(
+            Cli::parse(["--glyphs=unicode"]).unwrap().tui_glyphs,
+            Some(GlyphMode::Unicode)
+        );
+        assert!(Cli::parse(["--theme", "neon"]).is_err());
+        assert!(Cli::parse(["--glyphs", "emoji"]).is_err());
+        assert!(Cli::parse(["--theme"]).is_err());
+        assert!(Cli::parse(["--theme", "dark", "--theme", "light"]).is_err());
+        assert!(Cli::parse(["--glyphs", "ascii", "--glyphs", "unicode"]).is_err());
+        assert!(Cli::parse(["--theme", "light", "--table"]).is_err());
+        assert!(Cli::parse(["--glyphs", "ascii", "--json"]).is_err());
         assert_eq!(
             Cli::parse([
                 "top",

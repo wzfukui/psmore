@@ -1,0 +1,28 @@
+ testhost  CPU 42%  MEM 12.1G/16.0G  load 0.82→  SWAP 25%                                          ▲ 2 alerts 
+┌ psmore  macOS process relationships ──────────────────────────────────────────────────────────── CPU%  MEM ┐
+│▾ kernel / system  [0]    0.0    0B system root                                                             │
+│└─▾ launchd  [1]          0.0    0B /sbin/launchd                                                           │
+│  ├─▾ worker  [2]        91.5  512M /usr/bin/worker                                                         │
+│  │ └─· child  [4]        0.0    0B /usr/bin/child                                                          │
+│  └─· helper  [3]        62.0   64M /usr/bin/helper                                                         │
+│                                                                                                            │
+│                                                                                                            │
+│                                                                                                            │
+│                                                                                                            │
+│                                                                                                            │
+│                                                                                                            │
+│                                                                                                            │
+│                                                                                                            │
+│                                                                                                            │
+│                                                                                                            │
+│                                                                                                            │
+│                                                                                                            │
+│                                                                                                            │
+│                                                                                                            │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ selected process ──────────────────────────────────────────────────────────────────────────────────────────┐
+│PID 0  PPID -  children 1  status Sleep  CPU 0.0%  MEM 0 MB  R 0 B/s  W 0 B/s  runtime 1s                   │
+│TREE 4 proc (self + descendants)  CPU 153.5%  MEM 576 MB  R 0 B/s  W 0 B/s                                  │
+│system root                                                                                                 │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ 4 proc · LIVE · +0 -0 ↪0 | Enter details · / search · : commands · a alerts · p actions · ? help · q quit    

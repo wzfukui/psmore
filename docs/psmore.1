@@ -58,7 +58,8 @@ or
 .B --no-hash
 for a faster metadata-only dossier, and
 .B --output
-to create a private JSON incident artifact.
+to create a private JSON incident artifact. The interactive TUI presents the
+same dossier under the D key.
 .TP
 .B exe PID
 Compare the executable image held by a process with the current disk path.
@@ -284,6 +285,28 @@ exit status.
 .B --no-tips
 Suppress startup guidance for this TUI run without changing saved preferences.
 .TP
+.BI --theme " dark|light|high-contrast"
+Select the TUI color theme for this run. Overrides
+.B PSMORE_THEME
+and the persisted
+.B theme
+preference;
+.B dark
+is the default and matches the historical palette.
+.TP
+.BI --glyphs " unicode|ascii"
+Select the TUI glyph repertoire for this run. Overrides
+.BR PSMORE_GLYPHS ,
+the persisted
+.B glyphs
+preference, and terminal auto-detection (ASCII when
+.B TERM
+is
+.B dumb
+or
+.BR linux ,
+or when no locale variable mentions UTF-8).
+.TP
 .BR -h , " --help"
 Show global or command-specific help.
 .TP
@@ -295,7 +318,7 @@ with
 .BR ? .
 .SH TUI KEYS
 .TP
-.BR Up / Down
+.BR Up / Down " or " k / j
 Move the selection. The viewport follows the selected row.
 .TP
 .BR Left / Right
@@ -307,9 +330,31 @@ tree with its ancestor path exposed; Backspace edits and Escape cancels.
 .TP
 .B /
 Enter search input without changing the current tree. While editing, all
-printable characters including j and k belong to the query. Enter applies the
-query and returns to selection mode; k can then act on the selected result.
-Escape cancels input, or clears an already active search.
+printable characters including j and k belong to the query. Up and Down walk
+the history of applied queries (most recent first, the in-progress draft is
+restored when walking back), and Tab completes query field starters such as
+name:, user:, cpu>, or tree.mem>. Enter applies the query and returns to
+selection mode; p can then act on the selected result.
+Escape cancels input, or clears an already active search. The last 20 applied
+queries are kept in
+.BR ui-state.json .
+.TP
+.B *
+Toggle a star on the selected process. The star is bound to the process
+instance (PID plus start time), so a reused PID never inherits it, and it
+lasts only for the session. Starred rows show a marker before the process
+name.
+.TP
+.B '
+Jump to the next starred process, wrapping around; a notice appears when no
+star is set or no starred row is visible.
+.TP
+.B :
+Open the command palette from the bare tree or any workspace. Typing
+fuzzy-matches every command by its English and Chinese names and keywords,
+Up and Down (or Control-P and Control-N) move the selection, Enter runs the
+selected command exactly like its key equivalent, and Escape closes the
+palette. Text editors keep : as ordinary input.
 .TP
 .B Space
 Pause or resume live refresh.
@@ -323,20 +368,28 @@ relationship context.
 .TP
 .B Enter
 Open deep inspection for the selected process. Overview, hot threads,
-ports/connections, and open files are separated into cards. Tab and Shift-Tab
-cycle forward and backward; each card starts at the top. Up and Down scroll,
-Enter or r refreshes, and Escape closes the workspace.
+ports/connections, and open files are separated into cards. Tab/Right and
+Shift-Tab/Left cycle forward and backward; each card starts at the top. Up and
+Down scroll, Enter or r refreshes, and Escape closes the workspace. The popup
+hugs the process-tree block so its bottom border never dips into the
+selected-process pane below.
 .TP
-.B k
-Open the focused end-process dialog for the selected process. Choose graceful
-TERM or immediate KILL, review the target, then press y on the second screen to
-send the signal. The PID start time is revalidated before every action.
+.B p
+Open the process action center for the selected process. Choose TERM, KILL,
+STOP, or CONT (also reachable through the t, k, s, and c shortcuts inside the
+dialog), review the target, then press y on the second screen to send the
+signal. The PID start time is revalidated before every action. This is the
+only signal entry point; the former standalone k end-process binding was
+removed so k can move the selection up.
 .TP
 .B D
-Build a process dossier for the selected process in the background. The panel
+Build a process dossier for the selected process in the background, the same
+dossier that
+.B psmore explain
+prints. The panel
 prioritizes signals from deep inspection, service ownership, executable-image,
 and bounded native-log evidence. Enter or r refreshes; i, M, m, v, and l open
-related evidence; L toggles log collection; h toggles SHA-256; D or Escape
+related evidence; g toggles log collection; h toggles SHA-256; D or Escape
 closes the workspace.
 .TP
 .B M
@@ -371,6 +424,12 @@ Escape closes the workspace.
 and
 .B i
 Open network, deep inspection, baseline/diff, or process detail workspaces.
+Inside the network workspace, / filters by text,
+.B p
+starts a digit-only port lookup that narrows the list to endpoints whose local
+or remote port matches and selects the first one, and
+.B x
+clears both filters.
 .TP
 .BR ?
 Open the field guide. Within guidance,
@@ -385,15 +444,20 @@ workspace. Escape intentionally does nothing on the bare process tree and
 cannot quit psmore.
 .TP
 .B L
-Switch between Chinese and English from the main process tree or field guide.
-Inside the process dossier, L remains the log-collection toggle.
-.TP
-.B F2
-Switch between Chinese and English from any TUI workspace. The manual choice is
-saved and takes precedence over operating-system language on later starts.
+Switch between Chinese and English from any TUI state, including open
+workspaces and dialogs. Text editors still accept L as ordinary input. The
+manual choice is saved and takes precedence over operating-system language on
+later starts. The former F2 binding was removed.
 .TP
 .BR q
-Quit psmore. Control-C also exits from the TUI.
+Close the current overlay, workspace, or dialog layer; on the bare process
+tree, q quits psmore. Control-C exits immediately from any state.
+.SS MOUSE
+The TUI captures the mouse while running and releases it on exit. Left-click a
+process-tree row to select it; clicking the already-selected row opens deep
+inspection. Left-click a tab label in the inspection workspace to switch
+cards. The scroll wheel moves the tree selection or scrolls the open
+workspace, exactly like the Up and Down keys. Clicks elsewhere are ignored.
 .SH EXIT STATUS
 .TP
 .B 0
@@ -411,10 +475,19 @@ A confirmed expectation, severity threshold, or regression policy failed.
 .SH FILES
 .TP
 .I ~/Library/Application Support/psmore/ui-state.json
-Default macOS TUI preference state.
+Default macOS TUI preference state. Alongside startup guidance, language, and
+filters it stores the optional
+.B theme
+.RB ( dark | light | high-contrast )
+and
+.B glyphs
+.RB ( unicode | ascii )
+preferences written by the command palette, plus the
+.B query_history
+list of the 20 most recently applied / queries.
 .TP
 .I ${XDG_CONFIG_HOME:-~/.config}/psmore/ui-state.json
-Default Linux TUI preference state.
+Default Linux TUI preference state, with the same fields as above.
 .TP
 .I PREFIX/share/psmore/uninstall.sh
 Uninstaller for a binary-package installation. It does not remove TUI state or
@@ -428,6 +501,21 @@ Override the directory used for private TUI preference state.
 Select the initial TUI language before a manual preference has been saved.
 Values beginning with zh select Chinese; other recognized locales select
 English.
+.TP
+.B PSMORE_THEME
+Select the TUI color theme
+.RB ( dark | light | high-contrast )
+unless
+.B --theme
+is given; takes precedence over the persisted preference.
+.TP
+.B PSMORE_GLYPHS
+Select the TUI glyph repertoire
+.RB ( unicode | ascii )
+unless
+.B --glyphs
+is given; takes precedence over the persisted preference and terminal
+auto-detection.
 .TP
 .B PSMORE_PREFIX
 Override the binary package install prefix. The default is

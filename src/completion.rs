@@ -30,6 +30,8 @@ _psmore_completion() {
         --state) words="ESTABLISHED LISTEN TIME_WAIT CLOSE_WAIT SYN_SENT SYN_RECV CONNECTED CONNECTING BOUND OPEN" ;;
         --fail-on)
             if [[ "$cmd" == "diff" ]]; then words="never regression"; else words="never warning critical"; fi ;;
+        --theme) words="dark light high-contrast" ;;
+        --glyphs) words="unicode ascii" ;;
         --output) compopt -o default; return ;;
         completion) words="bash zsh fish" ;;
         *) words="" ;;
@@ -40,7 +42,7 @@ _psmore_completion() {
     fi
 
     if (( COMP_CWORD == 1 )); then
-        words="check inspect memory explain exe stale service logs port listen net tree watch trace run deleted file fd top oom cgroup doctor diff completion --table --json --query --no-tips --sample-ms --redact --help --version"
+        words="check inspect memory explain exe stale service logs port listen net tree watch trace run deleted file fd top oom cgroup doctor diff completion --table --json --query --no-tips --theme --glyphs --sample-ms --redact --help --version"
         COMPREPLY=( $(compgen -W "$words" -- "$cur") )
         return
     fi
@@ -75,7 +77,7 @@ _psmore_completion() {
         doctor) words="--query --deep --limit --table --json --output --force --fail-on --quiet --sample-ms --help --version" ;;
         diff) words="--table --json --output --force --fail-on --quiet --help --version" ;;
         completion) words="bash zsh fish --help --version" ;;
-        *) words="--query --no-tips --table --json --sample-ms --help --version" ;;
+        *) words="--query --no-tips --theme --glyphs --table --json --sample-ms --help --version" ;;
     esac
     words="$words --redact"
     COMPREPLY=( $(compgen -W "$words" -- "$cur") )
@@ -117,6 +119,8 @@ _psmore() {
     '--json:print a JSON snapshot and exit'
     '--query:filter the TUI or snapshot'
     '--no-tips:skip the startup help or tip for this TUI run'
+    '--theme:TUI color theme dark light or high-contrast'
+    '--glyphs:TUI glyph set unicode or ascii'
     '--sample-ms:set the snapshot sampling interval'
     '--redact:mask common secret values in command lines'
     '--help:print global help'
@@ -152,6 +156,8 @@ _psmore() {
       else _values 'scope' process tree; fi
       return ;;
     --priority) _values 'priority' error warning info debug; return ;;
+    --theme) _values 'theme' dark light high-contrast; return ;;
+    --glyphs) _values 'glyphs' unicode ascii; return ;;
   esac
   if [[ "$cmd" == completion && CURRENT == 3 ]]; then
     _values 'shell' bash zsh fish
@@ -183,7 +189,7 @@ _psmore() {
     doctor) options=( '--query[scope quick process signals and hotspots]:query:' '--deep[scan exposure fd deleted files and Linux OOM]' '--limit[maximum rows per section]:rows:(all)' '--table[table output]' '--json[JSON output]' '--output[atomically write private JSON]:file:_files' '--force[replace an existing output file]' '--fail-on[exit threshold]:severity:(never warning critical)' '--quiet[suppress stdout]' '--sample-ms[sampling milliseconds]:milliseconds:' ) ;;
     diff) options=( '--table[table output]' '--json[JSON output]' '--output[atomically write private JSON]:file:_files' '--force[replace an existing output file]' '--fail-on[exit for doctor regression]:policy:(never regression)' '--quiet[suppress stdout]' ) ;;
     completion) options=() ;;
-    *) options=( '--query[process query]:query:' '--no-tips[skip startup guidance for this TUI run]' '--table[table snapshot]' '--json[JSON snapshot]' '--sample-ms[sampling milliseconds]:milliseconds:' ) ;;
+    *) options=( '--query[process query]:query:' '--no-tips[skip startup guidance for this TUI run]' '--theme[TUI color theme]:theme:(dark light high-contrast)' '--glyphs[TUI glyph set]:glyphs:(unicode ascii)' '--table[table snapshot]' '--json[JSON snapshot]' '--sample-ms[sampling milliseconds]:milliseconds:' ) ;;
   esac
   options+=( '--redact[mask common secret values in command lines]' '-h[print help]' '--help[print help]' '-V[print version]' '--version[print version]' )
   _arguments -s $options '*:argument:_files'
@@ -221,6 +227,8 @@ complete -c psmore -n '__fish_use_subcommand' -a completion -d 'Generate shell c
 complete -c psmore -n '__fish_seen_subcommand_from completion' -a 'bash zsh fish'
 complete -c psmore -n 'not __fish_seen_subcommand_from check inspect memory explain exe stale service logs port listen net tree watch trace run deleted file fd top oom cgroup doctor diff completion' -s q -l query -r -d 'Initial TUI or snapshot query'
 complete -c psmore -n 'not __fish_seen_subcommand_from check inspect memory explain exe stale service logs port listen net tree watch trace run deleted file fd top oom cgroup doctor diff completion' -l no-tips -d 'Skip startup guidance for this TUI run'
+complete -c psmore -n 'not __fish_seen_subcommand_from check inspect memory explain exe stale service logs port listen net tree watch trace run deleted file fd top oom cgroup doctor diff completion' -l theme -xa 'dark light high-contrast' -d 'TUI color theme'
+complete -c psmore -n 'not __fish_seen_subcommand_from check inspect memory explain exe stale service logs port listen net tree watch trace run deleted file fd top oom cgroup doctor diff completion' -l glyphs -xa 'unicode ascii' -d 'TUI glyph set'
 complete -c psmore -n 'not __fish_seen_subcommand_from check inspect memory explain exe stale service logs port listen net tree watch trace run deleted file fd top oom cgroup doctor diff completion' -l table -d 'Print table snapshot'
 complete -c psmore -n 'not __fish_seen_subcommand_from check inspect memory explain exe stale service logs port listen net tree watch trace run deleted file fd top oom cgroup doctor diff completion' -l json -d 'Print JSON snapshot'
 complete -c psmore -n 'not __fish_seen_subcommand_from check inspect memory explain exe stale service logs port listen net tree watch trace run deleted file fd top oom cgroup doctor diff completion' -l sample-ms -r -d 'Sampling milliseconds'
@@ -399,6 +407,14 @@ mod tests {
             assert!(
                 script.contains("--no-hash") || script.contains("-l no-hash"),
                 "{} completion is missing exe --no-hash",
+                shell.label()
+            );
+            assert!(
+                (script.contains("--theme") || script.contains("-l theme"))
+                    && script.contains("high-contrast")
+                    && (script.contains("--glyphs") || script.contains("-l glyphs"))
+                    && script.contains("ascii"),
+                "{} completion is missing --theme/--glyphs options",
                 shell.label()
             );
             match shell {

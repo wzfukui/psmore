@@ -1,11 +1,14 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::mpsc::{self, Receiver, TryRecvError},
     thread,
     time::{Duration, Instant},
 };
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::Rect;
 use sysinfo::Pid;
 use unicode_width::UnicodeWidthStr;
 
@@ -34,10 +37,11 @@ use crate::{
     },
     network::{NetworkScan, NetworkScope, scan_network},
     onboarding::{Guidance, GuidanceOverlay},
-    provider::{NativeProcessProvider, ProcessProvider, platform_name},
+    provider::{HostMetrics, NativeProcessProvider, ProcessProvider, platform_name},
     query::ProcessQuery,
     report::{ReportInput, export_report},
     snapshot::BaselineSnapshot,
+    theme::{GlyphMode, Glyphs, Theme, ThemeId, resolve_glyph_mode, resolve_theme_id},
 };
 
 pub(crate) fn aggregate_resources(
@@ -92,6 +96,7 @@ pub(crate) fn aggregate_resources(
 #[cfg(test)]
 mod filter_tests {
     use super::*;
+    use crate::network::NetworkEndpoint;
 
     fn process(pid: u32, parent: Option<u32>, name: &str, executable: &str) -> ProcessInfo {
         ProcessInfo {
@@ -437,6 +442,197 @@ mod filter_tests {
         assert_eq!(visible_row, 2);
         assert_eq!(app.selected_pid(), Some(herdr_pid));
     }
+
+    #[test]
+    fn next_starred_with_empty_filtered_view_notices_instead_of_panicking() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        app.processes = [
+            process(0, None, "kernel / system", ""),
+            process(1, Some(0), "launchd", "/sbin/launchd"),
+            process(2, Some(1), "worker", "/usr/bin/worker"),
+        ]
+        .into_iter()
+        .map(|process| (process.pid, process))
+        .collect();
+        app.children.clear();
+        for process in app.processes.values() {
+            app.children
+                .entry(process.parent)
+                .or_default()
+                .push(process.pid);
+        }
+        app.resources = aggregate_resources(&app.processes, &app.children);
+        app.expanded = [0, 1].into_iter().map(Pid::from_u32).collect();
+        app.rebuild_visible();
+
+        // Star the selected process, then hide every row behind a
+        // zero-result search.
+        app.on_key(KeyEvent::new(KeyCode::Char('*'), KeyModifiers::NONE));
+        assert_eq!(app.marks.len(), 1);
+        app.search = "name:no-such-process".into();
+        app.rebuild_visible();
+        assert!(app.visible.is_empty());
+
+        app.on_key(KeyEvent::new(KeyCode::Char('\''), KeyModifiers::NONE));
+        let notice = app.notice.as_ref().expect("not-visible notice");
+        assert!(notice.message.contains("not visible"));
+    }
+
+    #[test]
+    fn palette_pause_pauses_without_touching_the_filter_manager() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        app.process_filters = vec![ProcessFilterRule {
+            action: FilterAction::Include,
+            expression: "name:node".into(),
+            enabled: true,
+        }];
+        app.on_key(KeyEvent::new(KeyCode::Char('F'), KeyModifiers::NONE));
+        assert!(app.show_filter_manager);
+
+        // Palette Pause must pause from every context; replaying Space here
+        // would toggle the selected rule instead.
+        let quit = app.execute_palette_command(PaletteCommandId::Pause);
+        assert!(!quit);
+        assert!(app.paused);
+        assert!(app.show_filter_manager);
+        assert!(app.process_filters[0].enabled);
+
+        // Contrast: a real Space in the filter manager toggles the rule and
+        // leaves the pause state alone.
+        app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(!app.process_filters[0].enabled);
+        assert!(app.paused);
+
+        // And from the bare tree, palette Pause still toggles back.
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.show_filter_manager);
+        app.execute_palette_command(PaletteCommandId::Pause);
+        assert!(!app.paused);
+    }
+
+    #[test]
+    fn search_completion_advances_past_multibyte_whitespace() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        // U+3000 (ideographic space) is three UTF-8 bytes; the token boundary
+        // must start after the whole character, not one byte into it.
+        app.search_input = "cpu>20\u{3000}n".into();
+        app.complete_search_field();
+        assert_eq!(app.search_input, "cpu>20\u{3000}name:");
+        // Cycling with a single candidate keeps the completed token.
+        app.complete_search_field();
+        assert_eq!(app.search_input, "cpu>20\u{3000}name:");
+    }
+
+    #[test]
+    fn pending_port_lookup_applies_when_the_initial_scan_completes() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        app.show_network = true;
+        // The first background scan is still running: no snapshot yet.
+        assert!(app.network_scan.is_none());
+        app.network_port_input = Some("8080".into());
+        app.finish_network_port_input();
+        assert_eq!(app.network_port_filter, None);
+        assert_eq!(app.network_pending_port, Some(8080));
+        let notice = app.notice.as_ref().expect("pending notice");
+        assert!(notice.message.contains("when the scan completes"));
+
+        let scan = NetworkScan {
+            endpoints: vec![NetworkEndpoint {
+                pid: Some(Pid::from_u32(2)),
+                process: "worker".into(),
+                fd: "12".into(),
+                protocol: "TCP".into(),
+                local_endpoint: "127.0.0.1:8080".into(),
+                remote_endpoint: String::new(),
+                state: "LISTEN".into(),
+                namespace: String::new(),
+            }],
+            warning: None,
+        };
+        let (sender, receiver) = mpsc::channel();
+        sender.send(scan).unwrap();
+        app.network_task = Some(NetworkTask {
+            receiver,
+            started_at: Instant::now(),
+        });
+        app.poll_background_jobs();
+        assert_eq!(app.network_pending_port, None);
+        assert_eq!(app.network_port_filter, Some(8080));
+        assert_eq!(app.network_visible_indices().len(), 1);
+    }
+
+    #[test]
+    fn pending_port_lookup_reports_no_endpoint_after_the_scan() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        app.show_network = true;
+        app.network_port_input = Some("9".into());
+        app.finish_network_port_input();
+        assert_eq!(app.network_pending_port, Some(9));
+
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(NetworkScan {
+                endpoints: vec![],
+                warning: None,
+            })
+            .unwrap();
+        app.network_task = Some(NetworkTask {
+            receiver,
+            started_at: Instant::now(),
+        });
+        app.poll_background_jobs();
+        assert_eq!(app.network_pending_port, None);
+        assert_eq!(app.network_port_filter, None);
+        let notice = app.notice.as_ref().expect("no-match notice");
+        assert!(notice.message.contains("no endpoint on port 9"));
+    }
+
+    #[test]
+    fn clicks_reach_inspection_tabs_only_without_a_higher_modal() {
+        let mut app = App::new_for_test(Guidance::welcome_for_test());
+        app.guidance.overlay = None;
+        app.inspection = Some(ProcessInspection::default());
+        app.inspection_tab_regions = vec![(Rect::new(0, 0, 10, 1), InspectionTab::Threads)];
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        // The palette owns the screen: the click must not switch the hidden
+        // inspection tab underneath.
+        app.show_palette = true;
+        app.on_mouse(click);
+        assert_eq!(app.inspection_tab, InspectionTab::Overview);
+
+        app.show_palette = false;
+        app.on_mouse(click);
+        assert_eq!(app.inspection_tab, InspectionTab::Threads);
+
+        // The process-action dialog is modal too.
+        app.inspection_tab_regions = vec![(Rect::new(0, 0, 10, 1), InspectionTab::Ports)];
+        app.process_action = Some(ProcessActionDialog {
+            target: ProcessActionTarget {
+                pid: Pid::from_u32(2),
+                name: "worker".into(),
+                command: "/usr/bin/worker".into(),
+                start_time: 1,
+            },
+            selected: 0,
+            confirming: false,
+            mode: ProcessActionDialogMode::All,
+        });
+        app.on_mouse(click);
+        assert_eq!(app.inspection_tab, InspectionTab::Threads);
+        app.process_action = None;
+        app.on_mouse(click);
+        assert_eq!(app.inspection_tab, InspectionTab::Ports);
+    }
 }
 
 pub(crate) fn sort_processes(
@@ -544,6 +740,7 @@ const GIB: u64 = 1024 * MIB;
 const ATTENTION_ACTIVITY_SAMPLES: usize = 5;
 const ATTENTION_GROWTH_SAMPLES: usize = 30;
 const ATTENTION_CHURN_WINDOW: Duration = Duration::from_secs(60);
+const LOAD_HISTORY_SAMPLES: usize = 10;
 
 fn attention_bytes(value: u64) -> String {
     if value >= GIB {
@@ -823,6 +1020,16 @@ impl InspectionTab {
         }
     }
 
+    pub(crate) const fn from_index(index: usize) -> Option<Self> {
+        match index {
+            0 => Some(Self::Overview),
+            1 => Some(Self::Threads),
+            2 => Some(Self::Ports),
+            3 => Some(Self::Files),
+            _ => None,
+        }
+    }
+
     const fn next(self) -> Self {
         match self {
             Self::Overview => Self::Threads,
@@ -949,12 +1156,413 @@ pub(crate) struct FilterEditor {
     enabled: bool,
 }
 
+/// A starred process instance: the star dies with the instance, so PID reuse
+/// (same PID, different start time) never shows a stale marker.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ProcessMark {
+    pub(crate) pid: Pid,
+    pub(crate) start_time: u64,
+}
+
+/// Tab-completion cycle state inside `/` search: the token that triggered the
+/// cycle plus the matching candidates, so repeated Tab walks the same list.
+#[derive(Clone, Debug)]
+struct SearchCompletion {
+    token_start: usize,
+    candidates: Vec<&'static str>,
+    index: usize,
+}
+
+/// Query field starters offered by Tab completion in `/` search.
+const QUERY_FIELD_STARTERS: &[&str] = &[
+    "name:",
+    "cmd:",
+    "path:",
+    "user:",
+    "state:",
+    "pid:",
+    "ppid:",
+    "cpu>",
+    "cpu<",
+    "mem>",
+    "mem<",
+    "tree.cpu>",
+    "tree.mem>",
+    "age>",
+    "read>",
+    "write>",
+    "!state:",
+];
+
+const MAX_QUERY_HISTORY: usize = 20;
+
 struct TreeSelection<'a> {
     matched: &'a HashSet<Pid>,
     allowed: &'a HashSet<Pid>,
     restricted: bool,
     filter_applied: bool,
     search_active: bool,
+}
+
+/// One entry in the `:` command palette. The catalog stays data-only so new
+/// commands are a one-line addition; dispatch replays the real key press.
+#[derive(Clone, Copy)]
+pub(crate) struct PaletteCommand {
+    pub(crate) id: PaletteCommandId,
+    pub(crate) en_name: &'static str,
+    pub(crate) zh_name: &'static str,
+    pub(crate) en_description: &'static str,
+    pub(crate) zh_description: &'static str,
+    pub(crate) key_hint: &'static str,
+    pub(crate) keywords: &'static [&'static str],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PaletteCommandId {
+    Inspect,
+    Search,
+    ToggleStar,
+    NextStarred,
+    Actions,
+    Dossier,
+    Memory,
+    Service,
+    Verify,
+    Logs,
+    Network,
+    FindPort,
+    Hotspots,
+    Attention,
+    Trend,
+    Events,
+    Filters,
+    Focus,
+    Sort,
+    Pause,
+    Refresh,
+    CaptureBaseline,
+    SnapshotDiff,
+    ClearBaseline,
+    ExportReport,
+    Language,
+    CycleTheme,
+    ToggleGlyphs,
+    Help,
+    Quit,
+}
+
+static PALETTE_COMMANDS: &[PaletteCommand] = &[
+    PaletteCommand {
+        id: PaletteCommandId::Inspect,
+        en_name: "Inspect process",
+        zh_name: "深度检查",
+        en_description: "Threads, sockets, files, and runtime context",
+        zh_description: "线程、套接字、文件和运行上下文",
+        key_hint: "Enter",
+        keywords: &["inspect", "details", "enter", "检查", "详情", "深检"],
+    },
+    PaletteCommand {
+        id: PaletteCommandId::Search,
+        en_name: "Search processes",
+        zh_name: "搜索进程",
+        en_description: "Filter the tree with a query",
+        zh_description: "用查询过滤进程树",
+        key_hint: "/",
+        keywords: &["search", "filter", "query", "搜索", "查询", "过滤"],
+    },
+    PaletteCommand {
+        id: PaletteCommandId::ToggleStar,
+        en_name: "Toggle star",
+        zh_name: "切换星标",
+        en_description: "Star or unstar the selected process",
+        zh_description: "为选中进程加星标或取消星标",
+        key_hint: "*",
+        keywords: &["star", "mark", "星标", "标记"],
+    },
+    PaletteCommand {
+        id: PaletteCommandId::NextStarred,
+        en_name: "Next starred",
+        zh_name: "下一个星标",
+        en_description: "Jump to the next starred process",
+        zh_description: "跳到下一个星标进程",
+        key_hint: "'",
+        keywords: &["star", "mark", "next", "jump", "星标", "下一个", "跳转"],
+    },
+    PaletteCommand {
+        id: PaletteCommandId::Actions,
+        en_name: "Process actions",
+        zh_name: "进程操作",
+        en_description: "TERM, KILL, STOP, or CONT with confirmation",
+        zh_description: "经明确确认发送 TERM/KILL/STOP/CONT",
+        key_hint: "p",
+        keywords: &["actions", "kill", "term", "signal", "操作", "终止", "信号"],
+    },
+    PaletteCommand {
+        id: PaletteCommandId::Dossier,
+        en_name: "Process dossier",
+        zh_name: "进程档案",
+        en_description: "One dossier with prioritized evidence",
+        zh_description: "带优先级线索的单进程档案",
+        key_hint: "D",
+        keywords: &["dossier", "evidence", "档案", "线索"],
+    },
+    PaletteCommand {
+        id: PaletteCommandId::Memory,
+        en_name: "Memory attribution",
+        zh_name: "内存归因",
+        en_description: "RSS, PSS, swap, regions, and mapped files",
+        zh_description: "归因 RSS、PSS、Swap、区域和映射",
+        key_hint: "M",
+        keywords: &["memory", "mem", "rss", "pss", "swap", "内存", "归因"],
+    },
+    PaletteCommand {
+        id: PaletteCommandId::Service,
+        en_name: "Service context",
+        zh_name: "服务归属",
+        en_description: "systemd or launchd ownership and state",
+        zh_description: "systemd/launchd 归属、状态和配置",
+        key_hint: "m",
+        keywords: &["service", "systemd", "launchd", "服务", "归属"],
+    },
+    PaletteCommand {
+        id: PaletteCommandId::Verify,
+        en_name: "Verify executable",
+        zh_name: "验证映像",
+        en_description: "Image identity, package, hash, and signature",
+        zh_description: "运行映像、软件包、哈希和代码签名",
+        key_hint: "v",
+        keywords: &[
+            "verify",
+            "executable",
+            "image",
+            "hash",
+            "signature",
+            "验证",
+            "映像",
+            "签名",
+        ],
+    },
+    PaletteCommand {
+        id: PaletteCommandId::Logs,
+        en_name: "Process logs",
+        zh_name: "进程日志",
+        en_description: "Bounded native logs for process or service",
+        zh_description: "进程或服务的有界原生日志",
+        key_hint: "l",
+        keywords: &["logs", "log", "journal", "日志"],
+    },
+    PaletteCommand {
+        id: PaletteCommandId::Network,
+        en_name: "Network workspace",
+        zh_name: "网络面板",
+        en_description: "Listeners, connections, peers, and owners",
+        zh_description: "监听、连接、对端和所有者",
+        key_hint: "n",
+        keywords: &[
+            "network",
+            "net",
+            "ports",
+            "connections",
+            "网络",
+            "端口",
+            "连接",
+        ],
+    },
+    PaletteCommand {
+        id: PaletteCommandId::FindPort,
+        en_name: "Find port…",
+        zh_name: "查找端口…",
+        en_description: "Open the network workspace on a port lookup",
+        zh_description: "打开网络面板并直接定位端口",
+        key_hint: "n → p",
+        keywords: &["port", "find", "locate", "端口", "查找", "定位"],
+    },
+    PaletteCommand {
+        id: PaletteCommandId::Hotspots,
+        en_name: "Hotspots",
+        zh_name: "热点",
+        en_description: "CPU, memory, read, and write ranking",
+        zh_description: "CPU、内存、读写排行",
+        key_hint: "h",
+        keywords: &["hotspots", "hot", "cpu", "热点", "排行"],
+    },
+    PaletteCommand {
+        id: PaletteCommandId::Attention,
+        en_name: "Attention",
+        zh_name: "关注事项",
+        en_description: "Unhealthy state, churn, pressure, and growth",
+        zh_description: "异常状态、抖动、压力和增长",
+        key_hint: "a",
+        keywords: &["attention", "alerts", "关注", "告警", "异常"],
+    },
+    PaletteCommand {
+        id: PaletteCommandId::Trend,
+        en_name: "Resource trend",
+        zh_name: "资源趋势",
+        en_description: "Recent own and complete-subtree trend",
+        zh_description: "自身及完整子树的近期趋势",
+        key_hint: "t",
+        keywords: &["trend", "chart", "趋势", "曲线"],
+    },
+    PaletteCommand {
+        id: PaletteCommandId::Events,
+        en_name: "Recent events",
+        zh_name: "近期事件",
+        en_description: "Process changes and action audit",
+        zh_description: "进程变化和操作审计",
+        key_hint: "e",
+        keywords: &["events", "audit", "changes", "事件", "审计"],
+    },
+    PaletteCommand {
+        id: PaletteCommandId::Filters,
+        en_name: "Process filters",
+        zh_name: "进程过滤器",
+        en_description: "Persistent allow/deny rules before search",
+        zh_description: "先于搜索的持久包含/排除规则",
+        key_hint: "F",
+        keywords: &["filters", "allow", "deny", "rules", "过滤器", "规则"],
+    },
+    PaletteCommand {
+        id: PaletteCommandId::Focus,
+        en_name: "Toggle focus",
+        zh_name: "聚焦切换",
+        en_description: "Focus the selected parent chain and subtree",
+        zh_description: "聚焦选中进程的父链和服务子树",
+        key_hint: "f",
+        keywords: &["focus", "聚焦"],
+    },
+    PaletteCommand {
+        id: PaletteCommandId::Sort,
+        en_name: "Cycle sort mode",
+        zh_name: "切换排序",
+        en_description: "Stable and service-tree hotspot sorting",
+        zh_description: "稳定排序和服务树热点排序",
+        key_hint: "s",
+        keywords: &["sort", "排序"],
+    },
+    PaletteCommand {
+        id: PaletteCommandId::Pause,
+        en_name: "Pause or resume",
+        zh_name: "暂停或恢复",
+        en_description: "Freeze or resume live refresh",
+        zh_description: "冻结或恢复实时刷新",
+        key_hint: "Space",
+        keywords: &["pause", "resume", "freeze", "space", "暂停", "恢复", "冻结"],
+    },
+    PaletteCommand {
+        id: PaletteCommandId::Refresh,
+        en_name: "Refresh now",
+        zh_name: "立即刷新",
+        en_description: "Sample processes manually",
+        zh_description: "手工采样一次进程",
+        key_hint: "r",
+        keywords: &["refresh", "reload", "sample", "刷新", "采样"],
+    },
+    PaletteCommand {
+        id: PaletteCommandId::CaptureBaseline,
+        en_name: "Capture baseline",
+        zh_name: "捕获基线",
+        en_description: "Snapshot resources for later comparison",
+        zh_description: "为后续对比捕获资源快照",
+        key_hint: "b",
+        keywords: &["baseline", "capture", "基线", "捕获"],
+    },
+    PaletteCommand {
+        id: PaletteCommandId::SnapshotDiff,
+        en_name: "Snapshot diff",
+        zh_name: "快照对比",
+        en_description: "Compare against the captured baseline",
+        zh_description: "与已捕获的基线对比",
+        key_hint: "d",
+        keywords: &["diff", "snapshot", "compare", "对比", "快照"],
+    },
+    PaletteCommand {
+        id: PaletteCommandId::ClearBaseline,
+        en_name: "Clear baseline",
+        zh_name: "清除基线",
+        en_description: "Drop the captured baseline",
+        zh_description: "丢弃已捕获的基线",
+        key_hint: "x",
+        keywords: &["clear", "drop", "清除", "丢弃"],
+    },
+    PaletteCommand {
+        id: PaletteCommandId::ExportReport,
+        en_name: "Export report",
+        zh_name: "导出报告",
+        en_description: "Private, versioned diagnostic report",
+        zh_description: "私有、版本化诊断报告",
+        key_hint: "o",
+        keywords: &["export", "report", "导出", "报告"],
+    },
+    PaletteCommand {
+        id: PaletteCommandId::Language,
+        en_name: "Switch language",
+        zh_name: "切换语言",
+        en_description: "English ↔ 中文",
+        zh_description: "中文 ↔ English",
+        key_hint: "L",
+        keywords: &["language", "english", "chinese", "语言", "中文", "英文"],
+    },
+    PaletteCommand {
+        id: PaletteCommandId::CycleTheme,
+        en_name: "Cycle theme",
+        zh_name: "切换主题",
+        en_description: "Rotate dark, light, and high-contrast",
+        zh_description: "轮换深色、浅色和高对比主题",
+        key_hint: ":",
+        keywords: &[
+            "theme", "color", "dark", "light", "contrast", "主题", "颜色",
+        ],
+    },
+    PaletteCommand {
+        id: PaletteCommandId::ToggleGlyphs,
+        en_name: "Toggle ASCII glyphs",
+        zh_name: "切换字符集",
+        en_description: "Unicode ↔ ASCII tree and status glyphs",
+        zh_description: "Unicode ↔ ASCII 树形与状态字符",
+        key_hint: ":",
+        keywords: &["glyphs", "ascii", "unicode", "charset", "字符", "字符集"],
+    },
+    PaletteCommand {
+        id: PaletteCommandId::Help,
+        en_name: "Field guide",
+        zh_name: "现场手册",
+        en_description: "Open the interactive help",
+        zh_description: "打开交互式帮助",
+        key_hint: "?",
+        keywords: &["help", "guide", "帮助", "手册"],
+    },
+    PaletteCommand {
+        id: PaletteCommandId::Quit,
+        en_name: "Quit psmore",
+        zh_name: "退出 psmore",
+        en_description: "Exit the TUI",
+        zh_description: "退出交互界面",
+        key_hint: "q",
+        keywords: &["quit", "exit", "退出"],
+    },
+];
+
+/// Case-insensitive subsequence match; every query character must appear in
+/// the target in order. Works for Chinese because lowercase is a no-op there.
+fn subsequence_match(query: &str, target: &str) -> bool {
+    let target: Vec<char> = target.to_lowercase().chars().collect();
+    let mut position = 0;
+    for needle in query.to_lowercase().chars() {
+        let mut found = false;
+        while position < target.len() {
+            let candidate = target[position];
+            position += 1;
+            if candidate == needle {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return false;
+        }
+    }
+    true
 }
 
 pub(crate) struct App {
@@ -981,6 +1589,11 @@ pub(crate) struct App {
     pub(crate) network_selected: usize,
     pub(crate) network_filter: String,
     pub(crate) network_searching: bool,
+    pub(crate) network_port_input: Option<String>,
+    pub(crate) network_port_filter: Option<u16>,
+    /// Port lookup submitted while the first background scan is still
+    /// running; applied as soon as a snapshot arrives.
+    pub(crate) network_pending_port: Option<u16>,
     pub(crate) sort_mode: SortMode,
     pub(crate) visible: Vec<TreeRow>,
     pub(crate) selected: usize,
@@ -992,6 +1605,15 @@ pub(crate) struct App {
     pub(crate) search_input: String,
     pub(crate) search_error: Option<String>,
     pub(crate) search_matches: usize,
+    /// Applied `/` queries, most recent first, persisted via ui-state.json.
+    pub(crate) query_history: Vec<String>,
+    /// Shell-style history walk: `None` sits on the in-progress draft.
+    search_history_index: Option<usize>,
+    search_draft: String,
+    search_completion: Option<SearchCompletion>,
+    /// Session-only starred processes keyed by PID + start time, so a reused
+    /// PID never inherits another instance's star.
+    pub(crate) marks: HashSet<ProcessMark>,
     pub(crate) process_filters: Vec<ProcessFilterRule>,
     pub(crate) show_filter_manager: bool,
     pub(crate) filter_selected: usize,
@@ -1034,17 +1656,47 @@ pub(crate) struct App {
     pub(crate) dossier_context_scroll: u16,
     pub(crate) process_action: Option<ProcessActionDialog>,
     pub(crate) action_history: Vec<ProcessActionRecord>,
+    pub(crate) host_metrics: HostMetrics,
+    pub(crate) load_history: VecDeque<f64>,
     pub(crate) guidance: Guidance,
+    pub(crate) show_palette: bool,
+    pub(crate) palette_query: String,
+    pub(crate) palette_selected: usize,
+    pub(crate) theme_id: ThemeId,
+    pub(crate) theme: Theme,
+    pub(crate) glyph_mode: GlyphMode,
+    pub(crate) glyphs: Glyphs,
+    /// Screen regions recorded by the last draw so mouse clicks can be mapped
+    /// back to tree rows and inspection tabs.
+    pub(crate) tree_area: Rect,
+    pub(crate) inspection_tab_regions: Vec<(Rect, InspectionTab)>,
 }
 
 impl App {
     #[cfg(test)]
     pub(crate) fn new_for_test(guidance: Guidance) -> Self {
-        Self::new_with_guidance(String::new(), guidance)
+        // Tests pin dark/unicode so rendering assertions never depend on the
+        // host environment; production resolves the real precedence chain.
+        Self::new_with_guidance(
+            String::new(),
+            guidance,
+            Some(ThemeId::Dark),
+            Some(GlyphMode::Unicode),
+        )
     }
 
-    pub(crate) fn new_for_tui(query: String, suppress_guidance: bool) -> Self {
-        Self::new_with_guidance(query, Guidance::load_default(suppress_guidance))
+    pub(crate) fn new_for_tui(
+        query: String,
+        suppress_guidance: bool,
+        theme_override: Option<ThemeId>,
+        glyph_override: Option<GlyphMode>,
+    ) -> Self {
+        Self::new_with_guidance(
+            query,
+            Guidance::load_default(suppress_guidance),
+            theme_override,
+            glyph_override,
+        )
     }
 
     pub(crate) fn language(&self) -> UiLanguage {
@@ -1074,10 +1726,35 @@ impl App {
         });
     }
 
-    fn new_with_guidance(query: String, mut guidance: Guidance) -> Self {
+    fn new_with_guidance(
+        query: String,
+        mut guidance: Guidance,
+        theme_override: Option<ThemeId>,
+        glyph_override: Option<GlyphMode>,
+    ) -> Self {
         let has_initial_query = !query.is_empty();
         let guidance_warning = guidance.take_warning();
         let process_filters = guidance.filters().to_vec();
+        // Theme/glyph resolution keeps the resolved id next to the resolved
+        // struct so runtime switching is a one-field update plus persist.
+        let env_theme = std::env::var("PSMORE_THEME")
+            .ok()
+            .and_then(|value| ThemeId::parse(&value));
+        let theme_id = resolve_theme_id(theme_override, env_theme, guidance.theme());
+        let env_glyphs = std::env::var("PSMORE_GLYPHS")
+            .ok()
+            .and_then(|value| GlyphMode::parse(&value));
+        let locales = ["LC_ALL", "LC_CTYPE", "LANG"]
+            .into_iter()
+            .map(|key| std::env::var(key).ok())
+            .collect::<Vec<_>>();
+        let glyph_mode = resolve_glyph_mode(
+            glyph_override,
+            env_glyphs,
+            guidance.glyphs(),
+            std::env::var("TERM").ok().as_deref(),
+            &locales,
+        );
         let mut app = Self {
             provider: NativeProcessProvider::new(),
             processes: HashMap::new(),
@@ -1102,6 +1779,9 @@ impl App {
             network_selected: 0,
             network_filter: String::new(),
             network_searching: false,
+            network_port_input: None,
+            network_port_filter: None,
+            network_pending_port: None,
             sort_mode: SortMode::Stable,
             visible: Vec::new(),
             selected: 0,
@@ -1113,6 +1793,11 @@ impl App {
             search_input: String::new(),
             search_error: None,
             search_matches: 0,
+            query_history: guidance.query_history().to_vec(),
+            search_history_index: None,
+            search_draft: String::new(),
+            search_completion: None,
+            marks: HashSet::new(),
             process_filters,
             show_filter_manager: false,
             filter_selected: 0,
@@ -1155,7 +1840,26 @@ impl App {
             dossier_context_scroll: 0,
             process_action: None,
             action_history: Vec::new(),
+            host_metrics: HostMetrics {
+                hostname: String::new(),
+                load_one: 0.0,
+                cpu_percent: 0.0,
+                memory_used: 0,
+                memory_total: 0,
+                swap_used: 0,
+                swap_total: 0,
+            },
+            load_history: VecDeque::new(),
             guidance,
+            show_palette: false,
+            palette_query: String::new(),
+            palette_selected: 0,
+            theme_id,
+            theme: theme_id.theme(),
+            glyph_mode,
+            glyphs: glyph_mode.glyphs(),
+            tree_area: Rect::default(),
+            inspection_tab_regions: Vec::new(),
         };
         if let Some(message) = guidance_warning {
             app.notice = Some(StatusNotice {
@@ -1178,6 +1882,11 @@ impl App {
             .into_iter()
             .map(|p| (p.pid, p))
             .collect();
+        self.host_metrics = self.provider.host_metrics();
+        self.load_history.push_back(self.host_metrics.load_one);
+        while self.load_history.len() > LOAD_HISTORY_SAMPLES {
+            self.load_history.pop_front();
+        }
         let changes = if self.processes.is_empty() {
             Vec::new()
         } else {
@@ -1253,9 +1962,15 @@ impl App {
                     is_error: false,
                     observed_at: Instant::now(),
                 });
+                // A port lookup submitted before the first snapshot arrived
+                // can now be resolved against real data.
+                if let Some(port) = self.network_pending_port.take() {
+                    self.apply_network_port_filter(port);
+                }
             }
             Some(Err(TryRecvError::Disconnected)) => {
                 self.network_task = None;
+                self.network_pending_port = None;
                 if self.network_scan.is_none() {
                     self.show_network = false;
                 }
@@ -1824,8 +2539,7 @@ impl App {
         self.show_hotspots = false;
         self.hotspot_selected = None;
         self.show_network = false;
-        self.network_filter.clear();
-        self.network_searching = false;
+        self.clear_network_filters();
         self.show_snapshot_diff = false;
         self.trend_pid = None;
         self.inspection = None;
@@ -1923,8 +2637,7 @@ impl App {
         self.show_hotspots = false;
         self.hotspot_selected = None;
         self.show_network = false;
-        self.network_filter.clear();
-        self.network_searching = false;
+        self.clear_network_filters();
         self.show_snapshot_diff = false;
         self.trend_pid = None;
         self.inspection = None;
@@ -2037,8 +2750,7 @@ impl App {
         self.show_hotspots = false;
         self.hotspot_selected = None;
         self.show_network = false;
-        self.network_filter.clear();
-        self.network_searching = false;
+        self.clear_network_filters();
         self.show_snapshot_diff = false;
         self.trend_pid = None;
         self.inspection = None;
@@ -2150,8 +2862,7 @@ impl App {
         self.show_hotspots = false;
         self.hotspot_selected = None;
         self.show_network = false;
-        self.network_filter.clear();
-        self.network_searching = false;
+        self.clear_network_filters();
         self.show_snapshot_diff = false;
         self.trend_pid = None;
         self.inspection = None;
@@ -2329,8 +3040,7 @@ impl App {
         self.show_hotspots = false;
         self.hotspot_selected = None;
         self.show_network = false;
-        self.network_filter.clear();
-        self.network_searching = false;
+        self.clear_network_filters();
         self.show_snapshot_diff = false;
         self.trend_pid = None;
         self.inspection = None;
@@ -2906,6 +3616,98 @@ impl App {
         self.rebuild_visible();
     }
 
+    pub(crate) fn is_starred(&self, pid: Pid) -> bool {
+        self.processes
+            .get(&pid)
+            .map(|process| {
+                self.marks.contains(&ProcessMark {
+                    pid,
+                    start_time: process.start_time,
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    fn toggle_star(&mut self) {
+        let Some(pid) = self.selected_pid() else {
+            return;
+        };
+        let Some(process) = self.processes.get(&pid) else {
+            return;
+        };
+        let mark = ProcessMark {
+            pid,
+            start_time: process.start_time,
+        };
+        let starred = self.marks.insert(mark);
+        if !starred {
+            self.marks.remove(&mark);
+        }
+        let name = process.name.clone();
+        self.notice = Some(StatusNotice {
+            message: match (self.language(), starred) {
+                (UiLanguage::English, true) => format!("starred {name} [{pid}]"),
+                (UiLanguage::English, false) => format!("unstarred {name} [{pid}]"),
+                (UiLanguage::Chinese, true) => format!("已加星标 {name} [{pid}]"),
+                (UiLanguage::Chinese, false) => format!("已取消星标 {name} [{pid}]"),
+            },
+            is_error: false,
+            observed_at: Instant::now(),
+        });
+    }
+
+    /// Jump to the next starred row in the current tree view, wrapping around.
+    /// Stars live by process identity, so rebuilds, collapse, and filtering
+    /// simply decide whether a starred row is currently visible.
+    fn jump_to_next_starred(&mut self) {
+        if self.marks.is_empty() {
+            self.notice = Some(StatusNotice {
+                message: text(
+                    self.language(),
+                    "no starred processes; press * to star the selected one",
+                    "暂无星标进程；按 * 为选中进程加星标",
+                )
+                .into(),
+                is_error: false,
+                observed_at: Instant::now(),
+            });
+            return;
+        }
+        // An empty view (e.g. a search with zero hits) has no row to land
+        // on; iterating it would also divide by zero in the wrap-around.
+        if self.visible.is_empty() {
+            self.notice = Some(StatusNotice {
+                message: text(
+                    self.language(),
+                    "starred process is not visible in the current view",
+                    "星标进程在当前视图中不可见",
+                )
+                .into(),
+                is_error: false,
+                observed_at: Instant::now(),
+            });
+            return;
+        }
+        let count = self.visible.len();
+        for step in 1..=count {
+            let index = (self.selected + step) % count;
+            if self.is_starred(self.visible[index].pid) {
+                self.selected = index;
+                return;
+            }
+        }
+        self.notice = Some(StatusNotice {
+            message: text(
+                self.language(),
+                "starred process is not visible in the current view",
+                "星标进程在当前视图中不可见",
+            )
+            .into(),
+            is_error: false,
+            observed_at: Instant::now(),
+        });
+    }
+
     fn toggle_selected_expanded(&mut self) {
         let Some(pid) = self.selected_pid() else {
             return;
@@ -2972,9 +3774,130 @@ impl App {
             return;
         }
         self.searching = false;
+        self.search_history_index = None;
+        self.search_completion = None;
         self.search = std::mem::take(&mut self.search_input);
+        self.record_query_history();
         self.rebuild_visible();
         self.select_first_match();
+    }
+
+    /// Remember the just-applied query (dedup, most recent first, capped) and
+    /// persist it next to the other private UI preferences.
+    fn record_query_history(&mut self) {
+        let query = self.search.trim();
+        if query.is_empty() {
+            return;
+        }
+        self.query_history.retain(|entry| entry != query);
+        self.query_history.insert(0, query.to_string());
+        self.query_history.truncate(MAX_QUERY_HISTORY);
+        if let Err(error) = self.guidance.save_query_history(&self.query_history) {
+            self.notice = Some(StatusNotice {
+                message: match self.language() {
+                    UiLanguage::English => {
+                        format!("query applied, but the history could not be saved: {error}")
+                    }
+                    UiLanguage::Chinese => format!("查询已应用，但无法保存历史：{error}"),
+                },
+                is_error: true,
+                observed_at: Instant::now(),
+            });
+        }
+    }
+
+    /// `↑` in search mode walks towards older queries; the first press saves
+    /// the in-progress draft so `↓` can return to it.
+    fn search_history_previous(&mut self) {
+        if self.query_history.is_empty() {
+            return;
+        }
+        match self.search_history_index {
+            None => {
+                self.search_draft = self.search_input.clone();
+                self.search_history_index = Some(0);
+            }
+            Some(index) if index + 1 < self.query_history.len() => {
+                self.search_history_index = Some(index + 1);
+            }
+            Some(_) => return,
+        }
+        if let Some(index) = self.search_history_index {
+            self.search_input = self.query_history[index].clone();
+        }
+        self.search_completion = None;
+    }
+
+    /// `↓` walks back towards newer queries and finally restores the draft.
+    fn search_history_next(&mut self) {
+        match self.search_history_index {
+            Some(0) => {
+                self.search_history_index = None;
+                self.search_input = self.search_draft.clone();
+            }
+            Some(index) => {
+                self.search_history_index = Some(index - 1);
+                self.search_input = self.query_history[index - 1].clone();
+            }
+            None => {}
+        }
+        self.search_completion = None;
+    }
+
+    /// `Tab` completes the current token against query field starters.
+    /// Repeated presses cycle the candidates for the original partial token;
+    /// any other edit ends the cycle.
+    fn complete_search_field(&mut self) {
+        // Find the byte index just past the last whitespace. `rfind` returns
+        // the whitespace's byte offset, so stepping one byte forward would
+        // land inside a multi-byte whitespace such as U+3000; advance by the
+        // character's full UTF-8 length instead.
+        let token_start = self
+            .search_input
+            .char_indices()
+            .rev()
+            .find(|(_, c)| c.is_whitespace())
+            .map(|(index, c)| index + c.len_utf8())
+            .unwrap_or(0);
+        let token = &self.search_input[token_start..];
+        let cycling = self
+            .search_completion
+            .as_ref()
+            .filter(|state| {
+                state.token_start == token_start && token == state.candidates[state.index]
+            })
+            .map(|state| {
+                (
+                    state.candidates.clone(),
+                    (state.index + 1) % state.candidates.len(),
+                )
+            });
+        let (candidates, index) = match cycling {
+            Some(next) => next,
+            None => {
+                if !token.is_empty() && !QUERY_FIELD_STARTERS.iter().any(|s| s.starts_with(token)) {
+                    self.search_completion = None;
+                    return;
+                }
+                let candidates: Vec<&'static str> = QUERY_FIELD_STARTERS
+                    .iter()
+                    .copied()
+                    .filter(|starter| starter.starts_with(token))
+                    .collect();
+                if candidates.is_empty() {
+                    self.search_completion = None;
+                    return;
+                }
+                (candidates, 0)
+            }
+        };
+        let candidate = candidates[index];
+        self.search_input.replace_range(token_start.., candidate);
+        self.search_completion = Some(SearchCompletion {
+            token_start,
+            candidates,
+            index,
+        });
     }
 
     pub(crate) fn active_filter_count(&self) -> usize {
@@ -3225,8 +4148,7 @@ impl App {
         self.start_network_scan(true);
         self.network_scope = NetworkScope::default();
         self.network_selected = 0;
-        self.network_filter.clear();
-        self.network_searching = false;
+        self.clear_network_filters();
         self.show_events = false;
         self.inspection = None;
         self.inspection_task = None;
@@ -3243,8 +4165,7 @@ impl App {
         self.hotspot_metric = HotspotMetric::default();
         self.hotspot_scope = HotspotScope::default();
         self.show_network = false;
-        self.network_filter.clear();
-        self.network_searching = false;
+        self.clear_network_filters();
         self.show_events = false;
         self.inspection = None;
         self.inspection_task = None;
@@ -3258,8 +4179,7 @@ impl App {
     fn open_attention(&mut self) {
         self.show_attention = true;
         self.show_network = false;
-        self.network_filter.clear();
-        self.network_searching = false;
+        self.clear_network_filters();
         self.show_events = false;
         self.inspection = None;
         self.inspection_task = None;
@@ -3372,10 +4292,97 @@ impl App {
                     .enumerate()
                     .filter(|(_, endpoint)| self.network_scope.includes(endpoint))
                     .filter(|(_, endpoint)| endpoint.matches(&self.network_filter))
+                    .filter(|(_, endpoint)| {
+                        self.network_port_filter
+                            .map(|port| endpoint.has_port(port))
+                            .unwrap_or(true)
+                    })
                     .map(|(index, _)| index)
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Reset every network-list narrowing (text filter, port filter, and any
+    /// pending port input) so cross-links land on the bare endpoint list.
+    fn clear_network_filters(&mut self) {
+        self.network_filter.clear();
+        self.network_searching = false;
+        self.network_port_input = None;
+        self.network_port_filter = None;
+        self.network_pending_port = None;
+    }
+
+    fn finish_network_port_input(&mut self) {
+        let Some(input) = self.network_port_input.take() else {
+            return;
+        };
+        let port = match input.parse::<u16>() {
+            Ok(port) => port,
+            Err(_) => {
+                self.notice = Some(StatusNotice {
+                    message: text(
+                        self.language(),
+                        "port must be a number between 0 and 65535",
+                        "端口必须是 0-65535 之间的数字",
+                    )
+                    .into(),
+                    is_error: true,
+                    observed_at: Instant::now(),
+                });
+                return;
+            }
+        };
+        // The port filter replaces the text filter: an exact lookup should
+        // never be silently narrowed by an older substring.
+        self.network_filter.clear();
+        if self.network_scan.is_none() {
+            // The initial background scan is still running, so there is no
+            // snapshot to look the port up in. Keep it pending and apply it
+            // when the scan completes instead of reporting a false negative.
+            self.network_pending_port = Some(port);
+            self.notice = Some(StatusNotice {
+                message: match self.language() {
+                    UiLanguage::English => {
+                        format!("port {port} lookup will apply when the scan completes")
+                    }
+                    UiLanguage::Chinese => format!("将在扫描完成后查找端口 {port}"),
+                },
+                is_error: false,
+                observed_at: Instant::now(),
+            });
+            return;
+        }
+        self.apply_network_port_filter(port);
+    }
+
+    /// Narrow the endpoint list to `port`, or report that no visible endpoint
+    /// uses it. Requires a completed scan snapshot.
+    fn apply_network_port_filter(&mut self, port: u16) {
+        let found = self
+            .network_scan
+            .as_ref()
+            .map(|scan| {
+                scan.endpoints
+                    .iter()
+                    .filter(|endpoint| self.network_scope.includes(endpoint))
+                    .any(|endpoint| endpoint.has_port(port))
+            })
+            .unwrap_or(false);
+        if found {
+            self.network_port_filter = Some(port);
+            self.network_selected = 0;
+        } else {
+            self.network_port_filter = None;
+            self.notice = Some(StatusNotice {
+                message: match self.language() {
+                    UiLanguage::English => format!("no endpoint on port {port}"),
+                    UiLanguage::Chinese => format!("端口 {port} 上没有端点"),
+                },
+                is_error: false,
+                observed_at: Instant::now(),
+            });
+        }
     }
 
     fn move_network_selection(&mut self, delta: isize) {
@@ -3394,8 +4401,7 @@ impl App {
             return;
         }
         self.show_network = false;
-        self.network_filter.clear();
-        self.network_searching = false;
+        self.clear_network_filters();
         self.show_hotspots = false;
         self.hotspot_selected = None;
         self.show_attention = false;
@@ -3482,12 +4488,6 @@ impl App {
     fn open_selected_process_action(&mut self) {
         if let Some(pid) = self.selected_pid() {
             self.open_process_action_for(pid);
-        }
-    }
-
-    fn open_selected_process_termination(&mut self) {
-        if let Some(pid) = self.selected_pid() {
-            self.open_process_action_for_mode(pid, ProcessActionDialogMode::Termination);
         }
     }
 
@@ -3695,18 +4695,260 @@ impl App {
         }
     }
 
+    /// Rotate dark → light → high-contrast, persist the choice, and confirm
+    /// through the notice bar. A failed save still applies the theme for the
+    /// current session, matching the language-toggle behavior.
+    pub(crate) fn cycle_theme(&mut self) {
+        self.theme_id = self.theme_id.next();
+        self.theme = self.theme_id.theme();
+        let result = self.guidance.set_theme(self.theme_id);
+        let language = self.language();
+        self.notice = Some(StatusNotice {
+            message: match &result {
+                Ok(_) => match language {
+                    UiLanguage::English => format!("Theme: {}", self.theme_id.label()),
+                    UiLanguage::Chinese => format!(
+                        "主题：{}",
+                        match self.theme_id {
+                            ThemeId::Dark => "深色",
+                            ThemeId::Light => "浅色",
+                            ThemeId::HighContrast => "高对比",
+                        }
+                    ),
+                },
+                Err(error) => format!(
+                    "{}: {error}",
+                    text(
+                        language,
+                        "theme changed, but the preference could not be saved",
+                        "主题已切换，但无法保存偏好"
+                    )
+                ),
+            },
+            is_error: result.is_err(),
+            observed_at: Instant::now(),
+        });
+    }
+
+    /// Flip the unicode ↔ ASCII glyph repertoire, persist, and confirm.
+    pub(crate) fn toggle_glyphs(&mut self) {
+        self.glyph_mode = self.glyph_mode.next();
+        self.glyphs = self.glyph_mode.glyphs();
+        let result = self.guidance.set_glyphs(self.glyph_mode);
+        let language = self.language();
+        self.notice = Some(StatusNotice {
+            message: match &result {
+                Ok(_) => match language {
+                    UiLanguage::English => format!("Glyphs: {}", self.glyph_mode.label()),
+                    UiLanguage::Chinese => format!(
+                        "字符集：{}",
+                        match self.glyph_mode {
+                            GlyphMode::Unicode => "Unicode",
+                            GlyphMode::Ascii => "ASCII",
+                        }
+                    ),
+                },
+                Err(error) => format!(
+                    "{}: {error}",
+                    text(
+                        language,
+                        "glyph set changed, but the preference could not be saved",
+                        "字符集已切换，但无法保存偏好"
+                    )
+                ),
+            },
+            is_error: result.is_err(),
+            observed_at: Instant::now(),
+        });
+    }
+
+    fn open_palette(&mut self) {
+        self.show_palette = true;
+        self.palette_query.clear();
+        self.palette_selected = 0;
+    }
+
+    fn close_palette(&mut self) {
+        self.show_palette = false;
+        self.palette_query.clear();
+        self.palette_selected = 0;
+    }
+
+    /// Commands matching the current palette query, in catalog order. An
+    /// empty query lists everything; matching is a case-insensitive
+    /// subsequence test against both languages' names plus the keywords.
+    pub(crate) fn palette_matches(&self) -> Vec<&'static PaletteCommand> {
+        let query = self.palette_query.trim();
+        PALETTE_COMMANDS
+            .iter()
+            .filter(|command| {
+                query.is_empty()
+                    || subsequence_match(query, command.en_name)
+                    || subsequence_match(query, command.zh_name)
+                    || command
+                        .keywords
+                        .iter()
+                        .any(|keyword| subsequence_match(query, keyword))
+            })
+            .collect()
+    }
+
+    fn move_palette_selection(&mut self, delta: isize) {
+        let count = self.palette_matches().len();
+        if count == 0 {
+            self.palette_selected = 0;
+            return;
+        }
+        let current = self.palette_selected.min(count - 1) as isize;
+        self.palette_selected = (current + delta).rem_euclid(count as isize) as usize;
+    }
+
+    /// Close every overlay, workspace, and dialog so a palette command runs
+    /// against the bare process tree, exactly like its key press would.
+    fn close_all_overlays(&mut self) {
+        self.show_filter_manager = false;
+        self.filter_editor = None;
+        self.show_attention = false;
+        self.attention_selected = None;
+        self.show_hotspots = false;
+        self.hotspot_selected = None;
+        self.show_network = false;
+        self.clear_network_filters();
+        self.show_snapshot_diff = false;
+        self.snapshot_diff_scroll = 0;
+        self.trend_pid = None;
+        self.dossier_context = None;
+        self.dossier_context_task = None;
+        self.dossier_context_scroll = 0;
+        self.memory_context = None;
+        self.memory_context_task = None;
+        self.memory_context_scroll = 0;
+        self.logs_context = None;
+        self.logs_context_task = None;
+        self.logs_context_scroll = 0;
+        self.service_context = None;
+        self.service_context_task = None;
+        self.service_context_scroll = 0;
+        self.executable_context = None;
+        self.executable_context_task = None;
+        self.executable_context_scroll = 0;
+        self.inspection = None;
+        self.inspection_task = None;
+        self.inspection_scroll = 0;
+        self.show_events = false;
+        self.process_action = None;
+    }
+
+    /// Run a palette command by replaying the real key press through the
+    /// normal handler, so palette behavior always matches key behavior.
+    /// Stateless toggles keep the current workspace; everything else first
+    /// closes open overlays, mirroring the existing cross-link exclusivity.
+    fn execute_palette_command(&mut self, id: PaletteCommandId) -> bool {
+        let keep_workspace = matches!(
+            id,
+            PaletteCommandId::Pause
+                | PaletteCommandId::Language
+                | PaletteCommandId::CycleTheme
+                | PaletteCommandId::ToggleGlyphs
+        );
+        if !keep_workspace {
+            self.close_all_overlays();
+        }
+        // Theme and glyph switching have no dedicated key press; they run
+        // directly instead of replaying through the key handler. Pause runs
+        // directly too: replaying Space would keep the current workspace and
+        // hit that workspace's own Space binding (the filter manager toggles
+        // the selected rule, the action dialog ignores it) instead of
+        // pausing, so the command must behave identically from every context.
+        match id {
+            PaletteCommandId::CycleTheme => {
+                self.cycle_theme();
+                return false;
+            }
+            PaletteCommandId::ToggleGlyphs => {
+                self.toggle_glyphs();
+                return false;
+            }
+            PaletteCommandId::Pause => {
+                self.toggle_paused();
+                return false;
+            }
+            // Port lookup is a two-step flow: open the network workspace,
+            // then start its digit-only port input.
+            PaletteCommandId::FindPort => {
+                self.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+                self.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+                return false;
+            }
+            _ => {}
+        }
+        let key = match id {
+            PaletteCommandId::Inspect => KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            PaletteCommandId::Search => KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            PaletteCommandId::ToggleStar => KeyEvent::new(KeyCode::Char('*'), KeyModifiers::NONE),
+            PaletteCommandId::NextStarred => KeyEvent::new(KeyCode::Char('\''), KeyModifiers::NONE),
+            PaletteCommandId::Actions => KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+            PaletteCommandId::Dossier => KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE),
+            PaletteCommandId::Memory => KeyEvent::new(KeyCode::Char('M'), KeyModifiers::NONE),
+            PaletteCommandId::Service => KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+            PaletteCommandId::Verify => KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+            PaletteCommandId::Logs => KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+            PaletteCommandId::Network => KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            PaletteCommandId::Hotspots => KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
+            PaletteCommandId::Attention => KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+            PaletteCommandId::Trend => KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+            PaletteCommandId::Events => KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+            PaletteCommandId::Filters => KeyEvent::new(KeyCode::Char('F'), KeyModifiers::NONE),
+            PaletteCommandId::Focus => KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
+            PaletteCommandId::Sort => KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+            PaletteCommandId::Refresh => KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            PaletteCommandId::CaptureBaseline => {
+                KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)
+            }
+            PaletteCommandId::SnapshotDiff => KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            PaletteCommandId::ClearBaseline => {
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)
+            }
+            PaletteCommandId::ExportReport => KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+            PaletteCommandId::Language => KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE),
+            PaletteCommandId::Help => KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+            PaletteCommandId::Quit => KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            // Handled above without a single key replay.
+            PaletteCommandId::CycleTheme
+            | PaletteCommandId::ToggleGlyphs
+            | PaletteCommandId::Pause
+            | PaletteCommandId::FindPort => unreachable!(),
+        };
+        self.on_key(key)
+    }
+
     pub(crate) fn on_key(&mut self, key: KeyEvent) -> bool {
         if key.kind != KeyEventKind::Press {
             return false;
         }
-        if key.code == KeyCode::F(2) && key.modifiers.is_empty() {
+        // Language switching is global, except while a text editor owns the
+        // keyboard (search, network filter, and the filter rule editor all
+        // accept `L` as ordinary input). Crossterm reports uppercase letters
+        // with SHIFT on most terminals, so accept NONE|SHIFT but reject
+        // Ctrl/Alt chords.
+        if key.code == KeyCode::Char('L')
+            && matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT)
+            && !self.searching
+            && !self.network_searching
+            && self.network_port_input.is_none()
+            && self.filter_editor.is_none()
+            && !self.show_palette
+        {
             self.toggle_language();
             return false;
         }
         if let Some(overlay) = self.guidance.overlay {
             if matches!(overlay, GuidanceOverlay::Tip(_)) {
                 match key.code {
-                    KeyCode::Char('q') => return true,
+                    KeyCode::Char('q') => {
+                        self.dismiss_guidance();
+                        return false;
+                    }
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         return true;
                     }
@@ -3726,15 +4968,11 @@ impl App {
                         self.guidance.open_help();
                         return false;
                     }
-                    KeyCode::Char('L') => {
-                        self.toggle_language();
-                        return false;
-                    }
                     _ => self.dismiss_guidance(),
                 }
             } else {
                 match key.code {
-                    KeyCode::Char('q') => return true,
+                    KeyCode::Char('q') => self.dismiss_guidance(),
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         return true;
                     }
@@ -3743,7 +4981,6 @@ impl App {
                     KeyCode::Right | KeyCode::Down | KeyCode::Tab => self.guidance.next_page(),
                     KeyCode::Char('d' | 'D') => self.disable_startup_guidance(),
                     KeyCode::Char('t' | 'T') => self.toggle_startup_tips(),
-                    KeyCode::Char('L') => self.toggle_language(),
                     KeyCode::Char('?') if overlay == GuidanceOverlay::Help => {
                         self.dismiss_guidance();
                     }
@@ -3752,10 +4989,70 @@ impl App {
                 return false;
             }
         }
+        // The command palette owns the keyboard while open: typed characters
+        // edit the query, arrows move the selection, Enter runs the command,
+        // and Esc (or q on an empty query, following the layered-q
+        // convention) closes it without executing anything.
+        if self.show_palette {
+            match key.code {
+                KeyCode::Esc => self.close_palette(),
+                KeyCode::Enter => {
+                    let command = self
+                        .palette_matches()
+                        .get(self.palette_selected)
+                        .map(|command| command.id);
+                    self.close_palette();
+                    if let Some(id) = command {
+                        return self.execute_palette_command(id);
+                    }
+                }
+                KeyCode::Down => self.move_palette_selection(1),
+                KeyCode::Up => self.move_palette_selection(-1),
+                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.move_palette_selection(1);
+                }
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.move_palette_selection(-1);
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return true;
+                }
+                KeyCode::Backspace => {
+                    self.palette_query.pop();
+                    self.palette_selected = 0;
+                }
+                KeyCode::Char('q') if key.modifiers.is_empty() && self.palette_query.is_empty() => {
+                    self.close_palette();
+                }
+                KeyCode::Char(character)
+                    if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) =>
+                {
+                    self.palette_query.push(character);
+                    self.palette_selected = 0;
+                }
+                _ => {}
+            }
+            return false;
+        }
+        // `:` opens the command palette anywhere the global L toggle is
+        // allowed; text editors (search, network filter, rule editor, PID
+        // entry) keep `:` as ordinary input.
+        if key.code == KeyCode::Char(':')
+            && matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT)
+            && !self.searching
+            && !self.network_searching
+            && self.filter_editor.is_none()
+            && self.pid_input.is_none()
+            && self.network_port_input.is_none()
+        {
+            self.open_palette();
+            return false;
+        }
         if !self.searching
             && !self.network_searching
             && !self.show_filter_manager
             && self.pid_input.is_none()
+            && self.network_port_input.is_none()
             && key.modifiers.is_empty()
             && key.code == KeyCode::Char('o')
         {
@@ -3770,7 +5067,13 @@ impl App {
                 .unwrap_or(false);
             if confirming {
                 match key.code {
-                    KeyCode::Char('q') => return true,
+                    // q steps back out of the confirmation, exactly like Esc;
+                    // only the bare process tree lets q quit psmore.
+                    KeyCode::Char('q') => {
+                        if let Some(dialog) = &mut self.process_action {
+                            dialog.confirming = false;
+                        }
+                    }
                     KeyCode::Esc => {
                         if let Some(dialog) = &mut self.process_action {
                             dialog.confirming = false;
@@ -3784,7 +5087,7 @@ impl App {
                 }
             } else {
                 match key.code {
-                    KeyCode::Char('q') => return true,
+                    KeyCode::Char('q') => self.process_action = None,
                     KeyCode::Esc => self.process_action = None,
                     KeyCode::Char('p')
                         if self
@@ -3821,7 +5124,7 @@ impl App {
         }
         if self.pid_input.is_some() {
             match key.code {
-                KeyCode::Esc => {
+                KeyCode::Esc | KeyCode::Char('q') => {
                     self.pid_input = None;
                     self.pid_input_error = None;
                 }
@@ -3866,7 +5169,7 @@ impl App {
                 }
             } else {
                 match key.code {
-                    KeyCode::Char('q') => return true,
+                    KeyCode::Char('q') => self.close_filter_manager(),
                     KeyCode::Esc | KeyCode::Char('F') => self.close_filter_manager(),
                     KeyCode::Char('a') => self.start_filter_editor(FilterAction::Include),
                     KeyCode::Char('x') => self.start_filter_editor(FilterAction::Exclude),
@@ -3890,8 +5193,7 @@ impl App {
         }
         if self.show_attention {
             match key.code {
-                KeyCode::Char('q') => return true,
-                KeyCode::Esc | KeyCode::Char('a') => {
+                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('a') => {
                     self.show_attention = false;
                     self.attention_selected = None;
                 }
@@ -3920,8 +5222,7 @@ impl App {
         }
         if self.show_hotspots {
             match key.code {
-                KeyCode::Char('q') => return true,
-                KeyCode::Esc | KeyCode::Char('h') => {
+                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('h') => {
                     self.show_hotspots = false;
                     self.hotspot_selected = None;
                 }
@@ -3953,8 +5254,7 @@ impl App {
         }
         if self.show_snapshot_diff {
             match key.code {
-                KeyCode::Char('q') => return true,
-                KeyCode::Esc | KeyCode::Char('d') => {
+                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('d') => {
                     self.show_snapshot_diff = false;
                     self.snapshot_diff_scroll = 0;
                 }
@@ -3984,6 +5284,36 @@ impl App {
             return false;
         }
         if self.show_network {
+            // The digit-only port locator owns the keyboard while open, just
+            // like the PID locator does on the bare tree.
+            if self.network_port_input.is_some() {
+                match key.code {
+                    KeyCode::Esc => {
+                        // Cancel the lookup and restore the unfiltered list.
+                        self.network_port_input = None;
+                        self.network_port_filter = None;
+                        self.network_pending_port = None;
+                        self.network_selected = 0;
+                    }
+                    KeyCode::Char('q') => self.network_port_input = None,
+                    KeyCode::Enter => self.finish_network_port_input(),
+                    KeyCode::Backspace => {
+                        if let Some(input) = &mut self.network_port_input {
+                            input.pop();
+                        }
+                    }
+                    KeyCode::Char(c) if c.is_ascii_digit() && key.modifiers.is_empty() => {
+                        if let Some(input) = &mut self.network_port_input {
+                            input.push(c);
+                        }
+                    }
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return true;
+                    }
+                    _ => {}
+                }
+                return false;
+            }
             if self.network_searching {
                 match key.code {
                     KeyCode::Esc => {
@@ -4012,11 +5342,9 @@ impl App {
                 return false;
             }
             match key.code {
-                KeyCode::Char('q') => return true,
-                KeyCode::Esc | KeyCode::Char('n') => {
+                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('n') => {
                     self.show_network = false;
-                    self.network_filter.clear();
-                    self.network_searching = false;
+                    self.clear_network_filters();
                 }
                 KeyCode::Char('r') => self.refresh_network(),
                 KeyCode::Char('/') => {
@@ -4024,8 +5352,13 @@ impl App {
                     self.network_filter.clear();
                     self.network_selected = 0;
                 }
+                KeyCode::Char('p') => {
+                    self.network_port_input = Some(String::new());
+                }
                 KeyCode::Char('x') => {
                     self.network_filter.clear();
+                    self.network_port_filter = None;
+                    self.network_pending_port = None;
                     self.network_selected = 0;
                 }
                 KeyCode::Char('v') => {
@@ -4058,8 +5391,7 @@ impl App {
         }
         if self.trend_pid.is_some() {
             match key.code {
-                KeyCode::Char('q') => return true,
-                KeyCode::Esc | KeyCode::Char('t') => self.trend_pid = None,
+                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('t') => self.trend_pid = None,
                 KeyCode::Char(' ') => self.toggle_paused(),
                 KeyCode::Char('r') => self.refresh(),
                 KeyCode::Char('i') => self.trend_view.toggle(),
@@ -4070,8 +5402,9 @@ impl App {
         }
         if self.dossier_context.is_some() {
             match key.code {
-                KeyCode::Char('q') => return true,
-                KeyCode::Esc | KeyCode::Char('D') => self.close_dossier_context(),
+                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('D') => {
+                    self.close_dossier_context()
+                }
                 KeyCode::Char('i') => {
                     self.close_dossier_context();
                     self.open_inspection();
@@ -4094,7 +5427,7 @@ impl App {
                 }
                 KeyCode::Enter | KeyCode::Char('r') => self.refresh_dossier_context(),
                 KeyCode::Char('h') => self.toggle_dossier_hash(),
-                KeyCode::Char('L') => self.toggle_dossier_logs(),
+                KeyCode::Char('g') => self.toggle_dossier_logs(),
                 KeyCode::Char('s') => self.cycle_dossier_scope(),
                 KeyCode::Char('p') => self.cycle_dossier_priority(),
                 KeyCode::Char('w') => self.cycle_dossier_window(),
@@ -4118,8 +5451,9 @@ impl App {
         }
         if self.memory_context.is_some() {
             match key.code {
-                KeyCode::Char('q') => return true,
-                KeyCode::Esc | KeyCode::Char('M') => self.close_memory_context(),
+                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('M') => {
+                    self.close_memory_context()
+                }
                 KeyCode::Char('D') => {
                     self.close_memory_context();
                     self.open_dossier_context();
@@ -4161,8 +5495,7 @@ impl App {
         }
         if self.logs_context.is_some() {
             match key.code {
-                KeyCode::Char('q') => return true,
-                KeyCode::Esc | KeyCode::Char('l') => {
+                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('l') => {
                     self.logs_context = None;
                     self.logs_context_task = None;
                     self.logs_context_scroll = 0;
@@ -4210,8 +5543,7 @@ impl App {
         }
         if self.service_context.is_some() {
             match key.code {
-                KeyCode::Char('q') => return true,
-                KeyCode::Esc | KeyCode::Char('m') => {
+                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('m') => {
                     self.service_context = None;
                     self.service_context_task = None;
                     self.service_context_scroll = 0;
@@ -4256,8 +5588,7 @@ impl App {
         }
         if self.executable_context.is_some() {
             match key.code {
-                KeyCode::Char('q') => return true,
-                KeyCode::Esc | KeyCode::Char('v') => {
+                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('v') => {
                     self.executable_context = None;
                     self.executable_context_task = None;
                     self.executable_context_scroll = 0;
@@ -4307,8 +5638,7 @@ impl App {
         }
         if self.inspection.is_some() {
             match key.code {
-                KeyCode::Char('q') => return true,
-                KeyCode::Esc => {
+                KeyCode::Char('q') | KeyCode::Esc => {
                     self.inspection = None;
                     self.inspection_task = None;
                     self.inspection_scroll = 0;
@@ -4321,11 +5651,11 @@ impl App {
                 }
                 KeyCode::Char('M') => self.open_memory_context(),
                 KeyCode::Enter | KeyCode::Char('r') => self.refresh_inspection(),
-                KeyCode::Tab => {
+                KeyCode::Tab | KeyCode::Right => {
                     self.inspection_tab = self.inspection_tab.next();
                     self.inspection_scroll = 0;
                 }
-                KeyCode::BackTab => {
+                KeyCode::BackTab | KeyCode::Left => {
                     self.inspection_tab = self.inspection_tab.previous();
                     self.inspection_scroll = 0;
                 }
@@ -4349,8 +5679,7 @@ impl App {
         }
         if self.show_events {
             match key.code {
-                KeyCode::Char('q') => return true,
-                KeyCode::Esc | KeyCode::Char('e') => self.show_events = false,
+                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('e') => self.show_events = false,
                 KeyCode::Char(' ') => self.toggle_paused(),
                 KeyCode::Char('r') => self.refresh(),
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
@@ -4363,13 +5692,20 @@ impl App {
                 KeyCode::Esc => {
                     self.searching = false;
                     self.search_input.clear();
+                    self.search_history_index = None;
+                    self.search_completion = None;
                 }
                 KeyCode::Enter => self.apply_search_input(),
+                KeyCode::Up => self.search_history_previous(),
+                KeyCode::Down => self.search_history_next(),
+                KeyCode::Tab => self.complete_search_field(),
                 KeyCode::Backspace => {
                     self.search_input.pop();
+                    self.search_completion = None;
                 }
                 KeyCode::Char(c) if key.modifiers.is_empty() => {
                     self.search_input.push(c);
+                    self.search_completion = None;
                 }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
                 _ => {}
@@ -4398,7 +5734,7 @@ impl App {
             // overlays so an extra key press cannot terminate psmore.
             KeyCode::Esc => {}
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
-            KeyCode::Up => self.move_selection(-1),
+            KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::PageDown => self.move_selection(self.page_size as isize),
             KeyCode::PageUp => self.move_selection(-(self.page_size as isize)),
             KeyCode::Left => {
@@ -4408,11 +5744,16 @@ impl App {
             KeyCode::Char('/') => {
                 self.searching = true;
                 self.search_input.clear();
+                self.search_history_index = None;
+                self.search_draft.clear();
+                self.search_completion = None;
             }
             KeyCode::Char(c) if c.is_ascii_digit() && key.modifiers.is_empty() => {
                 self.begin_pid_input(c);
             }
             KeyCode::Char('f') => self.toggle_focus(),
+            KeyCode::Char('*') => self.toggle_star(),
+            KeyCode::Char('\'') => self.jump_to_next_starred(),
             KeyCode::Char('F') => self.open_filter_manager(),
             KeyCode::Char('s') => self.cycle_sort_mode(),
             KeyCode::Char('r') => self.refresh(),
@@ -4438,6 +5779,18 @@ impl App {
                 self.inspection_task = None;
                 self.trend_pid = None;
             }
+            KeyCode::Char('d') => {
+                self.notice = Some(StatusNotice {
+                    message: text(
+                        self.language(),
+                        "Capture a baseline first with b",
+                        "先按 b 捕获基线，再按 d 对比",
+                    )
+                    .into(),
+                    is_error: false,
+                    observed_at: Instant::now(),
+                });
+            }
             KeyCode::Char('x') => {
                 self.baseline = None;
                 self.show_snapshot_diff = false;
@@ -4451,8 +5804,6 @@ impl App {
             KeyCode::Char('m') => self.open_service_context(),
             KeyCode::Char('v') => self.open_executable_context(),
             KeyCode::Char('l') => self.open_logs_context(),
-            KeyCode::Char('L') => self.toggle_language(),
-            KeyCode::Char('k') => self.open_selected_process_termination(),
             KeyCode::Char('p') => self.open_selected_process_action(),
             KeyCode::Char('?') => self.guidance.open_help(),
             KeyCode::Enter => self.open_inspection(),
@@ -4460,5 +5811,106 @@ impl App {
             _ => {}
         }
         false
+    }
+
+    /// Mouse input. The wheel replays the matching arrow key so every overlay
+    /// scrolls exactly like j/k; left clicks act only on the bare process
+    /// tree (select row, or open inspection when the row is already selected)
+    /// and on the inspection tab bar.
+    pub(crate) fn on_mouse(&mut self, mouse: MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+            }
+            MouseEventKind::ScrollDown => {
+                self.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.handle_mouse_click(mouse.column, mouse.row);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_mouse_click(&mut self, column: u16, row: u16) {
+        // A higher modal opened over the inspection workspace (palette,
+        // action dialog, guidance, or any text editor) owns the screen; a
+        // click must not reach the inspection tab bar hidden beneath it.
+        if self.guidance.overlay.is_some()
+            || self.show_palette
+            || self.process_action.is_some()
+            || self.pid_input.is_some()
+            || self.filter_editor.is_some()
+            || self.searching
+            || self.network_searching
+            || self.network_port_input.is_some()
+        {
+            return;
+        }
+        if self.inspection.is_some() {
+            let tab = self
+                .inspection_tab_regions
+                .iter()
+                .find(|(region, _)| {
+                    row == region.y
+                        && column >= region.x
+                        && column < region.x.saturating_add(region.width)
+                })
+                .map(|(_, tab)| *tab);
+            if let Some(tab) = tab {
+                if tab != self.inspection_tab {
+                    self.inspection_tab = tab;
+                    self.inspection_scroll = 0;
+                }
+            }
+            return;
+        }
+        if self.any_overlay_open() {
+            return;
+        }
+        let area = self.tree_area;
+        if area.height < 3 {
+            return;
+        }
+        if column < area.x || column >= area.x.saturating_add(area.width) {
+            return;
+        }
+        // Rows live between the top and bottom borders of the tree block.
+        if row <= area.y || row >= area.y.saturating_add(area.height - 1) {
+            return;
+        }
+        let index = self.tree_offset + usize::from(row - area.y - 1);
+        if index >= self.visible.len() {
+            return;
+        }
+        if index == self.selected {
+            // Second click on the selected row acts like Enter; no double
+            // click timing involved.
+            self.open_inspection();
+        } else {
+            self.selected = index;
+        }
+    }
+
+    /// True when any workspace, dialog, or text input owns the screen, so
+    /// tree clicks underneath it must be ignored.
+    fn any_overlay_open(&self) -> bool {
+        self.guidance.overlay.is_some()
+            || self.show_palette
+            || self.process_action.is_some()
+            || self.pid_input.is_some()
+            || self.show_filter_manager
+            || self.show_attention
+            || self.show_hotspots
+            || self.show_snapshot_diff
+            || self.show_network
+            || self.trend_pid.is_some()
+            || self.dossier_context.is_some()
+            || self.memory_context.is_some()
+            || self.logs_context.is_some()
+            || self.service_context.is_some()
+            || self.executable_context.is_some()
+            || self.show_events
+            || self.searching
     }
 }
