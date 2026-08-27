@@ -5561,10 +5561,12 @@ mod tests {
             .expect("snapshot fixture should be writable");
             return;
         }
-        assert_eq!(
-            buffer_text(&terminal),
-            include_str!("ui_main_screen_snapshot.txt")
-        );
+        // The fixture stores the macOS rendering; the tree title embeds the
+        // platform name ("macOS"/"Linux", both five cells), so substitute it
+        // for the current platform before comparing.
+        let expected = include_str!("ui_main_screen_snapshot.txt")
+            .replace("macOS", crate::provider::platform_name());
+        assert_eq!(buffer_text(&terminal), expected);
         // Key styles are also pinned: the selected row stays white-on-blue
         // bold, and the status-bar CPU label stays cyan.
         let buffer = terminal.backend().buffer();

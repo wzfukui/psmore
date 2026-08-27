@@ -878,12 +878,10 @@ fn human_bytes(value: u64) -> String {
 }
 
 fn signed_bytes(value: i64) -> String {
-    let sign = if value > 0 {
-        "+"
-    } else if value < 0 {
-        "-"
-    } else {
-        ""
+    let sign = match value.cmp(&0) {
+        std::cmp::Ordering::Greater => "+",
+        std::cmp::Ordering::Less => "-",
+        std::cmp::Ordering::Equal => "",
     };
     format!("{sign}{}", human_bytes(value.unsigned_abs()))
 }

@@ -539,7 +539,7 @@ fn compare_images(
 fn collect_package(
     path: &Path,
     sources: &mut Vec<String>,
-    _warnings: &mut Vec<String>,
+    _warnings: &mut [String],
 ) -> Option<PackageEvidence> {
     let path = path.to_str()?;
     if let Some(package) = query_dpkg(path) {
@@ -568,7 +568,7 @@ pub(crate) fn detect_package(path: &Path) -> Option<PackageEvidence> {
 fn collect_package(
     path: &Path,
     sources: &mut Vec<String>,
-    _warnings: &mut Vec<String>,
+    _warnings: &mut [String],
 ) -> Option<PackageEvidence> {
     if let Some(package) = homebrew_package(path) {
         sources.push("Homebrew Cellar path".into());
@@ -584,8 +584,8 @@ fn collect_package(
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn collect_package(
     _path: &Path,
-    _sources: &mut Vec<String>,
-    _warnings: &mut Vec<String>,
+    _sources: &mut [String],
+    _warnings: &mut [String],
 ) -> Option<PackageEvidence> {
     None
 }
@@ -797,7 +797,7 @@ fn collect_signing(path: &Path, sources: &mut Vec<String>) -> Option<SigningEvid
 }
 
 #[cfg(not(target_os = "macos"))]
-fn collect_signing(_path: &Path, _sources: &mut Vec<String>) -> Option<SigningEvidence> {
+fn collect_signing(_path: &Path, _sources: &mut [String]) -> Option<SigningEvidence> {
     None
 }
 

@@ -309,7 +309,7 @@ impl Guidance {
             None
         } else if !state.first_run_completed {
             Some(GuidanceOverlay::Welcome)
-        } else if state.tips_enabled && !TIPS.is_empty() {
+        } else if state.tips_enabled {
             let index = state.next_tip_index % TIPS.len();
             state.next_tip_index = (index + 1) % TIPS.len();
             Some(GuidanceOverlay::Tip(index))

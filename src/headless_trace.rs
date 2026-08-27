@@ -818,12 +818,10 @@ fn human_bytes(value: u64) -> String {
 }
 
 fn signed_human_bytes(value: i64) -> String {
-    if value > 0 {
-        format!("+{}", human_bytes(value as u64))
-    } else if value < 0 {
-        format!("-{}", human_bytes(value.unsigned_abs()))
-    } else {
-        "0B".into()
+    match value.cmp(&0) {
+        std::cmp::Ordering::Greater => format!("+{}", human_bytes(value as u64)),
+        std::cmp::Ordering::Less => format!("-{}", human_bytes(value.unsigned_abs())),
+        std::cmp::Ordering::Equal => "0B".into(),
     }
 }
 
