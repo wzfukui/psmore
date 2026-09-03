@@ -8,8 +8,10 @@
 - `x86_64-apple-darwin`
 - `aarch64-unknown-linux-gnu`
 - `x86_64-unknown-linux-gnu`
+- `aarch64-unknown-linux-musl`
+- `x86_64-unknown-linux-musl`
 
-每个目标都在同架构的原生 runner 上构建和验证。归档包括 `psmore`、MIT 许可证、变更记录、man page、bash/zsh/fish 补全、安装/卸载脚本、版本及构建来源信息。安装器默认写入 `~/.local`，不会修改 shell 启动文件，也不会删除用户偏好或诊断报告。
+每个目标都在同架构的原生 runner 上构建和验证。`linux-gnu` 二进制动态链接 Ubuntu 24.04 构建镜像的 glibc；`linux-musl` 二进制为静态链接，不依赖系统 glibc，可在任意 Linux 发行版（包括比构建镜像更老的版本）上运行。归档包括 `psmore`、MIT 许可证、变更记录、man page、bash/zsh/fish 补全、安装/卸载脚本、版本及构建来源信息。安装器默认写入 `~/.local`，不会修改 shell 启动文件，也不会删除用户偏好或诊断报告。
 
 SHA-256 证明归档与校验清单一致，但不是发布者身份签名。用户必须从可信的 Release 页面取得两者；在正式建立代码签名或签名清单之前，不应宣称资产具备来源认证。
 

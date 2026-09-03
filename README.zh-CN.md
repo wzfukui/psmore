@@ -162,7 +162,7 @@ cargo install psmore --locked
 
 ### GitHub Release
 
-发布归档不要求目标机器安装 Rust。下载与系统架构匹配的 `psmore-vVERSION-TARGET.tar.gz` 及同名 `.sha256` 后，先校验再安装：
+发布归档不要求目标机器安装 Rust。Linux 每种架构提供两个变体：`*-linux-gnu`（动态链接，要求 Ubuntu 24.04 或更新系统的 glibc）和 `*-linux-musl`（静态链接，不依赖系统 glibc，老发行版如 Ubuntu 22.04/20.04、CentOS 请选这个）。下载与系统架构匹配的 `psmore-vVERSION-TARGET.tar.gz` 及同名 `.sha256` 后，先校验再安装：
 
 ```bash
 # Linux；macOS 将 sha256sum 换成 shasum -a 256

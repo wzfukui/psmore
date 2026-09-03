@@ -15,8 +15,10 @@ Options:
   --no-build            Package an existing release binary
   -h, --help            Show this help
 
-The target must match the build host. Release automation uses native runners so
-the binary can generate completions and be smoke-tested before packaging.
+The target must match the build host, except linux-musl targets whose
+architecture matches the host: the static musl binary runs natively on the
+glibc host, so it can still generate completions and be smoke-tested.
+Release automation uses native runners for the same reason.
 EOF
 }
 
@@ -66,7 +68,17 @@ command -v install >/dev/null 2>&1 || fail 'install is required'
 host_target=$(rustc -vV | sed -n 's/^host: //p')
 [ -n "$host_target" ] || fail 'could not determine the rustc host target'
 [ -n "$target" ] || target=$host_target
-[ "$target" = "$host_target" ] || fail "target $target is not native to this $host_target host"
+if [ "$target" != "$host_target" ]; then
+    host_arch=${host_target%%-*}
+    case "$host_target:$target" in
+        "$host_arch"-unknown-linux-gnu:"$host_arch"-unknown-linux-musl)
+            # A static musl binary runs natively on this glibc Linux host.
+            ;;
+        *)
+            fail "target $target is not native to this $host_target host"
+            ;;
+    esac
+fi
 
 version=$(sed -n '/^\[package\]/,/^\[/{s/^version = "\([^"]*\)"/\1/p;}' "$repo_root/Cargo.toml" | head -n 1)
 [ -n "$version" ] || fail 'could not read package version from Cargo.toml'

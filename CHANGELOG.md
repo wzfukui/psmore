@@ -4,6 +4,12 @@ All notable changes to psmore are documented in this file.
 
 The project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- Add statically linked Linux release archives for `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`, built and verified in the CI and Release matrices, so older distributions (Ubuntu 22.04/20.04, CentOS, …) can install a prebuilt binary without any glibc version constraint.
+
 ## [0.2.0] - 2026-08-27
 
 ### Breaking changes

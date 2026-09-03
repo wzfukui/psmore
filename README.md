@@ -57,8 +57,10 @@ The binary lands in `~/.cargo/bin/psmore` by default; make sure `~/.cargo/bin` i
 
 ### GitHub Release archive
 
+Linux ships two variants per architecture: `*-linux-gnu` (dynamically linked, needs the glibc of Ubuntu 24.04 or newer) and `*-linux-musl` (statically linked, runs on any distro regardless of glibc version — pick this one for older systems like Ubuntu 22.04/20.04 or CentOS).
+
 ```bash
-# Linux
+# Linux (use the -musl archive on older distros)
 sha256sum -c psmore-v0.2.0-x86_64-unknown-linux-gnu.tar.gz.sha256
 tar -xzf psmore-v0.2.0-x86_64-unknown-linux-gnu.tar.gz
 cd psmore-v0.2.0-x86_64-unknown-linux-gnu

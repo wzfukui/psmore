@@ -24,6 +24,10 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
           - runner: macos-15-intel
             target: x86_64-apple-darwin
           - runner: macos-15
@@ -40,6 +44,12 @@ jobs:
           test "$GITHUB_REF_NAME" = "v$version"
       - name: Install minimum Rust toolchain
         run: rustup toolchain install "$RUST_VERSION" --profile minimal
+      - name: Install musl target support
+        if: contains(matrix.target, 'musl')
+        run: |
+          rustup target add "${{ matrix.target }}"
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
       - name: Build package
         run: scripts/package-release.sh --target "${{ matrix.target }}"
       - name: Verify package install and uninstall

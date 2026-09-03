@@ -8,8 +8,10 @@ Release language policy: this document is maintained in English (default) and ha
 - `x86_64-apple-darwin`
 - `aarch64-unknown-linux-gnu`
 - `x86_64-unknown-linux-gnu`
+- `aarch64-unknown-linux-musl`
+- `x86_64-unknown-linux-musl`
 
-Each target is built and verified on its native architecture runner.
+Each target is built and verified on a native-architecture runner. The `linux-gnu` binaries are dynamically linked against the Ubuntu 24.04 build image's glibc; the `linux-musl` binaries are statically linked and run on any Linux distro, including releases older than the build image.
 
 Every release archive includes:
 
