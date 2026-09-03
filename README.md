@@ -61,9 +61,9 @@ Linux ships two variants per architecture: `*-linux-gnu` (dynamically linked, ne
 
 ```bash
 # Linux (use the -musl archive on older distros)
-sha256sum -c psmore-v0.2.0-x86_64-unknown-linux-gnu.tar.gz.sha256
-tar -xzf psmore-v0.2.0-x86_64-unknown-linux-gnu.tar.gz
-cd psmore-v0.2.0-x86_64-unknown-linux-gnu
+sha256sum -c psmore-v0.3.0-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf psmore-v0.3.0-x86_64-unknown-linux-gnu.tar.gz
+cd psmore-v0.3.0-x86_64-unknown-linux-gnu
 ./install.sh --dry-run
 ./install.sh
 ```

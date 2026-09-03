@@ -4,7 +4,7 @@ All notable changes to psmore are documented in this file.
 
 The project follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.0] - 2026-09-04
 
 ### Added
 
