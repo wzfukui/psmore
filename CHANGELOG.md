@@ -10,6 +10,10 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 - Add statically linked Linux release archives for `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`, built and verified in the CI and Release matrices, so older distributions (Ubuntu 22.04/20.04, CentOS, …) can install a prebuilt binary without any glibc version constraint.
 
+### Fixed
+
+- Serialize sysinfo user-list refreshes behind a process-wide lock: concurrent capture threads raced on libc's non-thread-safe `getpwent`/`setpwent`/`endpwent`, which segfaults under musl (glibc only survives by chance). Found by the new musl CI jobs, fixed with a regression test.
+
 ## [0.2.0] - 2026-08-27
 
 ### Breaking changes

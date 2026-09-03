@@ -2,12 +2,26 @@ use std::{
     collections::{HashMap, HashSet},
     path::Path,
     process::{Command, Stdio},
+    sync::Mutex,
     time::{Duration, Instant},
 };
 
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind, Users};
 
 use crate::model::ProcessInfo;
+
+// sysinfo refreshes the user list through libc's getpwent/setpwent/endpwent,
+// which are not thread-safe: concurrent calls race on a shared static FILE.
+// glibc happens to survive the race; musl segfaults inside its stdio locking.
+// Serialize refreshes so concurrent capture threads stay safe on both.
+static USERS_REFRESH_LOCK: Mutex<()> = Mutex::new(());
+
+fn refreshed_users() -> Users {
+    let _guard = USERS_REFRESH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Users::new_with_refreshed_list()
+}
 
 pub(crate) trait ProcessProvider {
     fn refresh(&mut self) -> Vec<ProcessInfo>;
@@ -109,7 +123,7 @@ impl NativeProcessProvider {
     pub(crate) fn new() -> Self {
         Self {
             system: System::new(),
-            users: Users::new_with_refreshed_list(),
+            users: refreshed_users(),
             io_instances: HashMap::new(),
             last_sample: None,
         }
@@ -320,5 +334,23 @@ impl ProcessProvider for NativeProcessProvider {
             status: "VirtualRoot".into(),
         });
         processes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
+
+    #[test]
+    fn concurrent_provider_construction_does_not_crash() {
+        // Regression test: concurrent sysinfo user-list refreshes race on
+        // libc's non-thread-safe passwd iteration and segfault on musl.
+        let handles: Vec<_> = (0..8)
+            .map(|_| thread::spawn(NativeProcessProvider::new))
+            .collect();
+        for handle in handles {
+            handle.join().expect("provider construction panicked");
+        }
     }
 }
