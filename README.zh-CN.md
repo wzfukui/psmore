@@ -142,6 +142,15 @@ DENY   name~^(Updater|Helper)$
 
 ## 安装
 
+按操作系统选择：
+
+| 系统 | 推荐安装方式 |
+| --- | --- |
+| macOS（Apple Silicon 或 Intel） | `brew install wzfukui/tap/psmore` |
+| Ubuntu 24.04+ 等较新发行版 | GitHub Release 的 `*-linux-gnu` 归档（见下） |
+| Ubuntu 22.04/20.04、CentOS 等老发行版 | GitHub Release 的 `*-linux-musl` 静态归档（不依赖系统 glibc） |
+| 已装 Rust 1.85+ 的任意系统 | `cargo install psmore --locked` |
+
 ### Homebrew
 
 macOS 或 Linux 用户可以通过项目 Tap 安装：

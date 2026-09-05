@@ -38,6 +38,15 @@ This repository is now defaulted to English.
 
 ## Installation
 
+Pick by operating system:
+
+| System | Recommended install |
+| --- | --- |
+| macOS (Apple Silicon or Intel) | `brew install wzfukui/tap/psmore` |
+| Ubuntu 24.04+ and other recent distros | GitHub Release `*-linux-gnu` archive (below) |
+| Ubuntu 22.04/20.04, CentOS, older distros | GitHub Release `*-linux-musl` archive (static, no glibc requirement) |
+| Anywhere with Rust 1.85+ | `cargo install psmore --locked` |
+
 ### Homebrew (recommended on macOS and Linux)
 
 ```bash
@@ -60,7 +69,8 @@ The binary lands in `~/.cargo/bin/psmore` by default; make sure `~/.cargo/bin` i
 Linux ships two variants per architecture: `*-linux-gnu` (dynamically linked, needs the glibc of Ubuntu 24.04 or newer) and `*-linux-musl` (statically linked, runs on any distro regardless of glibc version — pick this one for older systems like Ubuntu 22.04/20.04 or CentOS).
 
 ```bash
-# Linux (use the -musl archive on older distros)
+# Linux x86_64；ARM 机器把 x86_64 换成 aarch64，老发行版把 gnu 换成 musl
+# macOS 将 sha256sum 换成 shasum -a 256
 sha256sum -c psmore-v0.3.0-x86_64-unknown-linux-gnu.tar.gz.sha256
 tar -xzf psmore-v0.3.0-x86_64-unknown-linux-gnu.tar.gz
 cd psmore-v0.3.0-x86_64-unknown-linux-gnu
